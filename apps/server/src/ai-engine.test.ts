@@ -205,10 +205,53 @@ describe('AI engine', () => {
 
     const { patch } = await generateDiagramPatch(room, { reason: 'manual' });
     expect(patch.diagramType).toBe('tree');
-    expect(patch.actions.some((action) => action.op === 'upsertNode' && action.label === 'Tree A')).toBe(true);
-    expect(patch.actions.some((action) => action.op === 'upsertNode' && action.label === 'Tree B')).toBe(true);
+    expect(
+      patch.actions.some(
+        (action) => action.op === 'upsertNode' && action.label.toLowerCase().replace(/\s+/g, ' ').includes('a tree'),
+      ),
+    ).toBe(true);
+    expect(
+      patch.actions.some(
+        (action) => action.op === 'upsertNode' && action.label.toLowerCase().replace(/\s+/g, ' ').includes('b tree'),
+      ),
+    ).toBe(true);
     expect(patch.actions.some((action) => action.op === 'upsertNode' && action.label === 'C1')).toBe(true);
     expect(patch.actions.filter((action) => action.op === 'upsertEdge').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('maps named trees and underscore shared node from correction text', async () => {
+    const room = createEmptyRoom('ROOM07B');
+    const now = Date.now();
+    room.chatMessages.push(
+      {
+        id: 'm1',
+        authorId: 'u1',
+        authorName: 'Host',
+        kind: 'correction',
+        createdAt: now - 1000,
+        text: "today we're looking at the trees for an ad",
+      },
+      {
+        id: 'm2',
+        authorId: 'u1',
+        authorName: 'Host',
+        kind: 'correction',
+        createdAt: now,
+        text: 'when you have 2 trees, lets say click through tree and referral tree, both trees can have different nodes, but they can also share similar nodes, for example they could both have node ad_trait_3. But we need to process these nodes differently depending on the tree.',
+      },
+    );
+
+    const { patch } = await generateDiagramPatch(room, { reason: 'correction' });
+    expect(patch.diagramType).toBe('tree');
+    expect(
+      patch.actions.some(
+        (action) => action.op === 'upsertNode' && action.label.toLowerCase().includes('click through tree'),
+      ),
+    ).toBe(true);
+    expect(
+      patch.actions.some((action) => action.op === 'upsertNode' && action.label.toLowerCase().includes('referral tree')),
+    ).toBe(true);
+    expect(patch.actions.some((action) => action.op === 'upsertNode' && action.label === 'AD_TRAIT_3')).toBe(true);
   });
 
   it('revises provider output toward reference until review threshold is met', async () => {

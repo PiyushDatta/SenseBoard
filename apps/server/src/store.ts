@@ -1,6 +1,6 @@
 import { createEmptyRoom, newId, newRoomId } from '../../shared/room-state';
 import type { ClientMessage, RoomState, ServerMessage } from '../../shared/types';
-import { pinCurrentDiagram, restoreLatestArchivedDiagram, undoAiPatch } from './diagram-engine';
+import { clearBoard, pinCurrentDiagram, restoreLatestArchivedDiagram, undoAiPatch } from './diagram-engine';
 
 interface SocketWithData {
   send: (data: string) => void;
@@ -224,5 +224,10 @@ export const applyClientMessage = (room: RoomState, sender: SocketWithData['data
 
   if (message.type === 'diagram:restoreArchived') {
     restoreLatestArchivedDiagram(room);
+    return;
+  }
+
+  if (message.type === 'diagram:clearBoard') {
+    clearBoard(room);
   }
 };

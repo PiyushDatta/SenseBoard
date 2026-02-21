@@ -5,7 +5,8 @@
   "scripts": {
     "start": "expo start",
     "server": "bun run apps/server/src/server.ts",
-    "start:web": "expo start --web",
+    "ai:preflight": "bun run apps/server/src/ai-preflight.ts",
+    "start:web": "bun run ai:preflight && expo start --web",
     "typecheck:client": "bun x tsc --noEmit",
     "typecheck:server": "bun x tsc -p apps/server/tsconfig.json --noEmit",
     "typecheck": "bun run typecheck:client && bun run typecheck:server",
@@ -46,9 +47,11 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
+    "@types/react-test-renderer": "^19.1.0",
     "bun-types": "^1.3.9",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
+    "react-test-renderer": "19.1.0",
     "typescript": "~5.9.2"
   },
   "private": true

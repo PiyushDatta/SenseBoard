@@ -1,6 +1,9 @@
 import { createDiagramGroup, newId } from '../../shared/room-state';
+import { applyBoardOp, applyBoardOps, createEmptyBoardState } from '../../shared/board-state';
 import type {
   ArchivedDiagram,
+  BoardElement,
+  BoardOp,
   DiagramEdge,
   DiagramGroup,
   DiagramNode,
@@ -13,6 +16,144 @@ import type {
 const NODE_WIDTH = 160;
 const NODE_HEIGHT = 72;
 const MAX_ARCHIVED_GROUPS = 24;
+
+const BOARD_STROKE = '#25333F';
+const BOARD_TEXT = '#1E2B36';
+
+const nodeCenter = (group: DiagramGroup, node: DiagramNode): [number, number] => {
+  return [group.bounds.x + node.x + node.width / 2, group.bounds.y + node.y + node.height / 2];
+};
+
+const toBoardOps = (group: DiagramGroup): BoardOp[] => {
+  const now = Date.now();
+  const ops: BoardOp[] = [{ type: 'clearBoard' }];
+  const elements: BoardElement[] = [];
+
+  if (group.title) {
+    elements.push({
+      id: `title:${group.id}`,
+      kind: 'text',
+      x: group.bounds.x + 20,
+      y: group.bounds.y - 24,
+      text: group.title.slice(0, 140),
+      createdAt: now,
+      createdBy: 'ai',
+      style: {
+        strokeColor: BOARD_TEXT,
+        fontSize: 28,
+      },
+    });
+  }
+
+  Object.values(group.nodes).forEach((node, index) => {
+    const x = group.bounds.x + node.x;
+    const y = group.bounds.y + node.y;
+    elements.push({
+      id: `shape:${group.id}:${node.id}`,
+      kind: 'rect',
+      x,
+      y,
+      w: node.width,
+      h: node.height,
+      createdAt: now + index,
+      createdBy: 'ai',
+      style: {
+        strokeColor: BOARD_STROKE,
+        fillColor: '#FFFFFF00',
+        strokeWidth: 2,
+        roughness: 2,
+      },
+    });
+    elements.push({
+      id: `label:${group.id}:${node.id}`,
+      kind: 'text',
+      x: x + 12,
+      y: y + node.height / 2 + 6,
+      text: node.label.slice(0, 80),
+      createdAt: now + index,
+      createdBy: 'ai',
+      style: {
+        strokeColor: BOARD_TEXT,
+        fontSize: 18,
+      },
+    });
+  });
+
+  Object.values(group.edges).forEach((edge, index) => {
+    const fromNode = group.nodes[edge.from];
+    const toNode = group.nodes[edge.to];
+    if (!fromNode || !toNode) {
+      return;
+    }
+    const from = nodeCenter(group, fromNode);
+    const to = nodeCenter(group, toNode);
+    elements.push({
+      id: `edge:${group.id}:${edge.id}`,
+      kind: 'arrow',
+      points: [from, to],
+      createdAt: now + 200 + index,
+      createdBy: 'ai',
+      style: {
+        strokeColor: BOARD_STROKE,
+        strokeWidth: 2,
+        roughness: 2,
+      },
+    });
+    if (edge.label) {
+      elements.push({
+        id: `edgeLabel:${group.id}:${edge.id}`,
+        kind: 'text',
+        x: (from[0] + to[0]) / 2,
+        y: (from[1] + to[1]) / 2 - 8,
+        text: edge.label.slice(0, 40),
+        createdAt: now + 250 + index,
+        createdBy: 'ai',
+        style: {
+          strokeColor: BOARD_TEXT,
+          fontSize: 14,
+        },
+      });
+    }
+  });
+
+  if (group.notes.length > 0) {
+    elements.push({
+      id: `notes:${group.id}`,
+      kind: 'text',
+      x: group.bounds.x + 30,
+      y: group.bounds.y + group.bounds.h + 46,
+      text: group.notes.join(' | ').slice(0, 220),
+      createdAt: now + 500,
+      createdBy: 'ai',
+      style: {
+        strokeColor: '#3A4954',
+        fontSize: 16,
+      },
+    });
+  }
+
+  if (group.highlightOrder.length > 0) {
+    elements.push({
+      id: `order:${group.id}`,
+      kind: 'text',
+      x: group.bounds.x + 30,
+      y: group.bounds.y + group.bounds.h + 74,
+      text: `Order: ${group.highlightOrder.join(' -> ')}`.slice(0, 220),
+      createdAt: now + 510,
+      createdBy: 'ai',
+      style: {
+        strokeColor: '#3A4954',
+        fontSize: 15,
+      },
+    });
+  }
+
+  elements.forEach((element) => {
+    ops.push({ type: 'upsertElement', element });
+  });
+
+  return ops;
+};
 
 const updatePinnedGroups = (room: RoomState) => {
   room.aiConfig.pinnedGroupIds = Object.values(room.diagramGroups)
@@ -310,6 +451,13 @@ export const pinCurrentDiagram = (room: RoomState) => {
   room.activeGroupId = fresh.id;
 };
 
+export const clearBoard = (room: RoomState) => {
+  const group = getOrCreateActiveGroup(room);
+  clearGroupContent(group);
+  room.board = applyBoardOp(room.board, { type: 'clearBoard' });
+  room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
+};
+
 export const undoAiPatch = (room: RoomState): boolean => {
   const history = room.aiHistory.pop();
   if (!history) {
@@ -317,6 +465,7 @@ export const undoAiPatch = (room: RoomState): boolean => {
   }
   room.diagramGroups[history.previousGroupSnapshot.id] = structuredClone(history.previousGroupSnapshot);
   room.activeGroupId = history.previousGroupSnapshot.id;
+  room.board = applyBoardOps(room.board, toBoardOps(history.previousGroupSnapshot));
   room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
   return true;
 };
@@ -337,6 +486,7 @@ export const restoreLatestArchivedDiagram = (room: RoomState): boolean => {
 
   room.diagramGroups[restored.id] = restored;
   room.activeGroupId = restored.id;
+  room.board = applyBoardOps(room.board, toBoardOps(restored));
   updatePinnedGroups(room);
   return true;
 };
@@ -349,6 +499,9 @@ export const applyDiagramPatch = (
   if (room.aiConfig.frozen) {
     room.aiConfig.status = 'frozen';
     return false;
+  }
+  if (!room.board) {
+    room.board = createEmptyBoardState();
   }
 
   const group = resolveGroupForPatch(room, patch);
@@ -385,6 +538,8 @@ export const applyDiagramPatch = (
   if (!hasSetTitle && patch.topic) {
     group.title = patch.topic;
   }
+
+  room.board = applyBoardOps(room.board, toBoardOps(group));
 
   room.aiHistory.push({
     id: newId(),

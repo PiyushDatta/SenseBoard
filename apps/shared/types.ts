@@ -6,6 +6,104 @@ export type ContextScope = 'global' | 'topic';
 
 export type DiagramType = 'flowchart' | 'system_blocks' | 'tree';
 
+export type BoardElementKind = 'stroke' | 'rect' | 'ellipse' | 'diamond' | 'arrow' | 'line' | 'text';
+
+export interface BoardElementStyle {
+  strokeColor?: string;
+  fillColor?: string;
+  strokeWidth?: number;
+  roughness?: number;
+  fontSize?: number;
+}
+
+interface BoardElementBase {
+  id: string;
+  kind: BoardElementKind;
+  style?: BoardElementStyle;
+  zIndex?: number;
+  createdAt: number;
+  createdBy: 'ai' | 'system';
+}
+
+export type BoardPoint = [number, number];
+
+export interface BoardStrokeElement extends BoardElementBase {
+  kind: 'stroke';
+  points: BoardPoint[];
+}
+
+export interface BoardRectElement extends BoardElementBase {
+  kind: 'rect';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface BoardEllipseElement extends BoardElementBase {
+  kind: 'ellipse';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface BoardDiamondElement extends BoardElementBase {
+  kind: 'diamond';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface BoardArrowElement extends BoardElementBase {
+  kind: 'arrow';
+  points: BoardPoint[];
+}
+
+export interface BoardLineElement extends BoardElementBase {
+  kind: 'line';
+  points: BoardPoint[];
+}
+
+export interface BoardTextElement extends BoardElementBase {
+  kind: 'text';
+  x: number;
+  y: number;
+  text: string;
+}
+
+export type BoardElement =
+  | BoardStrokeElement
+  | BoardRectElement
+  | BoardEllipseElement
+  | BoardDiamondElement
+  | BoardArrowElement
+  | BoardLineElement
+  | BoardTextElement;
+
+export interface BoardViewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+export interface BoardState {
+  elements: Record<string, BoardElement>;
+  order: string[];
+  revision: number;
+  lastUpdatedAt: number;
+  viewport: BoardViewport;
+}
+
+export type BoardOp =
+  | { type: 'upsertElement'; element: BoardElement }
+  | { type: 'appendStrokePoints'; id: string; points: BoardPoint[] }
+  | { type: 'deleteElement'; id: string }
+  | { type: 'clearBoard' }
+  | { type: 'setViewport'; viewport: Partial<BoardViewport> }
+  | { type: 'batch'; ops: BoardOp[] };
+
 export interface FocusBox {
   x: number;
   y: number;
@@ -116,6 +214,7 @@ export interface RoomState {
   aiHistory: AIPatchHistoryEntry[];
   lastAiPatchAt: number;
   lastAiFingerprint: string;
+  board: BoardState;
 }
 
 export type DiagramPatchAction =
@@ -241,6 +340,10 @@ export type ClientMessage =
     }
   | {
       type: 'diagram:restoreArchived';
+      payload: Record<string, never>;
+    }
+  | {
+      type: 'diagram:clearBoard';
       payload: Record<string, never>;
     };
 

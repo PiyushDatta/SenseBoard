@@ -7,6 +7,7 @@ export interface CanvasSurfaceProps {
   focusDrawMode?: boolean;
   onFocusBoxSelected?: (box: FocusBox) => void;
   onFocusDrawModeChange?: (value: boolean) => void;
+  showAiNotes?: boolean;
   unsupportedReason?: string;
   theme?: SenseTheme;
 }

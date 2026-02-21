@@ -1,4 +1,5 @@
 import { customAlphabet } from 'nanoid';
+import { createEmptyBoardState } from './board-state';
 
 import type {
   DiagramGroup,
@@ -70,6 +71,7 @@ export const createEmptyRoom = (roomId: string): RoomState => {
     aiHistory: [],
     lastAiPatchAt: 0,
     lastAiFingerprint: '',
+    board: createEmptyBoardState(),
   };
 };
 

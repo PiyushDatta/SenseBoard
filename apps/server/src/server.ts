@@ -1,5 +1,5 @@
-import { applyDiagramPatch } from './diagram-engine';
-import { createSystemPromptPayloadPreview, generateDiagramPatch, getAiProviderLabel, hasAiSignal } from './ai-engine';
+import { applyBoardOps } from '../../shared/board-state';
+import { createSystemPromptPayloadPreview, generateBoardOps, getAiProviderLabel, hasAiSignal, runAiPreflightCheck } from './ai-engine';
 import {
   applyClientMessage,
   attachSocket,
@@ -20,6 +20,16 @@ interface SocketData {
   roomId: string;
   memberId: string;
   memberName: string;
+}
+
+interface AiPatchJob {
+  request: TriggerPatchRequest;
+  resolve: (value: { applied: boolean; reason?: string; patch?: unknown }) => void;
+}
+
+interface AiQueueState {
+  running: boolean;
+  jobs: AiPatchJob[];
 }
 
 const headers = {
@@ -47,7 +57,115 @@ const parseRoomId = (url: URL): string | null => {
 
 const getRoomPathParts = (url: URL) => url.pathname.split('/').filter(Boolean);
 
-const fetchHandler = async (
+const AI_MIN_INTERVAL_MS = 2000;
+const AI_MAX_QUEUE_LENGTH = 120;
+const aiQueueByRoom = new Map<string, AiQueueState>();
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+const getQueueState = (roomId: string): AiQueueState => {
+  const existing = aiQueueByRoom.get(roomId);
+  if (existing) {
+    return existing;
+  }
+  const fresh: AiQueueState = { running: false, jobs: [] };
+  aiQueueByRoom.set(roomId, fresh);
+  return fresh;
+};
+
+const runAiPatchRequest = async (
+  roomId: string,
+  request: TriggerPatchRequest,
+): Promise<{ applied: boolean; reason?: string; patch?: unknown }> => {
+  const room = getOrCreateRoom(roomId);
+  const reason = request.reason ?? 'manual';
+  const regenerate = Boolean(request.regenerate);
+  const windowSeconds = request.windowSeconds ?? 30;
+
+  if (room.aiConfig.frozen && !regenerate) {
+    return { applied: false, reason: 'frozen' };
+  }
+
+  if (!regenerate) {
+    const waitMs = Math.max(0, AI_MIN_INTERVAL_MS - (Date.now() - room.lastAiPatchAt));
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+  }
+
+  if (reason === 'tick' && !hasAiSignal(room, windowSeconds)) {
+    room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
+    return { applied: false, reason: 'no_signal' };
+  }
+
+  room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'updating';
+  const boardOpsResult = await generateBoardOps(room, {
+    reason,
+    regenerate,
+    windowSeconds,
+  }).catch(() => null);
+
+  if (!boardOpsResult || boardOpsResult.ops.length === 0) {
+    room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
+    return { applied: false, reason: 'ai_no_response' };
+  }
+
+  if (!regenerate && reason === 'tick' && boardOpsResult.fingerprint === room.lastAiFingerprint) {
+    room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
+    return { applied: false, reason: 'no_change' };
+  }
+
+  room.board = applyBoardOps(room.board, boardOpsResult.ops);
+  room.lastAiPatchAt = Date.now();
+  room.lastAiFingerprint = boardOpsResult.fingerprint;
+  room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
+  broadcastSnapshot(room.id);
+  return { applied: true, patch: { kind: 'board_ops', ops: boardOpsResult.ops } };
+};
+
+const processRoomQueue = async (roomId: string) => {
+  const queueState = getQueueState(roomId);
+  if (queueState.running) {
+    return;
+  }
+  queueState.running = true;
+  try {
+    while (queueState.jobs.length > 0) {
+      const job = queueState.jobs.shift();
+      if (!job) {
+        continue;
+      }
+      try {
+        const result = await runAiPatchRequest(roomId, job.request);
+        job.resolve(result);
+      } catch {
+        job.resolve({ applied: false, reason: 'ai_error' });
+      }
+    }
+  } finally {
+    queueState.running = false;
+  }
+};
+
+const enqueueAiPatch = (
+  roomId: string,
+  request: TriggerPatchRequest,
+): Promise<{ applied: boolean; reason?: string; patch?: unknown }> => {
+  const queueState = getQueueState(roomId);
+  while (queueState.jobs.length >= AI_MAX_QUEUE_LENGTH) {
+    const dropped = queueState.jobs.shift();
+    dropped?.resolve({ applied: false, reason: 'queue_overflow' });
+  }
+  return new Promise((resolve) => {
+    queueState.jobs.push({ request, resolve });
+    void processRoomQueue(roomId);
+  });
+};
+
+export const fetchHandler = async (
   request: Request,
   server: any,
 ): Promise<Response | undefined> => {
@@ -72,6 +190,11 @@ const fetchHandler = async (
 
     if (url.pathname === '/health') {
       return json({ status: 'ok', now: new Date().toISOString() });
+    }
+
+    if (url.pathname === '/ai/preflight' && request.method === 'GET') {
+      const result = await runAiPreflightCheck();
+      return json(result, result.ok ? 200 : 503);
     }
 
     if (url.pathname === '/rooms' && request.method === 'POST') {
@@ -104,52 +227,19 @@ const fetchHandler = async (
       if (!roomId) {
         return json({ error: 'invalid room path' }, 400);
       }
-      const room = getOrCreateRoom(roomId);
       const payload = (await request.json().catch(() => ({}))) as Partial<TriggerPatchRequest>;
-      const reason = payload.reason ?? 'manual';
-      const regenerate = Boolean(payload.regenerate);
-      const windowSeconds = payload.windowSeconds ?? 30;
-      const now = Date.now();
-
-      if (room.aiConfig.frozen && !regenerate) {
-        return json({ applied: false, reason: 'frozen' });
-      }
-
-      const minIntervalMs = 2000;
-      if (!regenerate && now - room.lastAiPatchAt < minIntervalMs) {
-        return json({ applied: false, reason: 'rate_limited' });
-      }
-
-      if (reason === 'tick' && !hasAiSignal(room, windowSeconds)) {
-        room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
-        return json({ applied: false, reason: 'no_signal' });
-      }
-
-      room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'updating';
-      const { patch, fingerprint } = await generateDiagramPatch(room, {
-        reason,
-        regenerate,
-        windowSeconds,
+      const result = await enqueueAiPatch(roomId, {
+        reason: payload.reason ?? 'manual',
+        regenerate: Boolean(payload.regenerate),
+        windowSeconds: payload.windowSeconds ?? 30,
       });
-
-      if (!regenerate && reason === 'tick' && fingerprint === room.lastAiFingerprint) {
-        room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
-        return json({ applied: false, reason: 'no_change' });
-      }
-
-      const applied = applyDiagramPatch(room, patch, { regenerate });
-      if (applied) {
-        room.lastAiFingerprint = fingerprint;
-        broadcastSnapshot(room.id);
-      }
-
-      return json({ applied, patch });
+      return json(result);
     }
 
     return json({ error: 'not_found' }, 404);
 };
 
-const websocketHandler = {
+export const websocketHandler = {
   open: (ws: any) => {
     attachSocket(ws as unknown as Parameters<typeof attachSocket>[0]);
   },
@@ -206,13 +296,24 @@ const startServerWithPortFallback = () => {
   throw new Error(`No available port found in range ${PREFERRED_PORT}-${endPort}`);
 };
 
-const runningPort = startServerWithPortFallback();
-if (runningPort !== PREFERRED_PORT) {
-  console.warn(
-    `Port ${PREFERRED_PORT} is busy, using ${runningPort}. Client will auto-discover within ports ${PREFERRED_PORT}-${PREFERRED_PORT + PORT_SCAN_SPAN - 1}.`,
-  );
+export const startServer = () => {
+  const runningPort = startServerWithPortFallback();
+  if (runningPort !== PREFERRED_PORT) {
+    console.warn(
+      `Port ${PREFERRED_PORT} is busy, using ${runningPort}. Client will auto-discover within ports ${PREFERRED_PORT}-${PREFERRED_PORT + PORT_SCAN_SPAN - 1}.`,
+    );
+  }
+  if (runtimeConfig.sourcePath) {
+    console.log(`Loaded SenseBoard config: ${runtimeConfig.sourcePath}`);
+  }
+  console.log(`SenseBoard server listening on http://localhost:${runningPort} (AI provider: ${getAiProviderLabel()})`);
+  return runningPort;
+};
+
+export const __resetAiQueueForTests = () => {
+  aiQueueByRoom.clear();
+};
+
+if (import.meta.main) {
+  startServer();
 }
-if (runtimeConfig.sourcePath) {
-  console.log(`Loaded SenseBoard config: ${runtimeConfig.sourcePath}`);
-}
-console.log(`SenseBoard server listening on http://localhost:${runningPort} (AI provider: ${getAiProviderLabel()})`);

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRuntimeConfig } from './runtime-config';
 import type {
+  BoardOp,
   ChatMessage,
   ContextItem,
   DiagramPatch,
@@ -155,6 +156,12 @@ const safeJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 type AIProvider = 'deterministic' | 'openai' | 'codex_cli' | 'auto';
 let codexCliStatus: 'unknown' | 'ready' | 'unavailable' = 'unknown';
 
+interface AiAgent {
+  id: 'openai' | 'codex_cli';
+  completeJson: (systemPrompt: string, userPrompt: string) => Promise<unknown | null>;
+  completeText: (prompt: string) => Promise<string | null>;
+}
+
 const hashString = (value: string): string => {
   let hash = 2166136261;
   for (let index = 0; index < value.length; index += 1) {
@@ -264,6 +271,56 @@ const TREE_ALIAS_STOPWORDS = new Set([
   'with',
 ]);
 
+const normalizeTreeLabel = (value: string): string => {
+  const cleaned = value
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, '');
+  if (!cleaned) {
+    return '';
+  }
+  return cleaned
+    .split(' ')
+    .map((part) => (part.length <= 3 ? part.toLowerCase() : `${part[0]?.toUpperCase() ?? ''}${part.slice(1).toLowerCase()}`))
+    .join(' ');
+};
+
+const treeIdFromLabel = (label: string): string => {
+  return `TREE_${label.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').toUpperCase()}`;
+};
+
+const extractTreeAliases = (rawText: string): string[] => {
+  const aliases = new Set<string>();
+
+  Array.from(rawText.matchAll(/\btrees?\s+([A-Za-z0-9_-]+)/gi))
+    .map((match) => normalizeToken(match[1]).toUpperCase())
+    .filter((token) => token.length > 0 && !TREE_ALIAS_STOPWORDS.has(token.toLowerCase()))
+    .forEach((token) => aliases.add(token));
+
+  // Capture "click through tree", "referral tree", etc.
+  Array.from(rawText.matchAll(/\b([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+){0,2})\s+tree\b/gi))
+    .map((match) => normalizeTreeLabel(match[1] ?? ''))
+    .filter((label) => {
+      if (!label) {
+        return false;
+      }
+      const lower = label.toLowerCase();
+      if (TREE_ALIAS_STOPWORDS.has(lower)) {
+        return false;
+      }
+      if (/^\d+$/.test(lower)) {
+        return false;
+      }
+      if (lower === 'two' || lower === 'another' || lower === 'same') {
+        return false;
+      }
+      return true;
+    })
+    .forEach((label) => aliases.add(label));
+
+  return Array.from(aliases).slice(0, 6);
+};
+
 const hasTraversalIntent = (text: string): boolean => {
   const lower = text.toLowerCase();
   return (
@@ -333,25 +390,19 @@ const buildTreePatch = (input: AIInput, rawText: string): DiagramPatch => {
     edges.set(`${rootNode}->${right}`, { from: rootNode, to: right, label: 'right' });
   }
 
-  const treeAliases = Array.from(
-    new Set(
-      Array.from(rawText.matchAll(/\btrees?\s+([A-Za-z0-9_-]+)/gi))
-        .map((match) => normalizeToken(match[1]).toUpperCase())
-        .filter((token) => token.length > 0 && !TREE_ALIAS_STOPWORDS.has(token.toLowerCase())),
-    ),
-  ).slice(0, 6);
+  const treeAliases = extractTreeAliases(rawText);
 
   if (treeAliases.length >= 2) {
     treeAliases.forEach((alias) => {
-      const id = `TREE_${alias}`;
+      const id = treeIdFromLabel(alias);
       nodeIds.add(id);
-      nodeLabels.set(id, `Tree ${alias}`);
+      nodeLabels.set(id, alias.toLowerCase().startsWith('tree ') ? alias : `${alias} tree`);
       if (!rootNode) {
         rootNode = id;
       }
     });
 
-    const sharedLabelCandidates = Array.from(rawText.matchAll(/\b([A-Za-z]+[0-9]+)\b/g))
+    const sharedLabelCandidates = Array.from(rawText.matchAll(/\b([A-Za-z][A-Za-z0-9_]*\d+[A-Za-z0-9_]*)\b/g))
       .map((match) => normalizeToken(match[1]).toUpperCase())
       .filter((token) => token.length > 0);
     const sharedNode = sharedLabelCandidates[0] ?? (lowerRaw.includes('share') ? 'SHARED' : null);
@@ -360,7 +411,7 @@ const buildTreePatch = (input: AIInput, rawText: string): DiagramPatch => {
       nodeIds.add(sharedNode);
       nodeLabels.set(sharedNode, sharedNode);
       treeAliases.forEach((alias) => {
-        const from = `TREE_${alias}`;
+        const from = treeIdFromLabel(alias);
         edges.set(`${from}->${sharedNode}`, { from, to: sharedNode, label: 'shares' });
       });
     }
@@ -535,7 +586,9 @@ const buildTreePatch = (input: AIInput, rawText: string): DiagramPatch => {
     actions.push({
       op: 'setNotes',
       lines: [
-        `Trees: ${treeAliases.map((alias) => `Tree ${alias}`).join(', ')}`,
+        `Trees: ${treeAliases
+          .map((alias) => (alias.toLowerCase().startsWith('tree ') ? alias : `${alias} tree`))
+          .join(', ')}`,
         inferredSharedNode ? `Shared node: ${inferredSharedNode}` : 'Shared node mentioned but not clearly named.',
         ...input.contextPinnedHigh.slice(0, 2).map((item) => `Constraint: ${item.title} - ${item.content}`),
       ],
@@ -627,10 +680,6 @@ const buildSystemPatch = (input: AIInput, rawText: string): DiagramPatch => {
     ...input.contextPinnedHigh.slice(0, 3).map((item) => `${item.title}: ${item.content}`),
   ];
 
-  if (notes.length === 1 && input.visualHint) {
-    notes.push(`Visual hint: ${input.visualHint}`);
-  }
-
   actions.push({ op: 'setTitle', text: 'System design call flow' });
   actions.push({ op: 'setNotes', lines: notes });
   actions.push({ op: 'layoutHint', value: 'left-to-right' });
@@ -651,42 +700,61 @@ const buildFlowchartPatch = (input: AIInput, rawText: string): DiagramPatch => {
     .split(/[.!?]/)
     .map((segment) => segment.trim())
     .filter(Boolean);
-
-  const steps = sentenceSource.length > 1 ? sentenceSource.slice(0, 5) : ['Define goal', 'Discuss options', 'Agree next step'];
-  steps.forEach((step, index) => {
-    const id = `step_${index + 1}`;
-    actions.push({
-      op: 'upsertNode',
-      id,
-      label: step.length > 48 ? `${step.slice(0, 45)}...` : step,
-      x: 120,
-      y: 70 + index * 120,
-      width: 360,
-      height: 80,
-    });
-    if (index > 0) {
-      actions.push({
-        op: 'upsertEdge',
-        id: `e_step_${index}_step_${index + 1}`,
-        from: `step_${index}`,
-        to: id,
-        label: 'next',
-      });
+  const keyPhrases = sentenceSource.length > 0 ? sentenceSource.slice(0, 3) : ['Live discussion summary'];
+  const emojiForText = (value: string): string => {
+    const lower = value.toLowerCase();
+    if (lower.includes('api') || lower.includes('service') || lower.includes('system')) {
+      return '🧩';
     }
+    if (lower.includes('tree') || lower.includes('graph') || lower.includes('node')) {
+      return '🌳';
+    }
+    if (lower.includes('design') || lower.includes('ui') || lower.includes('screen')) {
+      return '🎨';
+    }
+    if (lower.includes('problem') || lower.includes('issue') || lower.includes('bug')) {
+      return '🛠️';
+    }
+    if (lower.includes('idea') || lower.includes('plan')) {
+      return '💡';
+    }
+    return '🖼️';
+  };
+
+  actions.push({
+    op: 'upsertNode',
+    id: 'visual_main',
+    label: `${emojiForText(keyPhrases[0] ?? '')} ${keyPhrases[0] ?? 'Live discussion'}`.slice(0, 86),
+    x: 320,
+    y: 170,
+    width: 620,
+    height: 190,
   });
 
-  actions.push({ op: 'setTitle', text: 'Live flowchart' });
+  keyPhrases.slice(1, 3).forEach((phrase, index) => {
+    actions.push({
+      op: 'upsertNode',
+      id: `visual_detail_${index + 1}`,
+      label: `${emojiForText(phrase)} ${phrase}`.slice(0, 72),
+      x: 360 + index * 300,
+      y: 410,
+      width: 280,
+      height: 100,
+    });
+  });
+
+  actions.push({ op: 'setTitle', text: 'Live visual summary' });
   actions.push({
     op: 'setNotes',
     lines: [
-      `Visual hint: ${input.visualHint || 'None'}`,
+      'AI sketch summary generated from the active discussion.',
       ...input.contextPinnedNormal.slice(0, 2).map((item) => `${item.title}: ${item.content}`),
     ],
   });
   actions.push({ op: 'layoutHint', value: 'top-down' });
 
   return {
-    topic: 'Meeting flow',
+    topic: 'Live visual summary',
     diagramType: 'flowchart',
     confidence: 0.66,
     actions,
@@ -715,17 +783,17 @@ const coercePatch = (value: unknown): DiagramPatch | null => {
   };
 };
 
-const parseOpenAiJson = (text: string): DiagramPatch | null => {
+const parseJsonObject = (text: string): unknown | null => {
   const trimmed = text.trim();
   try {
-    return coercePatch(JSON.parse(trimmed));
+    return JSON.parse(trimmed);
   } catch {
     const start = trimmed.indexOf('{');
     const end = trimmed.lastIndexOf('}');
     if (start >= 0 && end > start) {
       const slice = trimmed.slice(start, end + 1);
       try {
-        return coercePatch(JSON.parse(slice));
+        return JSON.parse(slice);
       } catch {
         return null;
       }
@@ -734,16 +802,99 @@ const parseOpenAiJson = (text: string): DiagramPatch | null => {
   }
 };
 
+interface BoardOpsEnvelope {
+  kind: 'board_ops';
+  summary?: string;
+  ops: BoardOp[];
+}
+
+const coerceBoardOp = (value: unknown): BoardOp | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const item = value as Record<string, unknown>;
+  const type = typeof item.type === 'string' ? item.type : '';
+  if (type === 'clearBoard') {
+    return { type: 'clearBoard' };
+  }
+  if (type === 'deleteElement' && typeof item.id === 'string') {
+    return { type: 'deleteElement', id: item.id };
+  }
+  if (type === 'appendStrokePoints' && typeof item.id === 'string' && Array.isArray(item.points)) {
+    return {
+      type: 'appendStrokePoints',
+      id: item.id,
+      points: item.points.filter((point) => Array.isArray(point) && point.length === 2) as Array<[number, number]>,
+    };
+  }
+  if (type === 'setViewport' && item.viewport && typeof item.viewport === 'object') {
+    const viewport = item.viewport as Record<string, unknown>;
+    return {
+      type: 'setViewport',
+      viewport: {
+        x: typeof viewport.x === 'number' ? viewport.x : undefined,
+        y: typeof viewport.y === 'number' ? viewport.y : undefined,
+        zoom: typeof viewport.zoom === 'number' ? viewport.zoom : undefined,
+      },
+    };
+  }
+  if (type === 'upsertElement' && item.element && typeof item.element === 'object') {
+    return {
+      type: 'upsertElement',
+      element: item.element as BoardOp extends { type: 'upsertElement'; element: infer E } ? E : never,
+    };
+  }
+  if (type === 'batch' && Array.isArray(item.ops)) {
+    return {
+      type: 'batch',
+      ops: item.ops.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 600),
+    };
+  }
+  return null;
+};
+
+const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind !== 'board_ops' || !Array.isArray(candidate.ops)) {
+    return null;
+  }
+  const ops = candidate.ops.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 800);
+  if (ops.length === 0) {
+    return null;
+  }
+  return {
+    kind: 'board_ops',
+    summary: typeof candidate.summary === 'string' ? candidate.summary.slice(0, 240) : undefined,
+    ops,
+  };
+};
+
 const getConfiguredProvider = (): AIProvider => {
   return getRuntimeConfig().ai.provider;
+};
+
+const isCodexLoggedIn = (exitCode: number, output: string): boolean => {
+  if (exitCode !== 0) {
+    return false;
+  }
+  const normalized = output.toLowerCase();
+  if (
+    normalized.includes('not logged in') ||
+    normalized.includes('logged out') ||
+    normalized.includes('login required') ||
+    normalized.includes('not authenticated')
+  ) {
+    return false;
+  }
+  return normalized.includes('logged in') || normalized.includes('authenticated');
 };
 
 const checkCodexCliReady = (): boolean => {
   if (codexCliStatus === 'ready') {
     return true;
-  }
-  if (codexCliStatus === 'unavailable') {
-    return false;
   }
   try {
     const status = Bun.spawnSync({
@@ -752,8 +903,10 @@ const checkCodexCliReady = (): boolean => {
       stderr: 'pipe',
       timeout: 3000,
     });
-    const output = status.stdout ? new TextDecoder().decode(status.stdout).toLowerCase() : '';
-    const ready = status.exitCode === 0 && output.includes('logged in');
+    const stdout = status.stdout ? new TextDecoder().decode(status.stdout) : '';
+    const stderr = status.stderr ? new TextDecoder().decode(status.stderr) : '';
+    const output = `${stdout}\n${stderr}`;
+    const ready = isCodexLoggedIn(status.exitCode, output);
     codexCliStatus = ready ? 'ready' : 'unavailable';
     return ready;
   } catch {
@@ -818,15 +971,60 @@ const buildDiagramPatchUserPrompt = (payload: AIInput): string => {
   ].join('\n\n');
 };
 
-const maybeRunCodexCli = async (payload: AIInput): Promise<DiagramPatch | null> => {
+const buildBoardOpsSystemPrompt = (): string => {
+  return [
+    'You are an AI whiteboard sketch engine.',
+    'Return JSON only. No markdown.',
+    'Output exactly one object: {"kind":"board_ops","summary":"...","ops":[...]}',
+    'Ops must use this API only:',
+    '- upsertElement: {type:"upsertElement", element:{id,kind,...}}',
+    '- appendStrokePoints: {type:"appendStrokePoints", id, points:[[x,y],...]}',
+    '- deleteElement: {type:"deleteElement", id}',
+    '- clearBoard: {type:"clearBoard"}',
+    '- setViewport: {type:"setViewport", viewport:{x?,y?,zoom?}}',
+    '- batch: {type:"batch", ops:[...]}',
+    'Element kinds: stroke, rect, ellipse, diamond, arrow, line, text.',
+    'Prefer sketches over prose. Use arrows/lines to connect ideas.',
+    'Modality priority: corrections > pinned high context > pinned normal context > transcript.',
+    'Avoid excessive text. Keep labels short. Keep coordinates in a readable range.',
+  ].join('\n');
+};
+
+const buildBoardOpsUserPrompt = (payload: AIInput): string => {
+  const input = {
+    metadata: {
+      roomId: payload.roomId,
+      nowIso: payload.nowIso,
+      trigger: payload.trigger,
+    },
+    context: {
+      corrections: payload.correctionDirectives,
+      contextPinnedHigh: payload.contextPinnedHigh,
+      contextPinnedNormal: payload.contextPinnedNormal,
+      transcriptWindow: payload.transcriptWindow,
+      recentChat: payload.recentChat,
+    },
+    currentBoardHint: {
+      topic: payload.currentDiagramSummary.topic,
+      diagramType: payload.currentDiagramSummary.diagramType,
+      nodeCount: payload.currentDiagramSummary.nodeCount,
+      edgeCount: payload.currentDiagramSummary.edgeCount,
+    },
+  };
+  return [
+    'Generate the next sketch operations for this meeting moment.',
+    'Return board_ops JSON only.',
+    JSON.stringify(input, null, 2),
+  ].join('\n\n');
+};
+
+const runCodexCliJsonPrompt = async (systemPrompt: string, userPrompt: string): Promise<unknown | null> => {
   if (!checkCodexCliReady()) {
     return null;
   }
-
   const outputFile = join(tmpdir(), `senseboard-codex-${newId()}.txt`);
   const model = getRuntimeConfig().ai.codexModel;
-  const prompt = [buildDiagramPatchSystemPrompt(), buildDiagramPatchUserPrompt(payload)].join('\n\n');
-
+  const prompt = [systemPrompt, userPrompt].join('\n\n');
   try {
     const result = Bun.spawnSync({
       cmd: ['codex', 'exec', '--output-last-message', outputFile, '--color', 'never', '-m', model, prompt],
@@ -838,7 +1036,7 @@ const maybeRunCodexCli = async (payload: AIInput): Promise<DiagramPatch | null> 
       return null;
     }
     const content = readFileSync(outputFile, 'utf8');
-    return parseOpenAiJson(content);
+    return parseJsonObject(content);
   } catch {
     return null;
   } finally {
@@ -848,16 +1046,12 @@ const maybeRunCodexCli = async (payload: AIInput): Promise<DiagramPatch | null> 
   }
 };
 
-const maybeRunOpenAi = async (payload: AIInput): Promise<DiagramPatch | null> => {
+const runOpenAiJsonPrompt = async (systemPrompt: string, userPrompt: string): Promise<unknown | null> => {
   const runtimeConfig = getRuntimeConfig();
   const apiKey = runtimeConfig.ai.openaiApiKey;
   if (!apiKey) {
     return null;
   }
-
-  const systemInstruction = buildDiagramPatchSystemPrompt();
-  const userInstruction = buildDiagramPatchUserPrompt(payload);
-
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -868,25 +1062,130 @@ const maybeRunOpenAi = async (payload: AIInput): Promise<DiagramPatch | null> =>
       model: runtimeConfig.ai.openaiModel,
       temperature: 0.15,
       messages: [
-        { role: 'system', content: systemInstruction },
-        { role: 'user', content: userInstruction },
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
       ],
       response_format: { type: 'json_object' },
     }),
   });
-
   if (!response.ok) {
     return null;
   }
-
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
+  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
   const content = data.choices?.[0]?.message?.content;
   if (!content) {
     return null;
   }
-  return parseOpenAiJson(content);
+  return parseJsonObject(content);
+};
+
+const runCodexCliTextPrompt = async (prompt: string): Promise<string | null> => {
+  if (!checkCodexCliReady()) {
+    return null;
+  }
+  const outputFile = join(tmpdir(), `senseboard-codex-ping-${newId()}.txt`);
+  const model = getRuntimeConfig().ai.codexModel;
+  try {
+    const result = Bun.spawnSync({
+      cmd: ['codex', 'exec', '--output-last-message', outputFile, '--color', 'never', '-m', model, prompt],
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 30000,
+    });
+    if (result.exitCode !== 0 || !existsSync(outputFile)) {
+      return null;
+    }
+    const content = readFileSync(outputFile, 'utf8').trim();
+    return content.length > 0 ? content : null;
+  } catch {
+    return null;
+  } finally {
+    if (existsSync(outputFile)) {
+      unlinkSync(outputFile);
+    }
+  }
+};
+
+const runOpenAiTextPrompt = async (prompt: string): Promise<string | null> => {
+  const runtimeConfig = getRuntimeConfig();
+  const apiKey = runtimeConfig.ai.openaiApiKey;
+  if (!apiKey) {
+    return null;
+  }
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: runtimeConfig.ai.openaiModel,
+      temperature: 0.1,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+  if (!response.ok) {
+    return null;
+  }
+  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const content = data.choices?.[0]?.message?.content?.trim();
+  return content && content.length > 0 ? content : null;
+};
+
+const getAgent = (): AiAgent | null => {
+  const provider = getConfiguredProvider();
+  const runtimeConfig = getRuntimeConfig();
+  const openAiAvailable = runtimeConfig.ai.openaiApiKey.trim().length > 0;
+  const codexAvailable = checkCodexCliReady();
+
+  if (provider === 'openai') {
+    if (!openAiAvailable) {
+      return null;
+    }
+    return {
+      id: 'openai',
+      completeJson: runOpenAiJsonPrompt,
+      completeText: runOpenAiTextPrompt,
+    };
+  }
+  if (provider === 'codex_cli') {
+    if (!codexAvailable) {
+      return null;
+    }
+    return {
+      id: 'codex_cli',
+      completeJson: runCodexCliJsonPrompt,
+      completeText: runCodexCliTextPrompt,
+    };
+  }
+  if (provider === 'auto') {
+    if (openAiAvailable) {
+      return {
+        id: 'openai',
+        completeJson: runOpenAiJsonPrompt,
+        completeText: runOpenAiTextPrompt,
+      };
+    }
+    if (codexAvailable) {
+      return {
+        id: 'codex_cli',
+        completeJson: runCodexCliJsonPrompt,
+        completeText: runCodexCliTextPrompt,
+      };
+    }
+    return null;
+  }
+  return null;
+};
+
+const maybeRunCodexCli = async (payload: AIInput): Promise<DiagramPatch | null> => {
+  const parsed = await runCodexCliJsonPrompt(buildDiagramPatchSystemPrompt(), buildDiagramPatchUserPrompt(payload));
+  return coercePatch(parsed);
+};
+
+const maybeRunOpenAi = async (payload: AIInput): Promise<DiagramPatch | null> => {
+  const parsed = await runOpenAiJsonPrompt(buildDiagramPatchSystemPrompt(), buildDiagramPatchUserPrompt(payload));
+  return coercePatch(parsed);
 };
 
 export const collectAiInput = (
@@ -1231,6 +1530,67 @@ const reviewAndRevisePatch = (
   return { patch: current, reviewScore, reviewPasses };
 };
 
+export const generateBoardOps = async (
+  room: RoomState,
+  request: TriggerPatchRequest,
+): Promise<{ ops: BoardOp[]; fingerprint: string } | null> => {
+  const agent = getAgent();
+  if (!agent) {
+    return null;
+  }
+  const input = collectAiInput(room, request.windowSeconds ?? 30, {
+    reason: request.reason,
+    regenerate: request.regenerate,
+  });
+  const fingerprint = `${getAiFingerprint(input)}:board_ops`;
+  const systemPrompt = buildBoardOpsSystemPrompt();
+  const userPrompt = buildBoardOpsUserPrompt(input);
+
+  const parsed = await agent.completeJson(systemPrompt, userPrompt).catch(() => null);
+
+  const envelope = coerceBoardOpsEnvelope(parsed);
+  if (!envelope || envelope.ops.length === 0) {
+    return null;
+  }
+  return {
+    ops: envelope.ops,
+    fingerprint,
+  };
+};
+
+export const runAiPreflightCheck = async (): Promise<{
+  ok: boolean;
+  provider: string;
+  response?: string;
+  error?: string;
+}> => {
+  const providerLabel = getAiProviderLabel();
+  const agent = getAgent();
+  if (!agent) {
+    return {
+      ok: false,
+      provider: providerLabel,
+      error: 'No connected AI agent is available for the configured provider.',
+    };
+  }
+  const response = await agent
+    .completeText('hello how are you')
+    .then((value) => (value ?? '').trim())
+    .catch(() => '');
+  if (!response) {
+    return {
+      ok: false,
+      provider: providerLabel,
+      error: 'AI agent did not return a response to preflight prompt.',
+    };
+  }
+  return {
+    ok: true,
+    provider: providerLabel,
+    response,
+  };
+};
+
 export const generateDiagramPatch = async (
   room: RoomState,
   request: TriggerPatchRequest,
@@ -1248,10 +1608,8 @@ export const generateDiagramPatch = async (
 
   let providerPatch: DiagramPatch | null = null;
   if (provider === 'codex_cli') {
-    providerPatch = (await maybeRunCodexCli(input).catch(() => null)) ?? (await maybeRunOpenAi(input).catch(() => null));
-  } else if (provider === 'openai') {
-    providerPatch = await maybeRunOpenAi(input).catch(() => null);
-  } else if (provider === 'auto') {
+    providerPatch = await maybeRunCodexCli(input).catch(() => null);
+  } else if (provider === 'openai' || provider === 'auto') {
     providerPatch = await maybeRunOpenAi(input).catch(() => null);
   }
 

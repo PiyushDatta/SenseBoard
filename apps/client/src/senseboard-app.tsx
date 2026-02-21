@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import type { ContextPriority, ContextScope, NoteKind, RoomState } from '../../shared/types';
+import { createEmptyBoardState } from '../../shared/board-state';
 import { CanvasSurface } from './components/canvas-surface';
+import { FloatingOptions } from './components/floating-options';
 import { JoinScreen } from './components/join-screen';
 import { Sidebar, type SidebarTab } from './components/sidebar';
-import { TopBar } from './components/top-bar';
 import { useRoomSocket } from './hooks/use-room-socket';
 import { useSpeechTranscript } from './hooks/use-speech-transcript';
 import { createRoom, getRoom, triggerAiPatch } from './lib/api';
@@ -48,6 +49,7 @@ const emptyRoomFallback = (roomId: string): RoomState => ({
   aiHistory: [],
   lastAiPatchAt: 0,
   lastAiFingerprint: '',
+  board: createEmptyBoardState(),
 });
 
 const THEME_STORAGE_KEY = 'senseboard.theme.mode';
@@ -81,12 +83,12 @@ export const SenseBoardApp = () => {
   const [chatDraft, setChatDraft] = useState('');
   const [chatKind, setChatKind] = useState<NoteKind>('normal');
   const [transcriptDraft, setTranscriptDraft] = useState('');
-  const [visualHintDraft, setVisualHintDraft] = useState('');
   const [contextDraft, setContextDraft] = useState<ContextDraft>(initialContextDraft);
   const [focusDrawMode, setFocusDrawMode] = useState(false);
   const [debugPanelOpen, setDebugPanelOpen] = useState(false);
   const [panelsOpen, setPanelsOpen] = useState(false);
-  const [controlsOpen, setControlsOpen] = useState(false);
+  const [showOptions, setShowOptions] = useState(false);
+  const [showAiNotes, setShowAiNotes] = useState(true);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
   const [prefersDark, setPrefersDark] = useState(getInitialPrefersDark);
 
@@ -183,12 +185,6 @@ export const SenseBoardApp = () => {
     onSnapshot: handleSnapshot,
     onError: handleSocketError,
   });
-
-  useEffect(() => {
-    if (currentRoom) {
-      setVisualHintDraft(currentRoom.visualHint);
-    }
-  }, [currentRoom?.visualHint]);
 
   const pushTranscriptChunk = useCallback(
     (text: string, source: 'mic' | 'manual') => {
@@ -358,7 +354,7 @@ export const SenseBoardApp = () => {
     setFocusDrawMode(false);
     setDebugPanelOpen(false);
     setPanelsOpen(false);
-    setControlsOpen(false);
+    setShowOptions(false);
   }, [speech]);
 
   const sortedMembers = useMemo(() => currentRoom?.members.map((member) => member.name).join(', ') ?? '', [currentRoom?.members]);
@@ -396,31 +392,74 @@ export const SenseBoardApp = () => {
 
   return (
     <View style={[styles.page, { backgroundColor: theme.colors.appBg }]}>
-      <TopBar
-        roomId={roomId}
-        connected={connected}
-        aiStatus={currentRoom.aiConfig.status}
-        archivedCount={currentRoom.archivedGroups.length}
-        visualHint={visualHintDraft}
+      <View style={styles.main}>
+        {Platform.OS === 'web' ? (
+          <CanvasSurface
+            room={currentRoom}
+            focusDrawMode={focusDrawMode}
+            onFocusBoxSelected={onSetFocusBox}
+            onFocusDrawModeChange={setFocusDrawMode}
+            showAiNotes={showAiNotes}
+            theme={theme}
+          />
+        ) : (
+          <CanvasSurface unsupportedReason="SenseBoard MVP is web-first for this demo." theme={theme} />
+        )}
+      </View>
+
+      {panelsOpen ? (
+        <View style={styles.sidebarBackdrop}>
+          <Pressable
+            onPress={() => setPanelsOpen(false)}
+            style={[styles.sidebarScrim, { backgroundColor: theme.id === 'dark' ? '#00000066' : '#0B1A2A33' }]}
+          />
+          <View style={styles.sidebarOverlayWrap}>
+            <Sidebar
+              room={currentRoom}
+              activeTab={activeTab}
+              interimTranscript={speech.interimText}
+              transcriptDraft={transcriptDraft}
+              chatDraft={chatDraft}
+              chatKind={chatKind}
+              contextDraft={contextDraft}
+              theme={theme}
+              overlay
+              onClose={() => setPanelsOpen(false)}
+              onTabChange={setActiveTab}
+              onTranscriptDraftChange={setTranscriptDraft}
+              onSendManualTranscript={onSendManualTranscript}
+              onChatDraftChange={setChatDraft}
+              onChatKindChange={setChatKind}
+              onSendChat={onSendChat}
+              onContextDraftChange={setContextDraft}
+              onAddContext={onAddContext}
+            />
+          </View>
+        </View>
+      ) : null}
+
+      <View style={[styles.statusPill, { borderColor: theme.colors.panelBorder, backgroundColor: theme.colors.panel }]}>
+        <Text style={[styles.statusText, { color: theme.colors.textPrimary, fontFamily: theme.fonts.heading }]}>Room {roomId}</Text>
+        <Text style={[styles.statusSubText, { color: theme.colors.textSecondary, fontFamily: theme.fonts.body }]}>
+          {connected ? 'Connected' : 'Reconnecting'} | AI {currentRoom.aiConfig.status} | Members {sortedMembers || 'None'}
+        </Text>
+      </View>
+
+      <FloatingOptions
+        open={showOptions}
+        panelsOpen={panelsOpen}
         micListening={speech.listening}
         micSupported={speech.supported}
         freezeAi={currentRoom.aiConfig.frozen}
         focusMode={currentRoom.aiConfig.focusMode || focusDrawMode}
-        panelsOpen={panelsOpen}
-        controlsOpen={controlsOpen}
-        theme={theme}
+        showAiNotes={showAiNotes}
+        chatHistory={currentRoom.chatMessages}
+        archivedCount={currentRoom.archivedGroups.length}
+        debugPanelOpen={debugPanelOpen}
         themeMode={themeMode}
-        resolvedTheme={resolvedTheme}
-        onThemeModeChange={setThemeMode}
+        theme={theme}
+        onToggleOpen={() => setShowOptions((value) => !value)}
         onTogglePanels={() => setPanelsOpen((value) => !value)}
-        onToggleControls={() => setControlsOpen((value) => !value)}
-        onVisualHintChange={(value) => {
-          setVisualHintDraft(value);
-          send({
-            type: 'visualHint:set',
-            payload: { value },
-          });
-        }}
         onToggleMic={toggleMic}
         onToggleFreeze={toggleFreeze}
         onPinDiagram={() => {
@@ -430,114 +469,32 @@ export const SenseBoardApp = () => {
         onRegenerate={() => {
           void runAiPatch('regenerate', true);
         }}
+        onClearBoard={() => {
+          send({ type: 'diagram:clearBoard', payload: {} });
+        }}
         onUndoAi={() => {
           send({ type: 'diagram:undoAi', payload: {} });
         }}
         onRestoreArchived={() => {
           send({ type: 'diagram:restoreArchived', payload: {} });
         }}
-      />
-
-      <View style={styles.main}>
-        <View
-          style={[
-            styles.canvasCard,
-            {
-              borderColor: theme.colors.panelBorder,
-              backgroundColor: theme.colors.panel,
+        onToggleShowAiNotes={() => setShowAiNotes((value) => !value)}
+        onThemeModeChange={setThemeMode}
+        onSendQuickChat={(text) => {
+          send({
+            type: 'chat:add',
+            payload: {
+              text,
+              kind: 'correction',
             },
-          ]}>
-          {Platform.OS === 'web' ? (
-            <CanvasSurface
-              room={currentRoom}
-              focusDrawMode={focusDrawMode}
-              onFocusBoxSelected={onSetFocusBox}
-              onFocusDrawModeChange={setFocusDrawMode}
-              theme={theme}
-            />
-          ) : (
-            <CanvasSurface unsupportedReason="SenseBoard MVP is web-first for this demo." theme={theme} />
-          )}
-        </View>
-        {panelsOpen ? (
-          <View style={styles.sidebarBackdrop}>
-            <Pressable
-              onPress={() => setPanelsOpen(false)}
-              style={[styles.sidebarScrim, { backgroundColor: theme.id === 'dark' ? '#00000066' : '#0B1A2A33' }]}
-            />
-            <View style={styles.sidebarOverlayWrap}>
-              <Sidebar
-                room={currentRoom}
-                activeTab={activeTab}
-                interimTranscript={speech.interimText}
-                transcriptDraft={transcriptDraft}
-                chatDraft={chatDraft}
-                chatKind={chatKind}
-                contextDraft={contextDraft}
-                theme={theme}
-                overlay
-                onClose={() => setPanelsOpen(false)}
-                onTabChange={setActiveTab}
-                onTranscriptDraftChange={setTranscriptDraft}
-                onSendManualTranscript={onSendManualTranscript}
-                onChatDraftChange={setChatDraft}
-                onChatKindChange={setChatKind}
-                onSendChat={onSendChat}
-                onContextDraftChange={setContextDraft}
-                onAddContext={onAddContext}
-              />
-            </View>
-          </View>
-        ) : null}
-      </View>
-
-      <View style={[styles.footer, { borderColor: theme.colors.panelBorder, backgroundColor: theme.colors.panel }]}>
-        <Text style={[styles.footerText, { color: theme.colors.textSecondary, fontFamily: theme.fonts.body }]}>
-          Members: {sortedMembers || 'No active members'} | Mic {speech.listening ? 'ON' : 'OFF'} | {speech.error ?? 'Speech ready'}
-        </Text>
-        <View style={styles.footerActions}>
-          {controlsOpen ? (
-            <>
-              <Pressable
-                onPress={() => setDebugPanelOpen((value) => !value)}
-                style={[
-                  styles.footerButton,
-                  {
-                    borderColor: theme.colors.buttonBorder,
-                    backgroundColor: theme.colors.buttonBg,
-                  },
-                ]}>
-                <Text style={[styles.footerButtonText, { color: theme.colors.buttonText, fontFamily: theme.fonts.body }]}>
-                  {debugPanelOpen ? 'Hide debug' : 'Show debug'}
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={leaveRoom}
-                style={[
-                  styles.footerButton,
-                  {
-                    borderColor: theme.colors.buttonBorder,
-                    backgroundColor: theme.colors.buttonBg,
-                  },
-                ]}>
-                <Text style={[styles.footerButtonText, { color: theme.colors.buttonText, fontFamily: theme.fonts.body }]}>Leave room</Text>
-              </Pressable>
-            </>
-          ) : (
-            <Pressable
-              onPress={() => setControlsOpen(true)}
-              style={[
-                styles.footerButton,
-                {
-                  borderColor: theme.colors.buttonBorder,
-                  backgroundColor: theme.colors.buttonBg,
-                },
-              ]}>
-              <Text style={[styles.footerButtonText, { color: theme.colors.buttonText, fontFamily: theme.fonts.body }]}>Session</Text>
-            </Pressable>
-          )}
-        </View>
-      </View>
+          });
+          setTimeout(() => {
+            void runAiPatch('correction');
+          }, 120);
+        }}
+        onToggleDebugPanel={() => setDebugPanelOpen((value) => !value)}
+        onLeaveRoom={leaveRoom}
+      />
 
       {debugPanelOpen ? (
         <View style={[styles.debugPanel, { borderColor: theme.colors.panelBorder, backgroundColor: theme.colors.panel }]}>
@@ -573,22 +530,9 @@ export const SenseBoardApp = () => {
 const styles = StyleSheet.create({
   page: {
     flex: 1,
-    paddingHorizontal: 8,
-    paddingTop: 8,
-    paddingBottom: 8,
-    gap: 6,
   },
   main: {
     flex: 1,
-    position: 'relative',
-    minHeight: 0,
-  },
-  canvasCard: {
-    flex: 1,
-    borderRadius: 14,
-    borderWidth: 1,
-    overflow: 'hidden',
-    minHeight: 0,
   },
   sidebarBackdrop: {
     position: 'absolute',
@@ -607,7 +551,9 @@ const styles = StyleSheet.create({
     width: 420,
     maxWidth: '95%',
     height: '100%',
-    paddingLeft: 8,
+    paddingLeft: 10,
+    paddingTop: 10,
+    paddingBottom: 10,
   },
   loadingPage: {
     flex: 1,
@@ -618,37 +564,23 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  footer: {
+  statusPill: {
     position: 'absolute',
+    top: 12,
     left: 12,
-    right: 12,
-    bottom: 10,
+    maxWidth: 620,
     borderWidth: 1,
-    borderRadius: 999,
-    paddingVertical: 6,
+    borderRadius: 12,
+    paddingVertical: 8,
     paddingHorizontal: 10,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+    gap: 2,
   },
-  footerText: {
+  statusText: {
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  statusSubText: {
     fontSize: 12,
-    flex: 1,
-    paddingRight: 8,
-  },
-  footerActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  footerButton: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderWidth: 1,
-    borderRadius: 999,
-  },
-  footerButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
   },
   debugPanel: {
     position: 'absolute',

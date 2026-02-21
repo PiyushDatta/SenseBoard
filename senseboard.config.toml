@@ -3,13 +3,19 @@ port = 8787
 port_scan_span = 8
 
 [ai]
-# auto | openai | codex_cli | deterministic
+# Active provider (supported now): auto | openai | codex_cli | deterministic
 provider = "codex_cli"
 openai_model = "gpt-4.1-mini"
 codex_model = "gpt-5-codex"
+
 # Optional
 # Prefer setting OPENAI_API_KEY in your env file for secrets.
 # openai_api_key = ""
+
+# Optional Claude/Anthropic config (kept here for quick switch readiness).
+# Note: provider="claude" is not wired in runtime yet; use when Claude support is enabled.
+# claude_model = "claude-3-7-sonnet-latest"
+# claude_api_key = ""
 
 [ai.review]
 # Max review/revision passes per patch cycle.
