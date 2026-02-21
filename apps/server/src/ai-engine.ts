@@ -158,6 +158,15 @@ let codexCliStatus: 'unknown' | 'ready' | 'unavailable' = 'unknown';
 const CODEX_REASONING_EFFORT = 'high';
 const ANTHROPIC_API_VERSION = '2023-06-01';
 
+const logAiRouter = (message: string) => {
+  console.log(`[AI Router] ${message}`);
+};
+
+const readErrorText = async (response: Response): Promise<string> => {
+  const body = await response.text().catch(() => '');
+  return body.replace(/\s+/g, ' ').trim().slice(0, 240);
+};
+
 interface AiAgent {
   id: 'openai' | 'anthropic' | 'codex_cli';
   completeJson: (systemPrompt: string, userPrompt: string) => Promise<unknown | null>;
@@ -1083,6 +1092,8 @@ const runOpenAiJsonPrompt = async (systemPrompt: string, userPrompt: string): Pr
     }),
   });
   if (!response.ok) {
+    const detail = await readErrorText(response);
+    logAiRouter(`OpenAI text call failed (${response.status})${detail ? `: ${detail}` : ''}`);
     return null;
   }
   const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
@@ -1136,6 +1147,8 @@ const runAnthropicJsonPrompt = async (systemPrompt: string, userPrompt: string):
     }),
   });
   if (!response.ok) {
+    const detail = await readErrorText(response);
+    logAiRouter(`OpenAI JSON call failed (${response.status})${detail ? `: ${detail}` : ''}`);
     return null;
   }
   const data = (await response.json().catch(() => null)) as unknown;
@@ -1204,6 +1217,8 @@ const runOpenAiTextPrompt = async (prompt: string): Promise<string | null> => {
     }),
   });
   if (!response.ok) {
+    const detail = await readErrorText(response);
+    logAiRouter(`Claude text call failed (${response.status})${detail ? `: ${detail}` : ''}`);
     return null;
   }
   const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
@@ -1233,6 +1248,8 @@ const runAnthropicTextPrompt = async (prompt: string): Promise<string | null> =>
     }),
   });
   if (!response.ok) {
+    const detail = await readErrorText(response);
+    logAiRouter(`Claude JSON call failed (${response.status})${detail ? `: ${detail}` : ''}`);
     return null;
   }
   const data = (await response.json().catch(() => null)) as unknown;
@@ -1247,61 +1264,105 @@ const getAgent = (): AiAgent | null => {
   const anthropicAvailable = runtimeConfig.ai.anthropicApiKey.trim().length > 0;
   const codexAvailable = checkCodexCliReady();
 
+  const chain: Array<{
+    id: AiAgent['id'];
+    completeJson: (systemPrompt: string, userPrompt: string) => Promise<unknown | null>;
+    completeText: (prompt: string) => Promise<string | null>;
+  }> = [];
+
   if (provider === 'openai') {
-    if (!openAiAvailable) {
-      return null;
-    }
-    return {
-      id: 'openai',
-      completeJson: runOpenAiJsonPrompt,
-      completeText: runOpenAiTextPrompt,
-    };
-  }
-  if (provider === 'codex_cli') {
-    if (!codexAvailable) {
-      return null;
-    }
-    return {
-      id: 'codex_cli',
-      completeJson: runCodexCliJsonPrompt,
-      completeText: runCodexCliTextPrompt,
-    };
-  }
-  if (provider === 'anthropic') {
-    if (!anthropicAvailable) {
-      return null;
-    }
-    return {
-      id: 'anthropic',
-      completeJson: runAnthropicJsonPrompt,
-      completeText: runAnthropicTextPrompt,
-    };
-  }
-  if (provider === 'auto') {
     if (openAiAvailable) {
-      return {
+      chain.push({
         id: 'openai',
         completeJson: runOpenAiJsonPrompt,
         completeText: runOpenAiTextPrompt,
-      };
-    }
-    if (anthropicAvailable) {
-      return {
-        id: 'anthropic',
-        completeJson: runAnthropicJsonPrompt,
-        completeText: runAnthropicTextPrompt,
-      };
+      });
     }
     if (codexAvailable) {
-      return {
+      chain.push({
         id: 'codex_cli',
         completeJson: runCodexCliJsonPrompt,
         completeText: runCodexCliTextPrompt,
-      };
+      });
     }
+  } else if (provider === 'codex_cli') {
+    if (codexAvailable) {
+      chain.push({
+        id: 'codex_cli',
+        completeJson: runCodexCliJsonPrompt,
+        completeText: runCodexCliTextPrompt,
+      });
+    }
+  } else if (provider === 'anthropic' || provider === 'auto') {
+    if (anthropicAvailable) {
+      chain.push({
+        id: 'anthropic',
+        completeJson: runAnthropicJsonPrompt,
+        completeText: runAnthropicTextPrompt,
+      });
+    }
+    if (codexAvailable) {
+      chain.push({
+        id: 'codex_cli',
+        completeJson: runCodexCliJsonPrompt,
+        completeText: runCodexCliTextPrompt,
+      });
+    }
+    if (provider === 'auto' && chain.length === 0 && openAiAvailable) {
+      chain.push({
+        id: 'openai',
+        completeJson: runOpenAiJsonPrompt,
+        completeText: runOpenAiTextPrompt,
+      });
+      logAiRouter('AUTO provider fell back to OpenAI because Claude/Codex were unavailable.');
+    }
+  }
+
+  if (chain.length === 0) {
     return null;
   }
-  return null;
+
+  return {
+    id: chain[0].id,
+    completeJson: async (systemPrompt: string, userPrompt: string) => {
+      for (let index = 0; index < chain.length; index += 1) {
+        const entry = chain[index]!;
+        if (index === 0) {
+          logAiRouter(`JSON route primary=${entry.id}`);
+        } else {
+          logAiRouter(`JSON fallback -> ${entry.id}`);
+        }
+        const response = await entry.completeJson(systemPrompt, userPrompt).catch(() => null);
+        if (response !== null) {
+          if (index > 0) {
+            logAiRouter(`JSON fallback succeeded with ${entry.id}`);
+          }
+          return response;
+        }
+      }
+      logAiRouter('JSON route exhausted all providers.');
+      return null;
+    },
+    completeText: async (prompt: string) => {
+      for (let index = 0; index < chain.length; index += 1) {
+        const entry = chain[index]!;
+        if (index === 0) {
+          logAiRouter(`Text route primary=${entry.id}`);
+        } else {
+          logAiRouter(`Text fallback -> ${entry.id}`);
+        }
+        const response = await entry.completeText(prompt).catch(() => null);
+        if (response && response.trim()) {
+          if (index > 0) {
+            logAiRouter(`Text fallback succeeded with ${entry.id}`);
+          }
+          return response;
+        }
+      }
+      logAiRouter('Text route exhausted all providers.');
+      return null;
+    },
+  };
 };
 
 const maybeRunCodexCli = async (payload: AIInput): Promise<DiagramPatch | null> => {
@@ -1739,17 +1800,35 @@ export const generateDiagramPatch = async (
 
   let providerPatch: DiagramPatch | null = null;
   if (provider === 'codex_cli') {
+    logAiRouter('Diagram route primary=codex_cli');
     providerPatch = await maybeRunCodexCli(input).catch(() => null);
-  } else if (provider === 'openai' || provider === 'auto') {
-    providerPatch = await maybeRunOpenAi(input).catch(() => null);
-    if (!providerPatch && provider === 'auto') {
-      providerPatch = await maybeRunAnthropic(input).catch(() => null);
-    }
-    if (!providerPatch && provider === 'auto') {
-      providerPatch = await maybeRunCodexCli(input).catch(() => null);
-    }
-  } else if (provider === 'anthropic') {
+  } else if (provider === 'anthropic' || provider === 'auto') {
+    logAiRouter('Diagram route primary=anthropic');
     providerPatch = await maybeRunAnthropic(input).catch(() => null);
+    if (!providerPatch) {
+      logAiRouter('Diagram fallback -> codex_cli');
+      providerPatch = await maybeRunCodexCli(input).catch(() => null);
+      if (providerPatch) {
+        logAiRouter('Diagram fallback succeeded with codex_cli');
+      }
+    }
+    if (!providerPatch && provider === 'auto') {
+      logAiRouter('Diagram AUTO fallback -> openai');
+      providerPatch = await maybeRunOpenAi(input).catch(() => null);
+      if (providerPatch) {
+        logAiRouter('Diagram fallback succeeded with openai');
+      }
+    }
+  } else if (provider === 'openai') {
+    logAiRouter('Diagram route primary=openai');
+    providerPatch = await maybeRunOpenAi(input).catch(() => null);
+    if (!providerPatch) {
+      logAiRouter('Diagram fallback -> codex_cli');
+      providerPatch = await maybeRunCodexCli(input).catch(() => null);
+      if (providerPatch) {
+        logAiRouter('Diagram fallback succeeded with codex_cli');
+      }
+    }
   }
 
   const patchFromProviderLooksOff =
@@ -1780,19 +1859,22 @@ export const getAiProviderLabel = (): string => {
     return `openai:${runtimeConfig.ai.openaiModel}`;
   }
   if (provider === 'anthropic') {
-    return `anthropic:${runtimeConfig.ai.anthropicModel}`;
+    return `anthropic:${runtimeConfig.ai.anthropicModel}->codex_cli:${runtimeConfig.ai.codexModel}`;
   }
   if (provider === 'codex_cli') {
     return `codex_cli:${runtimeConfig.ai.codexModel}`;
   }
   if (provider === 'auto') {
+    if (runtimeConfig.ai.anthropicApiKey) {
+      return `auto->anthropic:${runtimeConfig.ai.anthropicModel}->codex_cli:${runtimeConfig.ai.codexModel}`;
+    }
+    if (checkCodexCliReady()) {
+      return `auto->codex_cli:${runtimeConfig.ai.codexModel}`;
+    }
     if (runtimeConfig.ai.openaiApiKey) {
       return `auto->openai:${runtimeConfig.ai.openaiModel}`;
     }
-    if (runtimeConfig.ai.anthropicApiKey) {
-      return `auto->anthropic:${runtimeConfig.ai.anthropicModel}`;
-    }
-    return checkCodexCliReady() ? `auto->codex_cli:${runtimeConfig.ai.codexModel}` : 'auto->deterministic';
+    return 'auto->deterministic';
   }
   return 'deterministic';
 };

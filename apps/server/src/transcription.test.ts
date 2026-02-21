@@ -2,8 +2,13 @@ import { afterEach, describe, expect, it, mock } from 'bun:test';
 
 type TranscriptionModule = typeof import('./transcription');
 
-const loadTranscriptionModule = async (overrides?: { openaiApiKey?: string; transcriptionModel?: string }) => {
+const loadTranscriptionModule = async (overrides?: {
+  openaiApiKey?: string;
+  anthropicApiKey?: string;
+  transcriptionModel?: string;
+}) => {
   mock.restore();
+  process.env.SENSEBOARD_ENABLE_CODEX_TRANSCRIBE_FALLBACK = '0';
   mock.module('./runtime-config', () => ({
     getRuntimeConfig: () => ({
       ai: {
@@ -13,7 +18,7 @@ const loadTranscriptionModule = async (overrides?: { openaiApiKey?: string; tran
         anthropicModel: 'claude-3-5-sonnet-20241022',
         codexModel: 'gpt-5-codex',
         openaiApiKey: overrides?.openaiApiKey ?? 'test-key',
-        anthropicApiKey: '',
+        anthropicApiKey: overrides?.anthropicApiKey ?? '',
         review: {
           maxRevisions: 20,
           confidenceThreshold: 0.98,
@@ -31,6 +36,7 @@ const loadTranscriptionModule = async (overrides?: { openaiApiKey?: string; tran
 
 afterEach(() => {
   mock.restore();
+  delete process.env.SENSEBOARD_ENABLE_CODEX_TRANSCRIBE_FALLBACK;
 });
 
 describe('transcription', () => {
@@ -72,6 +78,7 @@ describe('transcription', () => {
       expect(result).toEqual({
         ok: true,
         text: 'hello from whisper',
+        provider: 'openai_whisper',
       });
     } finally {
       globalThis.fetch = originalFetch;
@@ -86,7 +93,45 @@ describe('transcription', () => {
     try {
       const result = await module.transcribeAudioBlob(new Blob(['x'], { type: 'audio/webm' }));
       expect(result.ok).toBe(false);
-      expect(result.error).toContain('400');
+      expect(result.error).toContain('OpenAI whisper failed (400)');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('falls back to Claude transcription when Whisper fails', async () => {
+    const module = await loadTranscriptionModule({
+      openaiApiKey: 'openai-key',
+      anthropicApiKey: 'anthropic-key',
+    });
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/v1/audio/transcriptions')) {
+        return new Response('quota exceeded', { status: 429 });
+      }
+      return new Response(
+        JSON.stringify({
+          content: [{ type: 'text', text: 'claude transcript text' }],
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await module.transcribeAudioBlob(new Blob(['x'], { type: 'audio/webm' }));
+      expect(result).toEqual({
+        ok: true,
+        text: 'claude transcript text',
+        provider: 'anthropic',
+      });
+      expect(calls.some((url) => url.includes('/v1/audio/transcriptions'))).toBe(true);
+      expect(calls.some((url) => url.includes('/v1/messages'))).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }

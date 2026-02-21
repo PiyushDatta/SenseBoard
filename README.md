@@ -118,85 +118,35 @@ bun run test
 
 `bun run typecheck` validates both client and server TypeScript projects.
 
-## MVP Features Implemented
+## AI Flow
 
-- Room create/join with room code
-- Realtime shared room state over websocket
-- Canvas with programmatic AI updates (nodes, edges, title, notes, traversal order)
-- Transcript panel with mic capture (MediaRecorder -> OpenAI Whisper API) + manual fallback input
-- Chat panel with `normal` / `correction` / `suggestion`
-- Context Bank with `priority`, `scope`, `pinned`
-- Visual context hint input ("Currently sharing")
-- AI patch loop:
-  - scheduled every 5s
-  - immediate on correction/context/regenerate
-  - server-side rate limit (~2s)
-- Control toggles:
-  - Freeze AI
-  - Pin Diagram
-  - Focus Mode (draw box)
-  - Regenerate
-  - Undo AI
-  - Restore Last (brings back archived prior diagram)
+### Speech-to-Text (Mic On)
+1. Client sends audio to `POST /rooms/:roomId/transcribe`.
+2. Server transcription provider chain:
+   - `OpenAI Whisper` (primary)
+   - `Claude` (fallback)
+   - `Codex CLI` (final fallback)
+3. If transcription succeeds:
+   - transcript chunk is added to room state
+   - AI patch scheduling is triggered (debounced)
+4. Debounced transcript events enqueue AI patch jobs.
 
-## AI Engine Notes
+### AI Diagram Generation (Understand Text + Draw)
+1. AI patch job runs from server queue.
+2. Server builds prompt context from transcript/chat/context bank + current board state.
+3. Provider routing for diagram ops:
+   - If `provider = "anthropic"`: `Claude -> Codex CLI`
+   - If `provider = "auto"`: `Claude -> Codex CLI -> OpenAI` (OpenAI only if Claude/Codex unavailable)
+4. Returned board ops are applied to shared board state and broadcast to room members.
 
-The server endpoint `POST /rooms/:roomId/ai-patch` generates constrained `DiagramPatch` JSON:
+### Logging
+- Transcription routing/fallback logs:
+  - prefix: `[Transcription] ...`
+- AI routing/fallback logs:
+  - prefix: `[AI Router] ...`
 
-- operations: `upsertNode`, `upsertEdge`, `deleteShape`, `setTitle`, `setNotes`, `highlightOrder`, `layoutHint`
-- supported diagram types: `tree`, `system_blocks`, `flowchart`
-- priority handling:
-  - typed corrections override transcript
-  - pinned context is treated as ground truth
-  - high-priority pinned context is always included first
-
-Provider selection:
-
-- `provider=deterministic`: local deterministic patch generator only
-- `provider=openai`: OpenAI API (`OPENAI_API_KEY` or `ai.openai_api_key`, optional `openai_model`, default `gpt-4.1-mini`)
-- `provider=anthropic`: Anthropic Messages API (`ANTHROPIC_API_KEY` or `ai.anthropic_api_key`, optional `anthropic_model`, default `claude-3-5-sonnet-20241022`)
-- `provider=codex_cli`: uses local `codex exec` CLI (requires `codex login status`; optional `codex_model`, default `gpt-5-codex`)
-- `provider=auto` (default): OpenAI if key exists, else Anthropic if key exists, else Codex CLI if logged in, otherwise deterministic
-- Review loop: each patch is reviewed and revised up to `ai.review.max_revisions` until `ai.review.confidence_threshold` is met.
-
-Transcription provider:
-
-- Mic transcription uses OpenAI Audio Transcriptions API via `POST /rooms/:roomId/transcribe`.
-- Default transcription model is `whisper-1` (set via `ai.openai_transcription_model` or `OPENAI_TRANSCRIPTION_MODEL`).
-- No local Whisper runtime/GPU is needed.
-
-Example (Codex CLI provider via TOML): set `ai.provider = "codex_cli"` then run:
-
-```bash
-bun run server
-```
-
-## Demo Script
-
-### Demo 1: Tree traversal
-
-1. Create room, join from two browser windows.
-2. Click **Start Mic**.
-3. Say: `We have a tree with root A, children B and C. B has D and E.`
-4. Say: `We'll do DFS pre-order.`
-5. Verify tree + traversal order.
-6. In second user window, send Chat as **Correction**:
-   `Actually, it's post-order.`
-7. Verify traversal order updates.
-
-### Demo 2: System design transition
-
-1. Click **Pin Diagram**.
-2. Say: `Now architecture: Client -> API Gateway -> Service -> Postgres. Add Redis cache between service and DB.`
-3. Verify a new diagram group appears beside the pinned one.
-4. Add Context Bank item:
-   - Title: `Constraint`
-   - Content: `Must handle 10k RPS, prefer read cache.`
-   - Priority: `High`
-   - Pinned: `true`
-5. Verify notes/context-driven updates after AI tick or **Regenerate**.
-
-## Meet Demo Options
-
-- Fast path: Share SenseBoard tab in Google Meet, keep Meet in picture-in-picture.
-- Add-on path (later): package this web app via Meet add-ons HTTP deployment.
+### Current Config
+- `senseboard.config.toml` currently uses:
+  - `provider = "auto"`
+- So effective AI drawing flow right now is:
+  - `Claude` primary, `Codex CLI` -> OpenAI fallback.
