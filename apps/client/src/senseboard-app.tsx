@@ -9,7 +9,7 @@ import { JoinScreen } from './components/join-screen';
 import { Sidebar, type SidebarTab } from './components/sidebar';
 import { useRoomSocket } from './hooks/use-room-socket';
 import { useSpeechTranscript } from './hooks/use-speech-transcript';
-import { createRoom, getRoom, triggerAiPatch } from './lib/api';
+import { createRoom, getRoom, transcribeAudioChunk, triggerAiPatch } from './lib/api';
 import { THEMES, clampThemeMode, resolveThemeMode, type ThemeMode } from './lib/theme';
 
 interface ContextDraft {
@@ -209,9 +209,30 @@ export const SenseBoardApp = () => {
     [pushTranscriptChunk],
   );
 
+  const handleMicAudioChunk = useCallback(
+    async (audioChunk: Blob, mimeType: string) => {
+      if (!roomId) {
+        return;
+      }
+      const response = await transcribeAudioChunk(roomId, displayName, audioChunk, mimeType);
+      if (!response.ok) {
+        throw new Error(response.error || 'Transcription failed.');
+      }
+    },
+    [displayName, roomId],
+  );
+
   const speech = useSpeechTranscript({
     onChunk: handleSpeechChunk,
+    onAudioChunk: handleMicAudioChunk,
+    chunkMs: 2600,
   });
+
+  useEffect(() => {
+    if (speech.error) {
+      setError(speech.error);
+    }
+  }, [speech.error]);
 
   const runAiPatch = useCallback(
     async (reason: 'tick' | 'correction' | 'context' | 'regenerate' | 'manual', regenerate = false) => {
@@ -357,7 +378,7 @@ export const SenseBoardApp = () => {
     setShowOptions(false);
   }, [speech]);
 
-  const sortedMembers = useMemo(() => currentRoom?.members.map((member) => member.name).join(', ') ?? '', [currentRoom?.members]);
+  const totalConnectedMembers = currentRoom?.members.length ?? 0;
 
   if (!roomId) {
     return (
@@ -441,7 +462,13 @@ export const SenseBoardApp = () => {
       <View style={[styles.statusPill, { borderColor: theme.colors.panelBorder, backgroundColor: theme.colors.panel }]}>
         <Text style={[styles.statusText, { color: theme.colors.textPrimary, fontFamily: theme.fonts.heading }]}>Room {roomId}</Text>
         <Text style={[styles.statusSubText, { color: theme.colors.textSecondary, fontFamily: theme.fonts.body }]}>
-          {connected ? 'Connected' : 'Reconnecting'} | AI {currentRoom.aiConfig.status} | Members {sortedMembers || 'None'}
+          Current user: {displayName || 'Guest'}
+        </Text>
+        <Text style={[styles.statusSubText, { color: theme.colors.textSecondary, fontFamily: theme.fonts.body }]}>
+          Total members connected: {totalConnectedMembers}
+        </Text>
+        <Text style={[styles.statusSubText, { color: theme.colors.textMuted, fontFamily: theme.fonts.body }]}>
+          {connected ? 'Connected' : 'Reconnecting'} | AI {currentRoom.aiConfig.status}
         </Text>
       </View>
 

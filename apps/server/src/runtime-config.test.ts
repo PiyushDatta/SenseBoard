@@ -11,8 +11,11 @@ const envKeys = [
   'SENSEBOARD_CONFIG',
   'AI_PROVIDER',
   'OPENAI_MODEL',
+  'OPENAI_TRANSCRIPTION_MODEL',
+  'ANTHROPIC_MODEL',
   'CODEX_MODEL',
   'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY',
   'PORT',
   'PORT_SCAN_SPAN',
   'AI_REVIEW_MAX_REVISIONS',
@@ -81,7 +84,10 @@ describe('runtime-config', () => {
         const runtimeConfig = (await loadRuntimeConfigModule()).getRuntimeConfig();
         expect(runtimeConfig.ai.provider).toBe('auto');
         expect(runtimeConfig.ai.openaiModel).toBe('gpt-4.1-mini');
+        expect(runtimeConfig.ai.openaiTranscriptionModel).toBe('whisper-1');
+        expect(runtimeConfig.ai.anthropicModel).toBe('claude-3-5-sonnet-20241022');
         expect(runtimeConfig.ai.codexModel).toBe('gpt-5-codex');
+        expect(runtimeConfig.ai.anthropicApiKey).toBe('');
         expect(runtimeConfig.server.port).toBe(8787);
         expect(runtimeConfig.server.portScanSpan).toBe(8);
         expect(runtimeConfig.ai.review.maxRevisions).toBe(20);
@@ -91,19 +97,22 @@ describe('runtime-config', () => {
     );
   });
 
-  it('reads values from TOML config and normalizes confidence threshold', async () => {
+  it('reads values from TOML config with 0-1 confidence threshold', async () => {
     const configPath = writeTempToml(
       'config-a.toml',
       `
 [ai]
 provider = "openai"
 openai_model = "gpt-4o-mini"
+openai_transcription_model = "gpt-4o-mini-transcribe"
+anthropic_model = "claude-3-5-haiku-20241022"
 codex_model = "gpt-5-mini"
 openai_api_key = "file-key"
+anthropic_api_key = "file-anthropic-key"
 
 [ai.review]
 max_revisions = 11
-confidence_threshold = 9.7
+confidence_threshold = 0.97
 
 [server]
 port = 9011
@@ -119,8 +128,11 @@ port_scan_span = 5
         const runtimeConfig = (await loadRuntimeConfigModule()).getRuntimeConfig();
         expect(runtimeConfig.ai.provider).toBe('openai');
         expect(runtimeConfig.ai.openaiModel).toBe('gpt-4o-mini');
+        expect(runtimeConfig.ai.openaiTranscriptionModel).toBe('gpt-4o-mini-transcribe');
+        expect(runtimeConfig.ai.anthropicModel).toBe('claude-3-5-haiku-20241022');
         expect(runtimeConfig.ai.codexModel).toBe('gpt-5-mini');
         expect(runtimeConfig.ai.openaiApiKey).toBe('file-key');
+        expect(runtimeConfig.ai.anthropicApiKey).toBe('file-anthropic-key');
         expect(runtimeConfig.ai.review.maxRevisions).toBe(11);
         expect(runtimeConfig.ai.review.confidenceThreshold).toBeCloseTo(0.97, 5);
         expect(runtimeConfig.server.port).toBe(9011);
@@ -137,8 +149,11 @@ port_scan_span = 5
 [ai]
 provider = "deterministic"
 openai_model = "from-file-openai"
+openai_transcription_model = "from-file-transcribe"
+anthropic_model = "from-file-anthropic-model"
 codex_model = "from-file-codex"
 openai_api_key = "from-file-key"
+anthropic_api_key = "from-file-anthropic-key"
 
 [ai.review]
 max_revisions = 2
@@ -155,23 +170,46 @@ port_scan_span = 2
         SENSEBOARD_CONFIG: configPath,
         AI_PROVIDER: 'codex_cli',
         OPENAI_MODEL: 'from-env-openai',
+        OPENAI_TRANSCRIPTION_MODEL: 'from-env-transcribe',
+        ANTHROPIC_MODEL: 'from-env-anthropic-model',
         CODEX_MODEL: 'from-env-codex',
         OPENAI_API_KEY: 'from-env-key',
+        ANTHROPIC_API_KEY: 'from-env-anthropic-key',
         PORT: '9101',
         PORT_SCAN_SPAN: '12',
         AI_REVIEW_MAX_REVISIONS: '33',
-        AI_REVIEW_CONFIDENCE_THRESHOLD: '8.6',
+        AI_REVIEW_CONFIDENCE_THRESHOLD: '0.86',
       },
       async () => {
         const runtimeConfig = (await loadRuntimeConfigModule()).getRuntimeConfig();
         expect(runtimeConfig.ai.provider).toBe('codex_cli');
         expect(runtimeConfig.ai.openaiModel).toBe('from-env-openai');
+        expect(runtimeConfig.ai.openaiTranscriptionModel).toBe('from-env-transcribe');
+        expect(runtimeConfig.ai.anthropicModel).toBe('from-env-anthropic-model');
         expect(runtimeConfig.ai.codexModel).toBe('from-env-codex');
         expect(runtimeConfig.ai.openaiApiKey).toBe('from-env-key');
+        expect(runtimeConfig.ai.anthropicApiKey).toBe('from-env-anthropic-key');
         expect(runtimeConfig.server.port).toBe(9101);
         expect(runtimeConfig.server.portScanSpan).toBe(12);
         expect(runtimeConfig.ai.review.maxRevisions).toBe(33);
         expect(runtimeConfig.ai.review.confidenceThreshold).toBeCloseTo(0.86, 5);
+      },
+    );
+  });
+
+  it('accepts anthropic provider and API key from environment', async () => {
+    await withEnv(
+      {
+        SENSEBOARD_CONFIG: join(tempRoot, 'missing-anthropic.toml'),
+        AI_PROVIDER: 'anthropic',
+        ANTHROPIC_MODEL: 'claude-3-7-sonnet-latest',
+        ANTHROPIC_API_KEY: 'anthropic-test-key',
+      },
+      async () => {
+        const runtimeConfig = (await loadRuntimeConfigModule()).getRuntimeConfig();
+        expect(runtimeConfig.ai.provider).toBe('anthropic');
+        expect(runtimeConfig.ai.anthropicModel).toBe('claude-3-7-sonnet-latest');
+        expect(runtimeConfig.ai.anthropicApiKey).toBe('anthropic-test-key');
       },
     );
   });

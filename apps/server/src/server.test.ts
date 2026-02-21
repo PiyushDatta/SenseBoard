@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it, mock } from 'bun:test';
 type ServerModule = typeof import('./server');
 
 interface AiMockOverrides {
-  createSystemPromptPayloadPreview?: () => unknown;
   generateBoardOps?: () => Promise<{ ops: unknown[]; fingerprint: string }>;
   hasAiSignal?: () => boolean;
   runAiPreflightCheck?: () => Promise<{ ok: boolean }>;
+  transcribeAudioBlob?: () => Promise<{ ok: boolean; text: string; error?: string }>;
 }
 
 const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<ServerModule> => {
@@ -17,8 +17,11 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
       ai: {
         provider: 'deterministic',
         openaiModel: 'gpt-4.1-mini',
+        openaiTranscriptionModel: 'whisper-1',
+        anthropicModel: 'claude-3-5-sonnet-20241022',
         codexModel: 'gpt-5-codex',
         openaiApiKey: '',
+        anthropicApiKey: '',
         review: {
           maxRevisions: 20,
           confidenceThreshold: 0.98,
@@ -33,7 +36,6 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
   }));
 
   mock.module('./ai-engine', () => ({
-    createSystemPromptPayloadPreview: overrides.createSystemPromptPayloadPreview ?? (() => ({ preview: 'ok' })),
     generateBoardOps:
       overrides.generateBoardOps ??
       (async () => ({
@@ -57,6 +59,15 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
     getAiProviderLabel: () => 'mock-provider',
     hasAiSignal: overrides.hasAiSignal ?? (() => true),
     runAiPreflightCheck: overrides.runAiPreflightCheck ?? (async () => ({ ok: true })),
+  }));
+
+  mock.module('./transcription', () => ({
+    transcribeAudioBlob:
+      overrides.transcribeAudioBlob ??
+      (async () => ({
+        ok: true,
+        text: 'mock transcript',
+      })),
   }));
 
   return (await import(`./server.ts?test=${Date.now()}-${Math.random()}`)) as ServerModule;
@@ -104,25 +115,6 @@ describe('server fetchHandler', () => {
     expect(roomResponse?.status).toBe(200);
     const roomPayload = await roomResponse?.json();
     expect(roomPayload?.room?.id).toBe(created?.roomId);
-  });
-
-  it('returns prompt preview payload from mocked AI prompt builder', async () => {
-    const server = await loadServerModule({
-      createSystemPromptPayloadPreview: () => ({
-        systemPrompt: 'system',
-        userPrompt: 'user',
-      }),
-    });
-
-    const response = await server.fetchHandler(new Request('http://localhost/rooms/prompt1/prompt-preview', { method: 'GET' }), {
-      upgrade: () => false,
-    });
-    expect(response?.status).toBe(200);
-    const payload = await response?.json();
-    expect(payload).toEqual({
-      systemPrompt: 'system',
-      userPrompt: 'user',
-    });
   });
 
   it('runs AI preflight and maps non-ok to 503', async () => {
@@ -244,6 +236,78 @@ describe('server fetchHandler', () => {
     });
   });
 
+  it('accepts multipart audio transcription and appends transcript to room state', async () => {
+    const server = await loadServerModule({
+      transcribeAudioBlob: async () => ({
+        ok: true,
+        text: 'Root A has children B and C',
+      }),
+    });
+
+    const form = new FormData();
+    form.append('speaker', 'Host');
+    form.append('audio', new File(['fake-audio'], 'chunk.webm', { type: 'audio/webm' }));
+
+    const transcribeResponse = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-audio-1/transcribe', {
+        method: 'POST',
+        body: form,
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(transcribeResponse?.status).toBe(200);
+    const transcribePayload = await transcribeResponse?.json();
+    expect(transcribePayload).toMatchObject({
+      ok: true,
+      accepted: true,
+      text: 'Root A has children B and C',
+    });
+
+    const roomResponse = await server.fetchHandler(new Request('http://localhost/rooms/ROOM-AUDIO-1', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(roomResponse?.status).toBe(200);
+    const roomPayload = (await roomResponse?.json()) as {
+      room: {
+        transcriptChunks: Array<{ speaker: string; text: string; source: string }>;
+      };
+    };
+    expect(roomPayload.room.transcriptChunks.length).toBe(1);
+    expect(roomPayload.room.transcriptChunks[0]).toMatchObject({
+      speaker: 'Host',
+      text: 'Root A has children B and C',
+      source: 'mic',
+    });
+
+    server.__resetAiQueueForTests();
+  });
+
+  it('returns 400 on transcribe endpoint when audio file is missing', async () => {
+    const server = await loadServerModule();
+    const form = new FormData();
+    form.append('speaker', 'Host');
+
+    const response = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-audio-2/transcribe', {
+        method: 'POST',
+        body: form,
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(response?.status).toBe(400);
+    const payload = await response?.json();
+    expect(payload).toEqual({
+      ok: false,
+      error: 'audio file is required',
+    });
+  });
+
   it('returns 404 for unknown routes', async () => {
     const server = await loadServerModule();
     const response = await server.fetchHandler(new Request('http://localhost/nope', { method: 'GET' }), {
@@ -313,6 +377,71 @@ describe('server websocketHandler', () => {
     const payload = JSON.parse(sent[0] ?? '{}') as { type: string; payload: { message: string } };
     expect(payload.type).toBe('room:error');
     expect(payload.payload.message).toContain('Invalid websocket message');
+  });
+
+  it('queues an AI patch after transcript chunks arrive over websocket', async () => {
+    let aiCallCount = 0;
+    const server = await loadServerModule({
+      generateBoardOps: async () => {
+        aiCallCount += 1;
+        return {
+          ops: [
+            {
+              type: 'upsertElement',
+              element: {
+                id: `ai-transcript-${aiCallCount}`,
+                kind: 'rect',
+                x: 12,
+                y: 24,
+                w: 160,
+                h: 90,
+                createdAt: Date.now(),
+                createdBy: 'ai',
+              },
+            },
+          ],
+          fingerprint: `fp-transcript-${aiCallCount}`,
+        };
+      },
+    });
+
+    const sent: string[] = [];
+    const ws = {
+      data: {
+        roomId: 'ROOM-WS-TX',
+        memberId: 'u-3',
+        memberName: 'Taylor',
+      },
+      send: (value: string) => {
+        sent.push(value);
+      },
+    };
+
+    server.websocketHandler.open(ws);
+    sent.length = 0;
+
+    server.websocketHandler.message(
+      ws,
+      JSON.stringify({
+        type: 'transcript:add',
+        payload: {
+          text: 'We have a tree with root A and children B and C.',
+          source: 'mic',
+        },
+      }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 850));
+
+    expect(aiCallCount).toBe(1);
+    const latestSnapshot = JSON.parse(sent.at(-1) ?? '{}') as {
+      type: string;
+      payload: { transcriptChunks: Array<{ text: string }> };
+    };
+    expect(latestSnapshot.type).toBe('room:snapshot');
+    expect(latestSnapshot.payload.transcriptChunks.at(-1)?.text).toContain('root A');
+
+    server.__resetAiQueueForTests();
   });
 
   it('detaches sockets on close and broadcasts updated membership', async () => {

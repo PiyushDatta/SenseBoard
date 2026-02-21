@@ -151,3 +151,50 @@ export const triggerAiPatch = async (roomId: string, request: TriggerPatchReques
     `Trigger AI patch for room ${roomId.toUpperCase()}`,
   );
 };
+
+export interface TranscribeAudioResponse {
+  ok: boolean;
+  text: string;
+  accepted?: boolean;
+  reason?: string;
+  error?: string;
+}
+
+const extensionForMimeType = (mimeType: string): string => {
+  const lower = mimeType.toLowerCase();
+  if (lower.includes('ogg')) {
+    return 'ogg';
+  }
+  if (lower.includes('mp4') || lower.includes('m4a')) {
+    return 'm4a';
+  }
+  if (lower.includes('wav')) {
+    return 'wav';
+  }
+  if (lower.includes('mpeg') || lower.includes('mp3')) {
+    return 'mp3';
+  }
+  return 'webm';
+};
+
+export const transcribeAudioChunk = async (
+  roomId: string,
+  speaker: string,
+  audioChunk: Blob,
+  mimeType?: string,
+): Promise<TranscribeAudioResponse> => {
+  const normalizedMime = (mimeType || audioChunk.type || 'audio/webm').trim() || 'audio/webm';
+  const ext = extensionForMimeType(normalizedMime);
+  const form = new FormData();
+  form.append('speaker', speaker.trim() || 'Speaker');
+  form.append('audio', new File([audioChunk], `chunk.${ext}`, { type: normalizedMime }));
+
+  return requestJson<TranscribeAudioResponse>(
+    `/rooms/${encodeURIComponent(roomId.toUpperCase())}/transcribe`,
+    {
+      method: 'POST',
+      body: form,
+    },
+    `Transcribe audio for room ${roomId.toUpperCase()}`,
+  );
+};

@@ -3,23 +3,23 @@ port = 8787
 port_scan_span = 8
 
 [ai]
-# Active provider (supported now): auto | openai | codex_cli | deterministic
-provider = "codex_cli"
+# Active provider: auto | openai | anthropic | codex_cli | deterministic
+provider = "auto"
 openai_model = "gpt-4.1-mini"
+openai_transcription_model = "whisper-1"
+anthropic_model = "claude-3-5-sonnet-20241022"
 codex_model = "gpt-5-codex"
 
 # Optional
 # Prefer setting OPENAI_API_KEY in your env file for secrets.
 # openai_api_key = ""
 
-# Optional Claude/Anthropic config (kept here for quick switch readiness).
-# Note: provider="claude" is not wired in runtime yet; use when Claude support is enabled.
-# claude_model = "claude-3-7-sonnet-latest"
-# claude_api_key = ""
+# Optional Anthropic config.
+# Prefer setting ANTHROPIC_API_KEY in your env file for secrets.
+# anthropic_api_key = ""
 
 [ai.review]
 # Max review/revision passes per patch cycle.
 max_revisions = 20
-# Accepts either 0-1 or 0-10 scale.
-# 9.8 means 9.8/10 (internally 0.98).
-confidence_threshold = 9.8
+# Range: 0.0 to 1.0.
+confidence_threshold = 0.98

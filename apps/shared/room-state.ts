@@ -6,7 +6,6 @@ import type {
   DiagramType,
   FocusBox,
   RoomState,
-  RoomSummary,
 } from './types';
 
 const roomIdAlphabet = customAlphabet('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 6);
@@ -72,16 +71,6 @@ export const createEmptyRoom = (roomId: string): RoomState => {
     lastAiPatchAt: 0,
     lastAiFingerprint: '',
     board: createEmptyBoardState(),
-  };
-};
-
-export const toRoomSummary = (room: RoomState): RoomSummary => {
-  return {
-    roomId: room.id,
-    activeMembers: room.members.length,
-    transcriptCount: room.transcriptChunks.length,
-    contextCount: room.contextItems.length,
-    diagramGroupCount: Object.keys(room.diagramGroups).length,
   };
 };
 

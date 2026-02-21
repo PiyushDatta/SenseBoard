@@ -77,7 +77,9 @@ const runCodexLogin = async (): Promise<boolean> => {
 const main = async () => {
   const config = getRuntimeConfig();
   const provider = config.ai.provider;
-  const codexPrimary = provider === 'codex_cli' || (provider === 'auto' && !config.ai.openaiApiKey);
+  const codexPrimary =
+    provider === 'codex_cli' ||
+    (provider === 'auto' && !config.ai.openaiApiKey && !config.ai.anthropicApiKey);
 
   if (codexPrimary) {
     const codex = probeCodex();

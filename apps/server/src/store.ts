@@ -101,6 +101,32 @@ export const createSocketData = (roomId: string, memberName: string) => {
   };
 };
 
+export const addTranscriptChunk = (
+  room: RoomState,
+  payload: {
+    speaker: string;
+    text: string;
+    source: 'mic' | 'manual';
+  },
+) => {
+  const text = payload.text.trim();
+  if (!text) {
+    return false;
+  }
+  room.transcriptChunks.push({
+    id: newId(),
+    speaker: payload.speaker.trim() || 'Speaker',
+    text,
+    source: payload.source,
+    createdAt: Date.now(),
+  });
+  if (room.transcriptChunks.length > MAX_TRANSCRIPT_CHUNKS) {
+    room.transcriptChunks = room.transcriptChunks.slice(room.transcriptChunks.length - MAX_TRANSCRIPT_CHUNKS);
+  }
+  room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'listening';
+  return true;
+};
+
 export const applyClientMessage = (room: RoomState, sender: SocketWithData['data'], message: ClientMessage) => {
   const now = Date.now();
   if (message.type === 'chat:add') {
@@ -169,20 +195,11 @@ export const applyClientMessage = (room: RoomState, sender: SocketWithData['data
   }
 
   if (message.type === 'transcript:add') {
-    if (!message.payload.text.trim()) {
-      return;
-    }
-    room.transcriptChunks.push({
-      id: newId(),
+    addTranscriptChunk(room, {
       speaker: sender.memberName,
-      text: message.payload.text.trim(),
+      text: message.payload.text,
       source: message.payload.source,
-      createdAt: now,
     });
-    if (room.transcriptChunks.length > MAX_TRANSCRIPT_CHUNKS) {
-      room.transcriptChunks = room.transcriptChunks.slice(room.transcriptChunks.length - MAX_TRANSCRIPT_CHUNKS);
-    }
-    room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'listening';
     return;
   }
 

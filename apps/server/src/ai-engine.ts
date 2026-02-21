@@ -153,11 +153,13 @@ const buildTranscriptWindow = (chunks: TranscriptChunk[], threshold: number): st
 const normalizeToken = (value: string) => value.trim().replace(/[^\w-]/g, '');
 
 const safeJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-type AIProvider = 'deterministic' | 'openai' | 'codex_cli' | 'auto';
+type AIProvider = 'deterministic' | 'openai' | 'anthropic' | 'codex_cli' | 'auto';
 let codexCliStatus: 'unknown' | 'ready' | 'unavailable' = 'unknown';
+const CODEX_REASONING_EFFORT = 'high';
+const ANTHROPIC_API_VERSION = '2023-06-01';
 
 interface AiAgent {
-  id: 'openai' | 'codex_cli';
+  id: 'openai' | 'anthropic' | 'codex_cli';
   completeJson: (systemPrompt: string, userPrompt: string) => Promise<unknown | null>;
   completeText: (prompt: string) => Promise<string | null>;
 }
@@ -1027,7 +1029,19 @@ const runCodexCliJsonPrompt = async (systemPrompt: string, userPrompt: string): 
   const prompt = [systemPrompt, userPrompt].join('\n\n');
   try {
     const result = Bun.spawnSync({
-      cmd: ['codex', 'exec', '--output-last-message', outputFile, '--color', 'never', '-m', model, prompt],
+      cmd: [
+        'codex',
+        'exec',
+        '--output-last-message',
+        outputFile,
+        '--color',
+        'never',
+        '-m',
+        model,
+        '-c',
+        `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+        prompt,
+      ],
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 45000,
@@ -1079,6 +1093,59 @@ const runOpenAiJsonPrompt = async (systemPrompt: string, userPrompt: string): Pr
   return parseJsonObject(content);
 };
 
+const extractAnthropicText = (value: unknown): string => {
+  if (!value || typeof value !== 'object') {
+    return '';
+  }
+  const root = value as { content?: unknown };
+  if (!Array.isArray(root.content)) {
+    return '';
+  }
+  const textBlocks = root.content
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+      const block = item as { type?: unknown; text?: unknown };
+      return block.type === 'text' && typeof block.text === 'string' ? block.text : '';
+    })
+    .filter((text) => text.length > 0);
+  return textBlocks.join('\n').trim();
+};
+
+const runAnthropicJsonPrompt = async (systemPrompt: string, userPrompt: string): Promise<unknown | null> => {
+  const runtimeConfig = getRuntimeConfig();
+  const apiKey = runtimeConfig.ai.anthropicApiKey;
+  if (!apiKey) {
+    return null;
+  }
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    body: JSON.stringify({
+      model: runtimeConfig.ai.anthropicModel,
+      max_tokens: 1600,
+      temperature: 0.15,
+      system: `${systemPrompt}\n\nReturn a valid JSON object only.`,
+      messages: [{ role: 'user', content: userPrompt }],
+    }),
+  });
+  if (!response.ok) {
+    return null;
+  }
+  const data = (await response.json().catch(() => null)) as unknown;
+  const content = extractAnthropicText(data);
+  if (!content) {
+    return null;
+  }
+  return parseJsonObject(content);
+};
+
 const runCodexCliTextPrompt = async (prompt: string): Promise<string | null> => {
   if (!checkCodexCliReady()) {
     return null;
@@ -1087,7 +1154,19 @@ const runCodexCliTextPrompt = async (prompt: string): Promise<string | null> => 
   const model = getRuntimeConfig().ai.codexModel;
   try {
     const result = Bun.spawnSync({
-      cmd: ['codex', 'exec', '--output-last-message', outputFile, '--color', 'never', '-m', model, prompt],
+      cmd: [
+        'codex',
+        'exec',
+        '--output-last-message',
+        outputFile,
+        '--color',
+        'never',
+        '-m',
+        model,
+        '-c',
+        `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+        prompt,
+      ],
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 30000,
@@ -1132,10 +1211,40 @@ const runOpenAiTextPrompt = async (prompt: string): Promise<string | null> => {
   return content && content.length > 0 ? content : null;
 };
 
+const runAnthropicTextPrompt = async (prompt: string): Promise<string | null> => {
+  const runtimeConfig = getRuntimeConfig();
+  const apiKey = runtimeConfig.ai.anthropicApiKey;
+  if (!apiKey) {
+    return null;
+  }
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    body: JSON.stringify({
+      model: runtimeConfig.ai.anthropicModel,
+      max_tokens: 256,
+      temperature: 0,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+  if (!response.ok) {
+    return null;
+  }
+  const data = (await response.json().catch(() => null)) as unknown;
+  const content = extractAnthropicText(data);
+  return content.length > 0 ? content : null;
+};
+
 const getAgent = (): AiAgent | null => {
   const provider = getConfiguredProvider();
   const runtimeConfig = getRuntimeConfig();
   const openAiAvailable = runtimeConfig.ai.openaiApiKey.trim().length > 0;
+  const anthropicAvailable = runtimeConfig.ai.anthropicApiKey.trim().length > 0;
   const codexAvailable = checkCodexCliReady();
 
   if (provider === 'openai') {
@@ -1158,12 +1267,29 @@ const getAgent = (): AiAgent | null => {
       completeText: runCodexCliTextPrompt,
     };
   }
+  if (provider === 'anthropic') {
+    if (!anthropicAvailable) {
+      return null;
+    }
+    return {
+      id: 'anthropic',
+      completeJson: runAnthropicJsonPrompt,
+      completeText: runAnthropicTextPrompt,
+    };
+  }
   if (provider === 'auto') {
     if (openAiAvailable) {
       return {
         id: 'openai',
         completeJson: runOpenAiJsonPrompt,
         completeText: runOpenAiTextPrompt,
+      };
+    }
+    if (anthropicAvailable) {
+      return {
+        id: 'anthropic',
+        completeJson: runAnthropicJsonPrompt,
+        completeText: runAnthropicTextPrompt,
       };
     }
     if (codexAvailable) {
@@ -1185,6 +1311,11 @@ const maybeRunCodexCli = async (payload: AIInput): Promise<DiagramPatch | null> 
 
 const maybeRunOpenAi = async (payload: AIInput): Promise<DiagramPatch | null> => {
   const parsed = await runOpenAiJsonPrompt(buildDiagramPatchSystemPrompt(), buildDiagramPatchUserPrompt(payload));
+  return coercePatch(parsed);
+};
+
+const maybeRunAnthropic = async (payload: AIInput): Promise<DiagramPatch | null> => {
+  const parsed = await runAnthropicJsonPrompt(buildDiagramPatchSystemPrompt(), buildDiagramPatchUserPrompt(payload));
   return coercePatch(parsed);
 };
 
@@ -1611,6 +1742,14 @@ export const generateDiagramPatch = async (
     providerPatch = await maybeRunCodexCli(input).catch(() => null);
   } else if (provider === 'openai' || provider === 'auto') {
     providerPatch = await maybeRunOpenAi(input).catch(() => null);
+    if (!providerPatch && provider === 'auto') {
+      providerPatch = await maybeRunAnthropic(input).catch(() => null);
+    }
+    if (!providerPatch && provider === 'auto') {
+      providerPatch = await maybeRunCodexCli(input).catch(() => null);
+    }
+  } else if (provider === 'anthropic') {
+    providerPatch = await maybeRunAnthropic(input).catch(() => null);
   }
 
   const patchFromProviderLooksOff =
@@ -1640,11 +1779,20 @@ export const getAiProviderLabel = (): string => {
   if (provider === 'openai') {
     return `openai:${runtimeConfig.ai.openaiModel}`;
   }
+  if (provider === 'anthropic') {
+    return `anthropic:${runtimeConfig.ai.anthropicModel}`;
+  }
   if (provider === 'codex_cli') {
     return `codex_cli:${runtimeConfig.ai.codexModel}`;
   }
   if (provider === 'auto') {
-    return runtimeConfig.ai.openaiApiKey ? `auto->openai:${runtimeConfig.ai.openaiModel}` : 'auto->deterministic';
+    if (runtimeConfig.ai.openaiApiKey) {
+      return `auto->openai:${runtimeConfig.ai.openaiModel}`;
+    }
+    if (runtimeConfig.ai.anthropicApiKey) {
+      return `auto->anthropic:${runtimeConfig.ai.anthropicModel}`;
+    }
+    return checkCodexCliReady() ? `auto->codex_cli:${runtimeConfig.ai.codexModel}` : 'auto->deterministic';
   }
   return 'deterministic';
 };

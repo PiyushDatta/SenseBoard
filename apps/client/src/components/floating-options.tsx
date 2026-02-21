@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PanResponder, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import { isDragGesture, shouldToggleOptionsOnPress } from './floating-options.logic';
 import type { ChatMessage } from '../../../shared/types';
@@ -238,16 +239,34 @@ export const FloatingOptions = ({
         </View>
       ) : null}
       <Pressable
+        onPress={onToggleMic}
+        disabled={!micSupported}
+        style={({ pressed }) => [
+          styles.fabButton,
+          {
+            borderColor: micListening ? theme.colors.accent : theme.colors.buttonBorder,
+            backgroundColor: micListening ? theme.colors.accentSoft : theme.colors.buttonBg,
+          },
+          !micSupported && styles.optionDisabled,
+          pressed && styles.handlePressed,
+        ]}>
+        <MaterialIcons
+          name={micListening ? 'mic' : 'mic-none'}
+          size={20}
+          color={micListening ? theme.colors.accentText : theme.colors.buttonText}
+        />
+      </Pressable>
+      <Pressable
         onPress={() => setChatOpen((value) => !value)}
         style={({ pressed }) => [
-          styles.chatFab,
+          styles.fabButton,
           {
             borderColor: theme.colors.buttonBorder,
             backgroundColor: theme.colors.buttonBg,
           },
           pressed && styles.handlePressed,
         ]}>
-        <Text style={[styles.chatFabText, { color: theme.colors.buttonText, fontFamily: theme.fonts.heading }]}>💬</Text>
+        <MaterialIcons name={chatOpen ? 'chat' : 'chat-bubble-outline'} size={20} color={theme.colors.buttonText} />
       </Pressable>
       <Pressable
         {...panResponder.panHandlers}
@@ -435,16 +454,13 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontStyle: 'italic',
   },
-  chatFab: {
+  fabButton: {
     width: 44,
     height: 44,
     borderRadius: 999,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  chatFabText: {
-    fontSize: 20,
   },
   handle: {
     borderWidth: 1,
@@ -460,3 +476,5 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
 });
+
+

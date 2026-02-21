@@ -1,14 +1,17 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-type AIProvider = 'deterministic' | 'openai' | 'codex_cli' | 'auto';
+type AIProvider = 'deterministic' | 'openai' | 'anthropic' | 'codex_cli' | 'auto';
 
 interface ServerRuntimeConfig {
   ai: {
     provider: AIProvider;
     openaiModel: string;
+    openaiTranscriptionModel: string;
+    anthropicModel: string;
     codexModel: string;
     openaiApiKey: string;
+    anthropicApiKey: string;
     review: {
       maxRevisions: number;
       confidenceThreshold: number;
@@ -25,8 +28,11 @@ interface ParsedTomlConfig {
   ai: {
     provider?: unknown;
     openai_model?: unknown;
+    openai_transcription_model?: unknown;
+    anthropic_model?: unknown;
     codex_model?: unknown;
     openai_api_key?: unknown;
+    anthropic_api_key?: unknown;
     review?: unknown;
   };
   server: {
@@ -39,8 +45,11 @@ const DEFAULT_CONFIG: Omit<ServerRuntimeConfig, 'sourcePath'> = {
   ai: {
     provider: 'auto',
     openaiModel: 'gpt-4.1-mini',
+    openaiTranscriptionModel: 'whisper-1',
+    anthropicModel: 'claude-3-5-sonnet-20241022',
     codexModel: 'gpt-5-codex',
     openaiApiKey: '',
+    anthropicApiKey: '',
     review: {
       maxRevisions: 20,
       confidenceThreshold: 0.98,
@@ -83,12 +92,10 @@ const toConfidenceThresholdOrUndefined = (value: unknown): number | undefined =>
     return undefined;
   }
 
-  // Accept either 0-1 or 0-10 format (e.g. 9.8/10).
-  const normalized = asNumber > 1 ? asNumber / 10 : asNumber;
-  if (normalized < 0 || normalized > 1) {
+  if (asNumber < 0 || asNumber > 1) {
     return undefined;
   }
-  return normalized;
+  return asNumber;
 };
 
 const toProviderOrUndefined = (value: unknown): AIProvider | undefined => {
@@ -96,6 +103,7 @@ const toProviderOrUndefined = (value: unknown): AIProvider | undefined => {
   if (
     normalized === 'deterministic' ||
     normalized === 'openai' ||
+    normalized === 'anthropic' ||
     normalized === 'codex_cli' ||
     normalized === 'auto'
   ) {
@@ -155,10 +163,25 @@ export const getRuntimeConfig = (): ServerRuntimeConfig => {
     toStringOrUndefined(config.ai.codex_model) ??
     DEFAULT_CONFIG.ai.codexModel;
 
+  const anthropicModel =
+    toStringOrUndefined(process.env.ANTHROPIC_MODEL) ??
+    toStringOrUndefined(config.ai.anthropic_model) ??
+    DEFAULT_CONFIG.ai.anthropicModel;
+
+  const openaiTranscriptionModel =
+    toStringOrUndefined(process.env.OPENAI_TRANSCRIPTION_MODEL) ??
+    toStringOrUndefined(config.ai.openai_transcription_model) ??
+    DEFAULT_CONFIG.ai.openaiTranscriptionModel;
+
   const openaiApiKey =
     toStringOrUndefined(process.env.OPENAI_API_KEY) ??
     toStringOrUndefined(config.ai.openai_api_key) ??
     DEFAULT_CONFIG.ai.openaiApiKey;
+
+  const anthropicApiKey =
+    toStringOrUndefined(process.env.ANTHROPIC_API_KEY) ??
+    toStringOrUndefined(config.ai.anthropic_api_key) ??
+    DEFAULT_CONFIG.ai.anthropicApiKey;
 
   const port =
     toPositiveIntOrUndefined(process.env.PORT) ??
@@ -184,8 +207,11 @@ export const getRuntimeConfig = (): ServerRuntimeConfig => {
     ai: {
       provider,
       openaiModel,
+      openaiTranscriptionModel,
+      anthropicModel,
       codexModel,
       openaiApiKey,
+      anthropicApiKey,
       review: {
         maxRevisions,
         confidenceThreshold,

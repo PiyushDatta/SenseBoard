@@ -1,6 +1,7 @@
 import { applyBoardOps } from '../../shared/board-state';
-import { createSystemPromptPayloadPreview, generateBoardOps, getAiProviderLabel, hasAiSignal, runAiPreflightCheck } from './ai-engine';
+import { generateBoardOps, getAiProviderLabel, hasAiSignal, runAiPreflightCheck } from './ai-engine';
 import {
+  addTranscriptChunk,
   applyClientMessage,
   attachSocket,
   broadcastSnapshot,
@@ -10,6 +11,7 @@ import {
   getOrCreateRoom,
 } from './store';
 import { getRuntimeConfig } from './runtime-config';
+import { transcribeAudioBlob } from './transcription';
 import type { ClientMessage, TriggerPatchRequest } from '../../shared/types';
 
 const runtimeConfig = getRuntimeConfig();
@@ -59,7 +61,9 @@ const getRoomPathParts = (url: URL) => url.pathname.split('/').filter(Boolean);
 
 const AI_MIN_INTERVAL_MS = 2000;
 const AI_MAX_QUEUE_LENGTH = 120;
+const AI_TRANSCRIPT_DEBOUNCE_MS = 500;
 const aiQueueByRoom = new Map<string, AiQueueState>();
+const transcriptDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -155,6 +159,12 @@ const enqueueAiPatch = (
   request: TriggerPatchRequest,
 ): Promise<{ applied: boolean; reason?: string; patch?: unknown }> => {
   const queueState = getQueueState(roomId);
+  if (request.reason === 'tick' && !request.regenerate) {
+    const pendingTick = queueState.jobs.some((job) => job.request.reason === 'tick' && !job.request.regenerate);
+    if (pendingTick) {
+      return Promise.resolve({ applied: false, reason: 'queued' });
+    }
+  }
   while (queueState.jobs.length >= AI_MAX_QUEUE_LENGTH) {
     const dropped = queueState.jobs.shift();
     dropped?.resolve({ applied: false, reason: 'queue_overflow' });
@@ -163,6 +173,25 @@ const enqueueAiPatch = (
     queueState.jobs.push({ request, resolve });
     void processRoomQueue(roomId);
   });
+};
+
+const scheduleTranscriptPatch = (roomId: string) => {
+  const existing = transcriptDebounceTimers.get(roomId);
+  if (existing) {
+    clearTimeout(existing);
+  }
+  const timer = setTimeout(() => {
+    transcriptDebounceTimers.delete(roomId);
+    const room = getOrCreateRoom(roomId);
+    if (room.aiConfig.frozen) {
+      return;
+    }
+    void enqueueAiPatch(roomId, {
+      reason: 'tick',
+      windowSeconds: 30,
+    });
+  }, AI_TRANSCRIPT_DEBOUNCE_MS);
+  transcriptDebounceTimers.set(roomId, timer);
 };
 
 export const fetchHandler = async (
@@ -213,15 +242,6 @@ export const fetchHandler = async (
       return json({ room });
     }
 
-    if (pathParts[0] === 'rooms' && pathParts[2] === 'prompt-preview' && request.method === 'GET') {
-      const roomId = parseRoomId(url);
-      if (!roomId) {
-        return json({ error: 'invalid room path' }, 400);
-      }
-      const room = getOrCreateRoom(roomId);
-      return json(createSystemPromptPayloadPreview(room, { reason: 'manual' }));
-    }
-
     if (pathParts[0] === 'rooms' && pathParts[2] === 'ai-patch' && request.method === 'POST') {
       const roomId = parseRoomId(url);
       if (!roomId) {
@@ -234,6 +254,64 @@ export const fetchHandler = async (
         windowSeconds: payload.windowSeconds ?? 30,
       });
       return json(result);
+    }
+
+    if (pathParts[0] === 'rooms' && pathParts[2] === 'transcribe' && request.method === 'POST') {
+      const roomId = parseRoomId(url);
+      if (!roomId) {
+        return json({ error: 'invalid room path' }, 400);
+      }
+
+      const body = await request.formData().catch(() => null);
+      if (!body) {
+        return json({ ok: false, error: 'multipart form-data is required' }, 400);
+      }
+
+      const audioValue = body.get('audio');
+      const speakerValue = body.get('speaker');
+      const speaker = typeof speakerValue === 'string' && speakerValue.trim() ? speakerValue.trim() : 'Speaker';
+
+      if (!(audioValue instanceof Blob) || audioValue.size === 0) {
+        return json({ ok: false, error: 'audio file is required' }, 400);
+      }
+
+      const transcription = await transcribeAudioBlob(audioValue);
+      if (!transcription.ok) {
+        return json(transcription, 503);
+      }
+
+      const text = transcription.text.trim();
+      if (!text) {
+        return json({
+          ok: true,
+          text: '',
+          accepted: false,
+          reason: 'empty_transcript',
+        });
+      }
+
+      const room = getOrCreateRoom(roomId);
+      const accepted = addTranscriptChunk(room, {
+        speaker,
+        text,
+        source: 'mic',
+      });
+      if (!accepted) {
+        return json({
+          ok: true,
+          text: '',
+          accepted: false,
+          reason: 'empty_transcript',
+        });
+      }
+
+      scheduleTranscriptPatch(room.id);
+      broadcastSnapshot(room.id);
+      return json({
+        ok: true,
+        text,
+        accepted: true,
+      });
     }
 
     return json({ error: 'not_found' }, 404);
@@ -249,6 +327,9 @@ export const websocketHandler = {
       const parsed = JSON.parse(String(message)) as ClientMessage;
       const room = getOrCreateRoom(socket.data.roomId);
       applyClientMessage(room, socket.data, parsed);
+      if (parsed.type === 'transcript:add') {
+        scheduleTranscriptPatch(room.id);
+      }
       broadcastSnapshot(room.id);
     } catch {
       socket.send(
@@ -312,6 +393,8 @@ export const startServer = () => {
 
 export const __resetAiQueueForTests = () => {
   aiQueueByRoom.clear();
+  transcriptDebounceTimers.forEach((timer) => clearTimeout(timer));
+  transcriptDebounceTimers.clear();
 };
 
 if (import.meta.main) {

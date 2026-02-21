@@ -22,19 +22,27 @@ port = 8787
 port_scan_span = 8
 
 [ai]
-provider = "auto" # auto | openai | codex_cli | deterministic
+provider = "auto" # auto | openai | anthropic | codex_cli | deterministic
 openai_model = "gpt-4.1-mini"
+openai_transcription_model = "whisper-1" # OpenAI-hosted Whisper (no local GPU)
+anthropic_model = "claude-3-5-sonnet-20241022"
 codex_model = "gpt-5-codex"
 
 [ai.review]
 max_revisions = 20
-confidence_threshold = 9.8 # accepts 0-1 or 0-10 scale
+confidence_threshold = 0.98 # range: 0.0 to 1.0
 ```
 
 Precedence is: `environment variables > senseboard.config.toml > built-in defaults`.
 Use `SENSEBOARD_CONFIG` to point to a different TOML file path.
 Review env overrides:
 
+- `OPENAI_API_KEY` (required for OpenAI Whisper transcription)
+- `OPENAI_MODEL`
+- `OPENAI_TRANSCRIPTION_MODEL`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_MODEL`
+- `CODEX_MODEL`
 - `AI_REVIEW_MAX_REVISIONS`
 - `AI_REVIEW_CONFIDENCE_THRESHOLD`
 
@@ -53,7 +61,21 @@ Review env overrides:
 bun install
 ```
 
-### 2) Run server (terminal 1)
+### 2) Create local env file
+
+`bun run start:web` now requires a local `.env` file.
+
+```bash
+cp .env.example .env
+```
+
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### 3) Run server (terminal 1)
 
 ```bash
 bun run server
@@ -67,7 +89,7 @@ You can control this with:
 - `PORT` (start port, default `8787`)
 - `PORT_SCAN_SPAN` (how many ports to try, default `8`)
 
-### 3) Run client web app (terminal 2)
+### 4) Run client web app (terminal 2)
 
 ```bash
 bun run start:web
@@ -101,7 +123,7 @@ bun run test
 - Room create/join with room code
 - Realtime shared room state over websocket
 - Canvas with programmatic AI updates (nodes, edges, title, notes, traversal order)
-- Transcript panel with mic capture (Web Speech API) + manual fallback input
+- Transcript panel with mic capture (MediaRecorder -> OpenAI Whisper API) + manual fallback input
 - Chat panel with `normal` / `correction` / `suggestion`
 - Context Bank with `priority`, `scope`, `pinned`
 - Visual context hint input ("Currently sharing")
@@ -132,9 +154,16 @@ Provider selection:
 
 - `provider=deterministic`: local deterministic patch generator only
 - `provider=openai`: OpenAI API (`OPENAI_API_KEY` or `ai.openai_api_key`, optional `openai_model`, default `gpt-4.1-mini`)
+- `provider=anthropic`: Anthropic Messages API (`ANTHROPIC_API_KEY` or `ai.anthropic_api_key`, optional `anthropic_model`, default `claude-3-5-sonnet-20241022`)
 - `provider=codex_cli`: uses local `codex exec` CLI (requires `codex login status`; optional `codex_model`, default `gpt-5-codex`)
-- `provider=auto` (default): OpenAI if key exists, otherwise deterministic
+- `provider=auto` (default): OpenAI if key exists, else Anthropic if key exists, else Codex CLI if logged in, otherwise deterministic
 - Review loop: each patch is reviewed and revised up to `ai.review.max_revisions` until `ai.review.confidence_threshold` is met.
+
+Transcription provider:
+
+- Mic transcription uses OpenAI Audio Transcriptions API via `POST /rooms/:roomId/transcribe`.
+- Default transcription model is `whisper-1` (set via `ai.openai_transcription_model` or `OPENAI_TRANSCRIPTION_MODEL`).
+- No local Whisper runtime/GPU is needed.
 
 Example (Codex CLI provider via TOML): set `ai.provider = "codex_cli"` then run:
 

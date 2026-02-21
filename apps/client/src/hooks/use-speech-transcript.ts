@@ -2,6 +2,8 @@ import { useMemo } from 'react';
 
 interface Options {
   onChunk: (text: string) => void;
+  onAudioChunk?: (audioChunk: Blob, mimeType: string) => Promise<void> | void;
+  chunkMs?: number;
 }
 
 export interface SpeechTranscriptController {
@@ -19,11 +21,10 @@ export const useSpeechTranscript = (_options: Options): SpeechTranscriptControll
       supported: false,
       listening: false,
       interimText: '',
-      error: 'Web Speech API is only available on web browsers.',
+      error: 'Microphone transcription is only available on web browsers.',
       start: () => {},
       stop: () => {},
     }),
     [],
   );
 };
-

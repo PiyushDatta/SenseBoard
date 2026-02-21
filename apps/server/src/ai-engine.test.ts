@@ -272,7 +272,7 @@ describe('AI engine', () => {
 
     process.env.AI_PROVIDER = 'openai';
     process.env.OPENAI_API_KEY = 'test-key';
-    process.env.AI_REVIEW_CONFIDENCE_THRESHOLD = '9.8';
+    process.env.AI_REVIEW_CONFIDENCE_THRESHOLD = '0.98';
     process.env.AI_REVIEW_MAX_REVISIONS = '20';
 
     globalThis.fetch = (async () => {

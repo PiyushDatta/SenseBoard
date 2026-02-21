@@ -270,14 +270,6 @@ export interface DiagramPatch {
   targetGroupId?: string;
 }
 
-export interface RoomSummary {
-  roomId: string;
-  activeMembers: number;
-  transcriptCount: number;
-  contextCount: number;
-  diagramGroupCount: number;
-}
-
 export type ClientMessage =
   | {
       type: 'chat:add';
@@ -351,10 +343,6 @@ export type ServerMessage =
   | {
       type: 'room:snapshot';
       payload: RoomState;
-    }
-  | {
-      type: 'room:summary';
-      payload: RoomSummary;
     }
   | {
       type: 'room:error';

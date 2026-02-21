@@ -101,6 +101,44 @@ describe('api client', () => {
     }
   });
 
+  it('uploads audio chunk as multipart form-data for server transcription', async () => {
+    const api = await loadApiModule();
+    const calls: Array<{ url: string; body?: FormData }> = [];
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({
+        url: String(input),
+        body: init?.body instanceof FormData ? init.body : undefined,
+      });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          accepted: true,
+          text: 'hello world',
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const blob = new Blob(['audio-bytes'], { type: 'audio/webm' });
+      const payload = await api.transcribeAudioChunk('room-xyz', 'Host', blob, 'audio/webm');
+      expect(payload.ok).toBe(true);
+      expect(calls[0]?.url.endsWith('/rooms/ROOM-XYZ/transcribe')).toBe(true);
+      expect(calls[0]?.body).toBeDefined();
+      expect(calls[0]?.body?.get('speaker')).toBe('Host');
+      const audio = calls[0]?.body?.get('audio');
+      expect(audio instanceof File).toBe(true);
+      expect((audio as File).name.endsWith('.webm')).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('surfaces HTTP status details in thrown errors', async () => {
     const api = await loadApiModule();
     const originalFetch = globalThis.fetch;
