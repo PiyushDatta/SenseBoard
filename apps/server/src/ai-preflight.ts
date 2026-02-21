@@ -1,5 +1,6 @@
 import { runAiPreflightCheck } from './ai-engine';
 import { getRuntimeConfig } from './runtime-config';
+import { runTranscriptionPreflightCheck } from './transcription';
 
 interface CodexProbe {
   installed: boolean;
@@ -76,6 +77,10 @@ const runCodexLogin = async (): Promise<boolean> => {
 
 const main = async () => {
   const config = getRuntimeConfig();
+  if (!config.preflight.enabled) {
+    console.log('AI preflight skipped (preflight.enabled=false in senseboard.config.toml).');
+    return;
+  }
   const provider = config.ai.provider;
   const codexPrimary =
     provider === 'codex_cli' ||
@@ -100,22 +105,40 @@ const main = async () => {
     }
   }
 
-  const result = await runAiPreflightCheck();
-  if (!result.ok && codexPrimary) {
+  const mainResult = await runAiPreflightCheck();
+  if (!mainResult.ok && codexPrimary) {
     console.error('Codex appears installed/authenticated, but AI preflight still failed.');
     console.error('Try running: codex login status');
     console.error('If needed, re-authenticate with: codex login');
   }
 
-  if (!result.ok) {
-    console.error(`AI preflight failed (provider: ${result.provider}, configured: ${config.ai.provider})`);
-    if (result.error) {
-      console.error(result.error);
+  if (!mainResult.ok) {
+    console.error(`Main AI preflight failed (provider: ${mainResult.provider}, configured: ${config.ai.provider})`);
+    if (mainResult.error) {
+      console.error(mainResult.error);
     }
     process.exit(1);
   }
-  console.log(`AI preflight ok (provider: ${result.provider})`);
-  console.log(`AI response: ${result.response}`);
+
+  const transcriptionResult = await runTranscriptionPreflightCheck();
+  if (!transcriptionResult.ok) {
+    console.error(
+      `Transcription preflight failed (provider: ${transcriptionResult.provider}, configured: ${config.ai.provider})`,
+    );
+    if (transcriptionResult.error) {
+      console.error(transcriptionResult.error);
+    }
+    process.exit(1);
+  }
+
+  const mainResponder = mainResult.resolvedProvider ?? 'unknown';
+  const transcriptionResponder = transcriptionResult.resolvedProvider ?? 'unknown';
+  console.log(`Main AI preflight ok (route: ${mainResult.provider}, resolved: ${mainResponder})`);
+  console.log(`Main AI response [${mainResponder}]: ${mainResult.response ?? ''}`);
+  console.log(
+    `Transcription preflight ok (route: ${transcriptionResult.provider}, resolved: ${transcriptionResponder})`,
+  );
+  console.log(`Transcription response [${transcriptionResponder}]: ${transcriptionResult.response ?? ''}`);
 };
 
 void main();

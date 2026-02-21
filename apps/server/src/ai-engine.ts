@@ -167,9 +167,17 @@ const readErrorText = async (response: Response): Promise<string> => {
   return body.replace(/\s+/g, ' ').trim().slice(0, 240);
 };
 
+type AiAgentId = 'openai' | 'anthropic' | 'codex_cli';
+
+interface AiAgentTextResult {
+  provider: AiAgentId;
+  text: string;
+}
+
 interface AiAgent {
-  id: 'openai' | 'anthropic' | 'codex_cli';
+  id: AiAgentId;
   completeJson: (systemPrompt: string, userPrompt: string) => Promise<unknown | null>;
+  completeTextWithProvider: (prompt: string) => Promise<AiAgentTextResult | null>;
   completeText: (prompt: string) => Promise<string | null>;
 }
 
@@ -1265,7 +1273,7 @@ const getAgent = (): AiAgent | null => {
   const codexAvailable = checkCodexCliReady();
 
   const chain: Array<{
-    id: AiAgent['id'];
+    id: AiAgentId;
     completeJson: (systemPrompt: string, userPrompt: string) => Promise<unknown | null>;
     completeText: (prompt: string) => Promise<string | null>;
   }> = [];
@@ -1322,45 +1330,57 @@ const getAgent = (): AiAgent | null => {
     return null;
   }
 
+  const runJsonRoute = async (systemPrompt: string, userPrompt: string): Promise<unknown | null> => {
+    for (let index = 0; index < chain.length; index += 1) {
+      const entry = chain[index]!;
+      if (index === 0) {
+        logAiRouter(`JSON route primary=${entry.id}`);
+      } else {
+        logAiRouter(`JSON fallback -> ${entry.id}`);
+      }
+      const response = await entry.completeJson(systemPrompt, userPrompt).catch(() => null);
+      if (response !== null) {
+        if (index > 0) {
+          logAiRouter(`JSON fallback succeeded with ${entry.id}`);
+        }
+        return response;
+      }
+    }
+    logAiRouter('JSON route exhausted all providers.');
+    return null;
+  };
+
+  const runTextRoute = async (prompt: string): Promise<AiAgentTextResult | null> => {
+    for (let index = 0; index < chain.length; index += 1) {
+      const entry = chain[index]!;
+      if (index === 0) {
+        logAiRouter(`Text route primary=${entry.id}`);
+      } else {
+        logAiRouter(`Text fallback -> ${entry.id}`);
+      }
+      const response = await entry.completeText(prompt).catch(() => null);
+      const trimmed = response?.trim() ?? '';
+      if (trimmed.length > 0) {
+        if (index > 0) {
+          logAiRouter(`Text fallback succeeded with ${entry.id}`);
+        }
+        return {
+          provider: entry.id,
+          text: trimmed,
+        };
+      }
+    }
+    logAiRouter('Text route exhausted all providers.');
+    return null;
+  };
+
   return {
     id: chain[0].id,
-    completeJson: async (systemPrompt: string, userPrompt: string) => {
-      for (let index = 0; index < chain.length; index += 1) {
-        const entry = chain[index]!;
-        if (index === 0) {
-          logAiRouter(`JSON route primary=${entry.id}`);
-        } else {
-          logAiRouter(`JSON fallback -> ${entry.id}`);
-        }
-        const response = await entry.completeJson(systemPrompt, userPrompt).catch(() => null);
-        if (response !== null) {
-          if (index > 0) {
-            logAiRouter(`JSON fallback succeeded with ${entry.id}`);
-          }
-          return response;
-        }
-      }
-      logAiRouter('JSON route exhausted all providers.');
-      return null;
-    },
+    completeJson: runJsonRoute,
+    completeTextWithProvider: runTextRoute,
     completeText: async (prompt: string) => {
-      for (let index = 0; index < chain.length; index += 1) {
-        const entry = chain[index]!;
-        if (index === 0) {
-          logAiRouter(`Text route primary=${entry.id}`);
-        } else {
-          logAiRouter(`Text fallback -> ${entry.id}`);
-        }
-        const response = await entry.completeText(prompt).catch(() => null);
-        if (response && response.trim()) {
-          if (index > 0) {
-            logAiRouter(`Text fallback succeeded with ${entry.id}`);
-          }
-          return response;
-        }
-      }
-      logAiRouter('Text route exhausted all providers.');
-      return null;
+      const resolved = await runTextRoute(prompt);
+      return resolved?.text ?? null;
     },
   };
 };
@@ -1753,6 +1773,7 @@ export const generateBoardOps = async (
 export const runAiPreflightCheck = async (): Promise<{
   ok: boolean;
   provider: string;
+  resolvedProvider?: AiAgentId;
   response?: string;
   error?: string;
 }> => {
@@ -1765,10 +1786,8 @@ export const runAiPreflightCheck = async (): Promise<{
       error: 'No connected AI agent is available for the configured provider.',
     };
   }
-  const response = await agent
-    .completeText('hello how are you')
-    .then((value) => (value ?? '').trim())
-    .catch(() => '');
+  const resolved = await agent.completeTextWithProvider('hello how are you').catch(() => null);
+  const response = resolved?.text ?? '';
   if (!response) {
     return {
       ok: false,
@@ -1779,6 +1798,7 @@ export const runAiPreflightCheck = async (): Promise<{
   return {
     ok: true,
     provider: providerLabel,
+    resolvedProvider: resolved?.provider,
     response,
   };
 };

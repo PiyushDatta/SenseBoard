@@ -11,12 +11,13 @@ import {
   getOrCreateRoom,
 } from './store';
 import { getRuntimeConfig } from './runtime-config';
-import { transcribeAudioBlob } from './transcription';
+import { getTranscriptionProviderLabel, transcribeAudioBlob } from './transcription';
 import type { ClientMessage, TriggerPatchRequest } from '../../shared/types';
 
 const runtimeConfig = getRuntimeConfig();
 const PREFERRED_PORT = runtimeConfig.server.port;
 const PORT_SCAN_SPAN = runtimeConfig.server.portScanSpan;
+const LOG_LEVEL = runtimeConfig.logging?.level ?? 'debug';
 
 interface SocketData {
   roomId: string;
@@ -38,6 +39,20 @@ const headers = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+const logDebug = (message: string) => {
+  if (LOG_LEVEL === 'debug') {
+    console.log(`[SenseBoard][debug] ${message}`);
+  }
+};
+
+const compactLogText = (value: string, maxLength = 280): string => {
+  const flattened = value.replace(/\s+/g, ' ').trim();
+  if (flattened.length <= maxLength) {
+    return flattened;
+  }
+  return `${flattened.slice(0, maxLength)}...`;
 };
 
 const json = (value: unknown, status = 200) =>
@@ -282,6 +297,9 @@ export const fetchHandler = async (
 
       const text = transcription.text.trim();
       if (!text) {
+        logDebug(
+          `Transcription returned empty text room=${roomId} speaker=${speaker} provider=${transcription.provider ?? 'unknown'}`,
+        );
         return json({
           ok: true,
           text: '',
@@ -297,6 +315,9 @@ export const fetchHandler = async (
         source: 'mic',
       });
       if (!accepted) {
+        logDebug(
+          `Transcription rejected room=${room.id} speaker=${speaker} provider=${transcription.provider ?? 'unknown'}`,
+        );
         return json({
           ok: true,
           text: '',
@@ -304,6 +325,10 @@ export const fetchHandler = async (
           reason: 'empty_transcript',
         });
       }
+
+      logDebug(
+        `Transcription accepted room=${room.id} speaker=${speaker} provider=${transcription.provider ?? 'unknown'} text="${compactLogText(text)}"`,
+      );
 
       scheduleTranscriptPatch(room.id);
       broadcastSnapshot(room.id);
@@ -387,7 +412,9 @@ export const startServer = () => {
   if (runtimeConfig.sourcePath) {
     console.log(`Loaded SenseBoard config: ${runtimeConfig.sourcePath}`);
   }
-  console.log(`SenseBoard server listening on http://localhost:${runningPort} (AI provider: ${getAiProviderLabel()})`);
+  console.log(`SenseBoard server listening on http://localhost:${runningPort}`);
+  console.log(`Using transcribing only AI provider: ${getTranscriptionProviderLabel()}`);
+  console.log(`Using main AI provider: ${getAiProviderLabel()}`);
   return runningPort;
 };
 

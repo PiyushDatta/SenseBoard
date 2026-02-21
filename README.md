@@ -21,6 +21,12 @@ Server runtime reads `senseboard.config.toml` automatically.
 port = 8787
 port_scan_span = 8
 
+[logging]
+level = "debug" # debug | info | warn | error | silent (keep debug on for demo)
+
+[preflight]
+enabled = true # set false to skip ai:preflight on bun run start:web
+
 [ai]
 provider = "auto" # auto | openai | anthropic | codex_cli | deterministic
 openai_model = "gpt-4.1-mini"
@@ -64,6 +70,7 @@ bun install
 ### 2) Create local env file
 
 `bun run start:web` now requires a local `.env` file.
+Preflight runs by default; disable it with `preflight.enabled = false` in `senseboard.config.toml`.
 
 ```bash
 cp .env.example .env

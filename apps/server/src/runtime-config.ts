@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 type AIProvider = 'deterministic' | 'openai' | 'anthropic' | 'codex_cli' | 'auto';
+type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
 
 interface ServerRuntimeConfig {
   ai: {
@@ -21,6 +22,12 @@ interface ServerRuntimeConfig {
     port: number;
     portScanSpan: number;
   };
+  logging: {
+    level: LogLevel;
+  };
+  preflight: {
+    enabled: boolean;
+  };
   sourcePath: string | null;
 }
 
@@ -38,6 +45,12 @@ interface ParsedTomlConfig {
   server: {
     port?: unknown;
     port_scan_span?: unknown;
+  };
+  logging: {
+    level?: unknown;
+  };
+  preflight: {
+    enabled?: unknown;
   };
 }
 
@@ -58,6 +71,12 @@ const DEFAULT_CONFIG: Omit<ServerRuntimeConfig, 'sourcePath'> = {
   server: {
     port: 8787,
     portScanSpan: 8,
+  },
+  logging: {
+    level: 'debug',
+  },
+  preflight: {
+    enabled: true,
   },
 };
 
@@ -112,6 +131,36 @@ const toProviderOrUndefined = (value: unknown): AIProvider | undefined => {
   return undefined;
 };
 
+const toLogLevelOrUndefined = (value: unknown): LogLevel | undefined => {
+  const normalized = toStringOrUndefined(value)?.toLowerCase();
+  if (
+    normalized === 'debug' ||
+    normalized === 'info' ||
+    normalized === 'warn' ||
+    normalized === 'error' ||
+    normalized === 'silent'
+  ) {
+    return normalized;
+  }
+  return undefined;
+};
+
+const toBooleanOrUndefined = (value: unknown): boolean | undefined => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') {
+      return true;
+    }
+    if (normalized === 'false') {
+      return false;
+    }
+  }
+  return undefined;
+};
+
 const readTomlConfig = (): { config: ParsedTomlConfig; sourcePath: string | null } => {
   if (parsedTomlCache) {
     return parsedTomlCache;
@@ -121,7 +170,7 @@ const readTomlConfig = (): { config: ParsedTomlConfig; sourcePath: string | null
   const sourcePath = explicitPath ? resolve(explicitPath) : resolve(process.cwd(), 'senseboard.config.toml');
 
   if (!existsSync(sourcePath)) {
-    parsedTomlCache = { config: { ai: {}, server: {} }, sourcePath: null };
+    parsedTomlCache = { config: { ai: {}, server: {}, logging: {}, preflight: {} }, sourcePath: null };
     return parsedTomlCache;
   }
 
@@ -133,13 +182,15 @@ const readTomlConfig = (): { config: ParsedTomlConfig; sourcePath: string | null
       config: {
         ai: toRecord(root.ai),
         server: toRecord(root.server),
+        logging: toRecord(root.logging),
+        preflight: toRecord(root.preflight),
       },
       sourcePath,
     };
     return parsedTomlCache;
   } catch (error) {
     console.warn(`Failed to parse ${sourcePath}: ${error instanceof Error ? error.message : String(error)}`);
-    parsedTomlCache = { config: { ai: {}, server: {} }, sourcePath };
+    parsedTomlCache = { config: { ai: {}, server: {}, logging: {}, preflight: {} }, sourcePath };
     return parsedTomlCache;
   }
 };
@@ -203,6 +254,9 @@ export const getRuntimeConfig = (): ServerRuntimeConfig => {
     toConfidenceThresholdOrUndefined(reviewConfig.confidence_threshold) ??
     DEFAULT_CONFIG.ai.review.confidenceThreshold;
 
+  const logLevel = toLogLevelOrUndefined(config.logging.level) ?? DEFAULT_CONFIG.logging.level;
+  const preflightEnabled = toBooleanOrUndefined(config.preflight.enabled) ?? DEFAULT_CONFIG.preflight.enabled;
+
   return {
     ai: {
       provider,
@@ -220,6 +274,12 @@ export const getRuntimeConfig = (): ServerRuntimeConfig => {
     server: {
       port,
       portScanSpan,
+    },
+    logging: {
+      level: logLevel,
+    },
+    preflight: {
+      enabled: preflightEnabled,
     },
     sourcePath,
   };

@@ -2,6 +2,15 @@
 port = 8787
 port_scan_span = 8
 
+[logging]
+# Options: debug | info | warn | error | silent
+# Keep debug on for the demo.
+level = "debug"
+
+[preflight]
+# Run AI + transcription preflight before `bun run start:web`.
+enabled = false
+
 [ai]
 # Active provider: auto | openai | anthropic | codex_cli | deterministic
 provider = "auto"

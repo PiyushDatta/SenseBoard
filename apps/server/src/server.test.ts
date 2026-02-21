@@ -68,6 +68,7 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
         ok: true,
         text: 'mock transcript',
       })),
+    getTranscriptionProviderLabel: () => 'mock-transcription-provider',
   }));
 
   return (await import(`./server.ts?test=${Date.now()}-${Math.random()}`)) as ServerModule;

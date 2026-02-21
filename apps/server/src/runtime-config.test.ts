@@ -92,6 +92,8 @@ describe('runtime-config', () => {
         expect(runtimeConfig.server.portScanSpan).toBe(8);
         expect(runtimeConfig.ai.review.maxRevisions).toBe(20);
         expect(runtimeConfig.ai.review.confidenceThreshold).toBe(0.98);
+        expect(runtimeConfig.logging.level).toBe('debug');
+        expect(runtimeConfig.preflight.enabled).toBe(true);
         expect(runtimeConfig.sourcePath).toBeNull();
       },
     );
@@ -117,6 +119,12 @@ confidence_threshold = 0.97
 [server]
 port = 9011
 port_scan_span = 5
+
+[logging]
+level = "warn"
+
+[preflight]
+enabled = false
       `.trim(),
     );
 
@@ -137,6 +145,8 @@ port_scan_span = 5
         expect(runtimeConfig.ai.review.confidenceThreshold).toBeCloseTo(0.97, 5);
         expect(runtimeConfig.server.port).toBe(9011);
         expect(runtimeConfig.server.portScanSpan).toBe(5);
+        expect(runtimeConfig.logging.level).toBe('warn');
+        expect(runtimeConfig.preflight.enabled).toBe(false);
         expect(runtimeConfig.sourcePath?.endsWith('config-a.toml')).toBe(true);
       },
     );
@@ -162,6 +172,12 @@ confidence_threshold = 0.7
 [server]
 port = 9000
 port_scan_span = 2
+
+[logging]
+level = "error"
+
+[preflight]
+enabled = true
       `.trim(),
     );
 
@@ -193,6 +209,8 @@ port_scan_span = 2
         expect(runtimeConfig.server.portScanSpan).toBe(12);
         expect(runtimeConfig.ai.review.maxRevisions).toBe(33);
         expect(runtimeConfig.ai.review.confidenceThreshold).toBeCloseTo(0.86, 5);
+        expect(runtimeConfig.logging.level).toBe('error');
+        expect(runtimeConfig.preflight.enabled).toBe(true);
       },
     );
   });
@@ -228,6 +246,12 @@ confidence_threshold = 24
 [server]
 port = -100
 port_scan_span = 0
+
+[logging]
+level = "loud"
+
+[preflight]
+enabled = "maybe"
       `.trim(),
     );
 
@@ -247,6 +271,8 @@ port_scan_span = 0
         expect(runtimeConfig.server.portScanSpan).toBe(8);
         expect(runtimeConfig.ai.review.maxRevisions).toBe(20);
         expect(runtimeConfig.ai.review.confidenceThreshold).toBe(0.98);
+        expect(runtimeConfig.logging.level).toBe('debug');
+        expect(runtimeConfig.preflight.enabled).toBe(true);
       },
     );
   });
