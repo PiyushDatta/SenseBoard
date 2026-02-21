@@ -3,6 +3,12 @@ import { useMemo, useRef, useState } from 'react';
 
 import type { BoardElement, BoardPoint, RoomState } from '../../../shared/types';
 import type { SenseTheme } from '../lib/theme';
+import {
+  CANVAS_BOARD_DIMENSIONS,
+  canvasSvgStyle,
+  createCanvasBoardStyle,
+  createCanvasViewportStyle,
+} from '../styles/canvas-surface-web.styles';
 
 export interface CanvasSurfaceProps {
   room: RoomState | null;
@@ -12,9 +18,6 @@ export interface CanvasSurfaceProps {
   showAiNotes: boolean;
   theme: SenseTheme;
 }
-
-const BOARD_WIDTH = 9000;
-const BOARD_HEIGHT = 6000;
 
 const seeded = (seed: string): number => {
   let h = 2166136261;
@@ -159,6 +162,11 @@ export const CanvasSurface = ({ room, showAiNotes, theme }: CanvasSurfaceProps) 
       .sort((left, right) => (left.zIndex ?? 0) - (right.zIndex ?? 0));
   }, [room?.board]);
 
+  const renderedElements = useMemo(
+    () => orderedElements.map((element) => renderElement(element, theme, showAiNotes)),
+    [orderedElements, theme, showAiNotes],
+  );
+
   const onMouseDown = (event: MouseEvent<HTMLDivElement>) => {
     setPanning(true);
     setPanStart({
@@ -204,23 +212,10 @@ export const CanvasSurface = ({ room, showAiNotes, theme }: CanvasSurfaceProps) 
       onMouseUp={onMouseUp}
       onMouseLeave={onMouseUp}
       onWheel={onWheel}
-      style={{
-        width: '100%',
-        height: '100%',
-        overflow: 'hidden',
-        background: '#FAFBFC',
-        cursor: panning ? 'grabbing' : 'grab',
-      }}>
-      <div
-        style={{
-          transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-          transformOrigin: '0 0',
-          width: BOARD_WIDTH,
-          height: BOARD_HEIGHT,
-          background: '#FDFEFE',
-        }}>
-        <svg width={BOARD_WIDTH} height={BOARD_HEIGHT} style={{ display: 'block' }}>
-          {orderedElements.map((element) => renderElement(element, theme, showAiNotes))}
+      style={createCanvasViewportStyle(panning)}>
+      <div style={createCanvasBoardStyle(pan.x, pan.y, zoom)}>
+        <svg width={CANVAS_BOARD_DIMENSIONS.width} height={CANVAS_BOARD_DIMENSIONS.height} style={canvasSvgStyle}>
+          {renderedElements}
         </svg>
       </div>
     </div>

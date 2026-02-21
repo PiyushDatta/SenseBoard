@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { PanResponder, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { PanResponder, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
 
 import { isDragGesture, shouldToggleOptionsOnPress } from './floating-options.logic';
 import type { ChatMessage } from '../../../shared/types';
 import type { SenseTheme, ThemeMode } from '../lib/theme';
+import { createFloatingOptionsThemeStyles, floatingOptionsStyles } from '../styles/floating-options.styles';
 
 interface FloatingOptionsProps {
   open: boolean;
@@ -35,6 +36,8 @@ interface FloatingOptionsProps {
   onToggleDebugPanel: () => void;
   onLeaveRoom: () => void;
 }
+
+type FloatingOptionsThemeStyles = ReturnType<typeof createFloatingOptionsThemeStyles>;
 
 export const FloatingOptions = ({
   open,
@@ -70,8 +73,8 @@ export const FloatingOptions = ({
   const [chatDraft, setChatDraft] = useState('');
   const dragStartRef = useRef({ x: 0, y: 0 });
   const draggedRef = useRef(false);
-  const pressDeltaRef = useRef({ dx: 0, dy: 0 });
   const chatInputRef = useRef<TextInput | null>(null);
+  const themeStyles = useMemo(() => createFloatingOptionsThemeStyles(theme), [theme]);
 
   const submitQuickChat = useCallback(() => {
     const text = chatDraft.trim();
@@ -93,10 +96,8 @@ export const FloatingOptions = ({
         onPanResponderGrant: () => {
           dragStartRef.current = offset;
           draggedRef.current = false;
-          pressDeltaRef.current = { dx: 0, dy: 0 };
         },
         onPanResponderMove: (_event, gestureState) => {
-          pressDeltaRef.current = { dx: gestureState.dx, dy: gestureState.dy };
           if (isDragGesture(gestureState.dx, gestureState.dy)) {
             draggedRef.current = true;
           }
@@ -142,68 +143,68 @@ export const FloatingOptions = ({
     <View
       pointerEvents="box-none"
       style={[
-        styles.container,
+        floatingOptionsStyles.container,
         {
           transform: [{ translateX: offset.x }, { translateY: offset.y }],
         },
       ]}>
       {open ? (
-        <View style={[styles.panel, { borderColor: theme.colors.panelBorder, backgroundColor: theme.colors.panel }]}>
-          <Text style={[styles.sectionTitle, { color: theme.colors.textPrimary, fontFamily: theme.fonts.heading }]}>Options</Text>
-          <View style={styles.row}>
-            <OptionButton text={panelsOpen ? 'Hide Panels' : 'Show Panels'} onPress={onTogglePanels} theme={theme} />
+        <View style={[floatingOptionsStyles.panel, themeStyles.panel]}>
+          <Text style={[floatingOptionsStyles.sectionTitle, themeStyles.sectionTitle]}>Options</Text>
+          <View style={floatingOptionsStyles.row}>
+            <OptionButton text={panelsOpen ? 'Hide Panels' : 'Show Panels'} onPress={onTogglePanels} themeStyles={themeStyles} />
             <OptionButton
               text={micListening ? 'Stop Mic' : 'Start Mic'}
               onPress={onToggleMic}
               disabled={!micSupported}
-              theme={theme}
+              themeStyles={themeStyles}
             />
           </View>
-          <View style={styles.row}>
-            <OptionButton text={freezeAi ? 'Unfreeze AI' : 'Freeze AI'} onPress={onToggleFreeze} theme={theme} />
-            <OptionButton text="Pin Diagram" onPress={onPinDiagram} theme={theme} />
+          <View style={floatingOptionsStyles.row}>
+            <OptionButton text={freezeAi ? 'Unfreeze AI' : 'Freeze AI'} onPress={onToggleFreeze} themeStyles={themeStyles} />
+            <OptionButton text="Pin Diagram" onPress={onPinDiagram} themeStyles={themeStyles} />
           </View>
-          <View style={styles.row}>
-            <OptionButton text={focusMode ? 'Cancel Focus' : 'Focus Mode'} onPress={onToggleFocusMode} theme={theme} />
-            <OptionButton text="Regenerate" onPress={onRegenerate} theme={theme} />
-            <OptionButton text="Clear board" onPress={onClearBoard} theme={theme} />
+          <View style={floatingOptionsStyles.row}>
+            <OptionButton text={focusMode ? 'Cancel Focus' : 'Focus Mode'} onPress={onToggleFocusMode} themeStyles={themeStyles} />
+            <OptionButton text="Regenerate" onPress={onRegenerate} themeStyles={themeStyles} />
+            <OptionButton text="Clear board" onPress={onClearBoard} themeStyles={themeStyles} />
           </View>
-          <View style={styles.row}>
-            <OptionButton text="Undo AI" onPress={onUndoAi} theme={theme} />
+          <View style={floatingOptionsStyles.row}>
+            <OptionButton text="Undo AI" onPress={onUndoAi} themeStyles={themeStyles} />
             <OptionButton
               text={`Restore Last (${archivedCount})`}
               onPress={onRestoreArchived}
               disabled={archivedCount === 0}
-              theme={theme}
+              themeStyles={themeStyles}
             />
           </View>
-          <View style={styles.row}>
-            <OptionButton text={showAiNotes ? 'Hide AI Notes' : 'Show AI Notes'} onPress={onToggleShowAiNotes} theme={theme} />
-            <OptionButton text={debugPanelOpen ? 'Hide Debug' : 'Show Debug'} onPress={onToggleDebugPanel} theme={theme} />
+          <View style={floatingOptionsStyles.row}>
+            <OptionButton text={showAiNotes ? 'Hide AI Notes' : 'Show AI Notes'} onPress={onToggleShowAiNotes} themeStyles={themeStyles} />
+            <OptionButton text={debugPanelOpen ? 'Hide Debug' : 'Show Debug'} onPress={onToggleDebugPanel} themeStyles={themeStyles} />
           </View>
-          <Text style={[styles.sectionTitle, { color: theme.colors.textSecondary, fontFamily: theme.fonts.body }]}>Theme</Text>
-          <View style={styles.row}>
-            <ModeChip label="Auto" value="auto" active={themeMode === 'auto'} theme={theme} onPress={onThemeModeChange} />
-            <ModeChip label="Light" value="light" active={themeMode === 'light'} theme={theme} onPress={onThemeModeChange} />
-            <ModeChip label="Dark" value="dark" active={themeMode === 'dark'} theme={theme} onPress={onThemeModeChange} />
+          <Text style={[floatingOptionsStyles.sectionTitle, themeStyles.sectionSubTitle]}>Theme</Text>
+          <View style={floatingOptionsStyles.row}>
+            <ModeChip label="Auto" value="auto" active={themeMode === 'auto'} themeStyles={themeStyles} onPress={onThemeModeChange} />
+            <ModeChip label="Light" value="light" active={themeMode === 'light'} themeStyles={themeStyles} onPress={onThemeModeChange} />
+            <ModeChip label="Dark" value="dark" active={themeMode === 'dark'} themeStyles={themeStyles} onPress={onThemeModeChange} />
           </View>
-          <OptionButton text="Leave Room" onPress={onLeaveRoom} theme={theme} />
+          <OptionButton text="Leave Room" onPress={onLeaveRoom} themeStyles={themeStyles} />
         </View>
       ) : null}
       {chatOpen ? (
-        <View style={[styles.chatPanel, { borderColor: theme.colors.panelBorder, backgroundColor: theme.colors.panel }]}>
-          <Text style={[styles.sectionTitle, { color: theme.colors.textPrimary, fontFamily: theme.fonts.heading }]}>Type Idea</Text>
-          <View style={[styles.historyWrap, { borderColor: theme.colors.inputBorder, backgroundColor: theme.colors.inputBg }]}>
-            <ScrollView style={styles.historyScroll} contentContainerStyle={styles.historyContent}>
+        <View style={[floatingOptionsStyles.chatPanel, themeStyles.chatPanel]}>
+          <Text style={[floatingOptionsStyles.sectionTitle, themeStyles.sectionTitle]}>Type Idea</Text>
+          <View style={[floatingOptionsStyles.historyWrap, themeStyles.historyWrap]}>
+            <ScrollView style={floatingOptionsStyles.historyScroll} contentContainerStyle={floatingOptionsStyles.historyContent}>
               {chatHistory.length === 0 ? (
-                <Text style={[styles.historyEmpty, { color: theme.colors.textMuted, fontFamily: theme.fonts.body }]}>No messages yet.</Text>
+                <Text style={[floatingOptionsStyles.historyEmpty, themeStyles.historyEmpty]}>No messages yet.</Text>
               ) : (
                 chatHistory.map((message) => (
-                  <View key={message.id} style={[styles.historyItem, { borderColor: theme.colors.panelBorder }]}>
-                    <Text style={[styles.historyMeta, { color: theme.colors.textMuted, fontFamily: theme.fonts.mono }]}>
+                  <View key={message.id} style={[floatingOptionsStyles.historyItem, themeStyles.historyItem]}>
+                    <Text style={[floatingOptionsStyles.historyMeta, themeStyles.historyMeta]}>
                       {message.authorName} - {message.kind}
                     </Text>
-                    <Text style={[styles.historyText, { color: theme.colors.textPrimary, fontFamily: theme.fonts.body }]}>
+                    <Text style={[floatingOptionsStyles.historyText, themeStyles.historyText]}>
                       {message.text}
                     </Text>
                   </View>
@@ -216,25 +217,13 @@ export const FloatingOptions = ({
             value={chatDraft}
             onChangeText={setChatDraft}
             placeholder="Type what should appear on the board..."
-            placeholderTextColor={theme.colors.textMuted}
-            style={[
-              styles.chatInput,
-              {
-                borderColor: theme.colors.inputBorder,
-                backgroundColor: theme.colors.inputBg,
-                color: theme.colors.textPrimary,
-                fontFamily: theme.fonts.body,
-              },
-            ]}
+            placeholderTextColor={themeStyles.placeholderColor}
+            style={[floatingOptionsStyles.chatInput, themeStyles.chatInput]}
             multiline
           />
-          <View style={styles.row}>
-            <OptionButton
-              text="Send to AI"
-              onPress={submitQuickChat}
-              theme={theme}
-            />
-            <OptionButton text="Close" onPress={() => setChatOpen(false)} theme={theme} />
+          <View style={floatingOptionsStyles.row}>
+            <OptionButton text="Send to AI" onPress={submitQuickChat} themeStyles={themeStyles} />
+            <OptionButton text="Close" onPress={() => setChatOpen(false)} themeStyles={themeStyles} />
           </View>
         </View>
       ) : null}
@@ -242,31 +231,25 @@ export const FloatingOptions = ({
         onPress={onToggleMic}
         disabled={!micSupported}
         style={({ pressed }) => [
-          styles.fabButton,
-          {
-            borderColor: micListening ? theme.colors.accent : theme.colors.buttonBorder,
-            backgroundColor: micListening ? theme.colors.accentSoft : theme.colors.buttonBg,
-          },
-          !micSupported && styles.optionDisabled,
-          pressed && styles.handlePressed,
+          floatingOptionsStyles.fabButton,
+          themeStyles.micFab(micListening),
+          !micSupported && floatingOptionsStyles.optionDisabled,
+          pressed && floatingOptionsStyles.handlePressed,
         ]}>
         <MaterialIcons
           name={micListening ? 'mic' : 'mic-none'}
           size={20}
-          color={micListening ? theme.colors.accentText : theme.colors.buttonText}
+          color={themeStyles.micFabIcon(micListening)}
         />
       </Pressable>
       <Pressable
         onPress={() => setChatOpen((value) => !value)}
         style={({ pressed }) => [
-          styles.fabButton,
-          {
-            borderColor: theme.colors.buttonBorder,
-            backgroundColor: theme.colors.buttonBg,
-          },
-          pressed && styles.handlePressed,
+          floatingOptionsStyles.fabButton,
+          themeStyles.chatFab,
+          pressed && floatingOptionsStyles.handlePressed,
         ]}>
-        <MaterialIcons name={chatOpen ? 'chat' : 'chat-bubble-outline'} size={20} color={theme.colors.buttonText} />
+        <MaterialIcons name={chatOpen ? 'chat' : 'chat-bubble-outline'} size={20} color={themeStyles.chatFabIcon} />
       </Pressable>
       <Pressable
         {...panResponder.panHandlers}
@@ -278,14 +261,11 @@ export const FloatingOptions = ({
           onToggleOpen();
         }}
         style={({ pressed }) => [
-          styles.handle,
-          {
-            borderColor: theme.colors.accent,
-            backgroundColor: theme.colors.accentSoft,
-          },
-          pressed && styles.handlePressed,
+          floatingOptionsStyles.handle,
+          themeStyles.handle,
+          pressed && floatingOptionsStyles.handlePressed,
         ]}>
-        <Text style={[styles.handleText, { color: theme.colors.accentText, fontFamily: theme.fonts.heading }]}>
+        <Text style={[floatingOptionsStyles.handleText, themeStyles.handleText]}>
           {open ? 'Hide options' : 'Show options'}
         </Text>
       </Pressable>
@@ -296,27 +276,24 @@ export const FloatingOptions = ({
 const OptionButton = ({
   text,
   onPress,
-  theme,
+  themeStyles,
   disabled,
 }: {
   text: string;
   onPress: () => void;
-  theme: SenseTheme;
+  themeStyles: FloatingOptionsThemeStyles;
   disabled?: boolean;
 }) => (
   <Pressable
     disabled={disabled}
     onPress={onPress}
     style={({ pressed }) => [
-      styles.optionButton,
-      {
-        borderColor: theme.colors.buttonBorder,
-        backgroundColor: theme.colors.buttonBg,
-      },
-      disabled && styles.optionDisabled,
-      pressed && styles.optionPressed,
+      floatingOptionsStyles.optionButton,
+      themeStyles.optionButton,
+      disabled && floatingOptionsStyles.optionDisabled,
+      pressed && floatingOptionsStyles.optionPressed,
     ]}>
-    <Text style={[styles.optionText, { color: theme.colors.buttonText, fontFamily: theme.fonts.body }]}>{text}</Text>
+    <Text style={[floatingOptionsStyles.optionText, themeStyles.optionText]}>{text}</Text>
   </Pressable>
 );
 
@@ -324,157 +301,22 @@ const ModeChip = ({
   label,
   value,
   active,
-  theme,
+  themeStyles,
   onPress,
 }: {
   label: string;
   value: ThemeMode;
   active: boolean;
-  theme: SenseTheme;
+  themeStyles: FloatingOptionsThemeStyles;
   onPress: (mode: ThemeMode) => void;
 }) => (
   <Pressable
     onPress={() => onPress(value)}
     style={({ pressed }) => [
-      styles.modeChip,
-      {
-        borderColor: theme.colors.buttonBorder,
-        backgroundColor: active ? theme.colors.accent : theme.colors.buttonBg,
-      },
-      pressed && styles.optionPressed,
+      floatingOptionsStyles.modeChip,
+      themeStyles.modeChip(active),
+      pressed && floatingOptionsStyles.optionPressed,
     ]}>
-    <Text style={[styles.modeText, { color: active ? theme.colors.accentText : theme.colors.textSecondary, fontFamily: theme.fonts.body }]}>
-      {label}
-    </Text>
+    <Text style={[floatingOptionsStyles.modeText, themeStyles.modeText(active)]}>{label}</Text>
   </Pressable>
 );
-
-const styles = StyleSheet.create({
-  container: {
-    position: 'absolute',
-    right: 16,
-    bottom: 18,
-    alignItems: 'flex-end',
-    gap: 8,
-    zIndex: 50,
-  },
-  panel: {
-    width: 320,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 10,
-    gap: 8,
-    shadowColor: '#0A2238',
-    shadowOpacity: 0.24,
-    shadowRadius: 16,
-    shadowOffset: { width: 0, height: 5 },
-  },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  row: {
-    flexDirection: 'row',
-    gap: 8,
-    flexWrap: 'wrap',
-  },
-  optionButton: {
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  optionText: {
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  optionDisabled: {
-    opacity: 0.45,
-  },
-  optionPressed: {
-    opacity: 0.78,
-  },
-  modeChip: {
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    minWidth: 56,
-    alignItems: 'center',
-  },
-  modeText: {
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  chatPanel: {
-    width: 320,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 10,
-    gap: 8,
-    shadowColor: '#0A2238',
-    shadowOpacity: 0.22,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 5 },
-  },
-  chatInput: {
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    fontSize: 12,
-    minHeight: 70,
-    textAlignVertical: 'top',
-  },
-  historyWrap: {
-    borderWidth: 1,
-    borderRadius: 10,
-    overflow: 'hidden',
-    maxHeight: 150,
-  },
-  historyScroll: {
-    maxHeight: 150,
-  },
-  historyContent: {
-    padding: 8,
-    gap: 8,
-  },
-  historyItem: {
-    borderBottomWidth: 1,
-    paddingBottom: 6,
-  },
-  historyMeta: {
-    fontSize: 10,
-    marginBottom: 2,
-  },
-  historyText: {
-    fontSize: 12,
-  },
-  historyEmpty: {
-    fontSize: 12,
-    fontStyle: 'italic',
-  },
-  fabButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 999,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  handle: {
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  handlePressed: {
-    opacity: 0.8,
-  },
-  handleText: {
-    fontSize: 13,
-    fontWeight: '700',
-  },
-});
-
-
