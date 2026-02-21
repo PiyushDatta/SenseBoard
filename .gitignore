@@ -70,6 +70,12 @@ web_modules/
 .env.*
 !.env.example
 
+# PushPals outputs (databases, logs, artifacts — all gitignored)
+outputs/
+workspace/
+apps/server/*.db*
+apps/agent-remote/*.db*
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
@@ -137,3 +143,39 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Ignore local patches and debug scripts
+*.patch
+tmp_*.mjs
+
+# Ignore compiled protocol runtime artifacts
+packages/protocol/dist/
+
+# api keys
+.env
+.env.*
+!.env.example
+
+# Docker worker sandbox build artifacts
+apps/worker/.dockerbuild/
+*.docker.tar.gz
+
+# Git worktrees for isolated job execution
+.worktrees/
+
+# Local machine config overrides
+config/local.toml
+
+
+# Python bytecode / cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+.claude/
+
+# Ignore any Python virtualenv folder named .venv anywhere
+**/.venv/
+.expo
+.vscode
