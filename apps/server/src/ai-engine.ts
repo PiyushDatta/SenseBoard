@@ -1293,6 +1293,33 @@ const parseJsonObject = (text: string): unknown | null => {
   }
 };
 
+const compactForLog = (value: string, maxLength = 1400): string => {
+  const flattened = value.replace(/\s+/g, ' ').trim();
+  if (flattened.length <= maxLength) {
+    return flattened;
+  }
+  return `${flattened.slice(0, maxLength)}...`;
+};
+
+const stringifyForLog = (value: unknown, maxLength = 1400): string => {
+  try {
+    return compactForLog(JSON.stringify(value), maxLength);
+  } catch {
+    return compactForLog(String(value), maxLength);
+  }
+};
+
+const parseJsonWithDebugLog = (providerLabel: string, rawContent: string): unknown | null => {
+  logAiRouter(`${providerLabel} JSON raw="${compactForLog(rawContent)}"`, 'debug');
+  const parsed = parseJsonObject(rawContent);
+  if (parsed === null) {
+    logAiRouter(`${providerLabel} JSON parse failed`, 'debug');
+    return null;
+  }
+  logAiRouter(`${providerLabel} JSON parsed="${stringifyForLog(parsed, 900)}"`, 'debug');
+  return parsed;
+};
+
 interface BoardOpsEnvelope {
   kind: 'board_ops';
   summary?: string;
@@ -1532,10 +1559,16 @@ const runCodexCliJsonPrompt = async (systemPrompt: string, userPrompt: string): 
       timeout: 45000,
     });
     if (result.exitCode !== 0 || !existsSync(outputFile)) {
+      const stdout = result.stdout ? new TextDecoder().decode(result.stdout) : '';
+      const stderr = result.stderr ? new TextDecoder().decode(result.stderr) : '';
+      logAiRouter(
+        `Codex JSON call failed exitCode=${result.exitCode} stdout="${compactForLog(stdout, 700)}" stderr="${compactForLog(stderr, 700)}"`,
+        'debug',
+      );
       return null;
     }
     const content = readFileSync(outputFile, 'utf8');
-    return parseJsonObject(content);
+    return parseJsonWithDebugLog('Codex JSON response', content);
   } catch {
     return null;
   } finally {
@@ -1575,9 +1608,10 @@ const runOpenAiJsonPrompt = async (systemPrompt: string, userPrompt: string): Pr
   const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
   const content = data.choices?.[0]?.message?.content;
   if (!content) {
+    logAiRouter('OpenAI JSON response was empty.', 'debug');
     return null;
   }
-  return parseJsonObject(content);
+  return parseJsonWithDebugLog('OpenAI JSON response', content);
 };
 
 const extractAnthropicText = (value: unknown): string => {
@@ -1630,9 +1664,10 @@ const runAnthropicJsonPrompt = async (systemPrompt: string, userPrompt: string):
   const data = (await response.json().catch(() => null)) as unknown;
   const content = extractAnthropicText(data);
   if (!content) {
+    logAiRouter('Anthropic JSON response was empty.', 'debug');
     return null;
   }
-  return parseJsonObject(content);
+  return parseJsonWithDebugLog('Anthropic JSON response', content);
 };
 
 const runCodexCliTextPrompt = async (prompt: string): Promise<string | null> => {
@@ -2242,6 +2277,11 @@ export const generateBoardOps = async (
       fingerprint,
     };
   }
+  if (parsed !== null) {
+    logAiRouter(`Board ops rejected parsed response="${stringifyForLog(parsed, 1100)}"`, 'debug');
+  } else {
+    logAiRouter('Board ops route returned null response.', 'debug');
+  }
 
   const fallbackOps = buildDeterministicBoardOpsFallback(input);
   if (fallbackOps.length > 0) {
@@ -2301,6 +2341,11 @@ export const generatePersonalizedBoardOps = async (
       ops: envelope.ops,
       fingerprint,
     };
+  }
+  if (parsed !== null) {
+    logAiRouter(`Personalized board ops rejected parsed response="${stringifyForLog(parsed, 1100)}"`, 'debug');
+  } else {
+    logAiRouter('Personalized board ops route returned null response.', 'debug');
   }
 
   const fallbackOps = buildDeterministicPersonalizedBoardOpsFallback(input, options);
