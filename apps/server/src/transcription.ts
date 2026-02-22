@@ -26,8 +26,12 @@ const ANTHROPIC_MESSAGES_ENDPOINT = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_API_VERSION = '2023-06-01';
 const CODEX_REASONING_EFFORT = 'high';
 
-const logTranscription = (message: string) => {
-  console.log(`[Transcription] ${message}`);
+const logTranscription = (message: string, level: 'info' | 'debug' = 'info') => {
+  if (level === 'debug' && getRuntimeConfig().logging?.level !== 'debug') {
+    return;
+  }
+  const prefix = level === 'debug' ? '[Transcription][debug]' : '[Transcription]';
+  console.log(`${prefix} ${message}`);
 };
 
 const isCodexTranscribeFallbackEnabled = (): boolean => {
@@ -543,7 +547,7 @@ export const runTranscriptionPreflightCheck = async (): Promise<TranscriptionPre
     logTranscription(`OpenAI whisper preflight failed: ${whisper.error}`);
   }
 
-  logTranscription('Preflight fallback -> anthropic');
+  logTranscription('Preflight fallback -> anthropic', 'debug');
   const anthropic = await probeAnthropicTranscriptionFallback().catch(() => ({
     ok: false,
     provider: 'anthropic' as const,
@@ -551,7 +555,7 @@ export const runTranscriptionPreflightCheck = async (): Promise<TranscriptionPre
     error: 'Claude fallback preflight threw an exception.',
   }));
   if (anthropic.ok) {
-    logTranscription('Claude transcription fallback preflight succeeded.');
+    logTranscription('Claude transcription fallback preflight succeeded.', 'debug');
     return {
       ok: true,
       provider: providerLabel,
@@ -561,12 +565,12 @@ export const runTranscriptionPreflightCheck = async (): Promise<TranscriptionPre
   }
   if (anthropic.error) {
     errors.push(anthropic.error);
-    logTranscription(`Claude transcription fallback preflight failed: ${anthropic.error}`);
+    logTranscription(`Claude transcription fallback preflight failed: ${anthropic.error}`, 'debug');
   }
 
-  logTranscription('Preflight fallback -> codex_cli');
+  logTranscription('Preflight fallback -> codex_cli', 'debug');
   if (!isCodexTranscribeFallbackEnabled()) {
-    logTranscription('Codex transcription fallback preflight disabled by env.');
+    logTranscription('Codex transcription fallback preflight disabled by env.', 'debug');
     return {
       ok: false,
       provider: providerLabel,
@@ -581,7 +585,7 @@ export const runTranscriptionPreflightCheck = async (): Promise<TranscriptionPre
     error: 'Codex fallback preflight threw an exception.',
   }));
   if (codex.ok) {
-    logTranscription('Codex transcription fallback preflight succeeded.');
+    logTranscription('Codex transcription fallback preflight succeeded.', 'debug');
     return {
       ok: true,
       provider: providerLabel,
@@ -591,7 +595,7 @@ export const runTranscriptionPreflightCheck = async (): Promise<TranscriptionPre
   }
   if (codex.error) {
     errors.push(codex.error);
-    logTranscription(`Codex transcription fallback preflight failed: ${codex.error}`);
+    logTranscription(`Codex transcription fallback preflight failed: ${codex.error}`, 'debug');
   }
 
   return {
@@ -624,20 +628,20 @@ export const transcribeAudioBlob = async (audio: Blob): Promise<TranscriptionRes
     logTranscription(`OpenAI whisper failed: ${whisper.error}`);
   }
 
-  logTranscription('Fallback -> anthropic');
+  logTranscription('Fallback -> anthropic', 'debug');
   const anthropic = await transcribeWithAnthropic(audio, mimeType);
   if (anthropic.ok) {
-    logTranscription('Claude transcription fallback succeeded.');
+    logTranscription('Claude transcription fallback succeeded.', 'debug');
     return anthropic;
   }
   if (anthropic.error) {
     errors.push(anthropic.error);
-    logTranscription(`Claude transcription fallback failed: ${anthropic.error}`);
+    logTranscription(`Claude transcription fallback failed: ${anthropic.error}`, 'debug');
   }
 
-  logTranscription('Fallback -> codex_cli');
+  logTranscription('Fallback -> codex_cli', 'debug');
   if (!isCodexTranscribeFallbackEnabled()) {
-    logTranscription('Codex transcription fallback disabled by env.');
+    logTranscription('Codex transcription fallback disabled by env.', 'debug');
     return {
       ok: false,
       text: '',
@@ -646,12 +650,12 @@ export const transcribeAudioBlob = async (audio: Blob): Promise<TranscriptionRes
   }
   const codex = await transcribeWithCodex(audio, mimeType);
   if (codex.ok) {
-    logTranscription('Codex transcription fallback succeeded.');
+    logTranscription('Codex transcription fallback succeeded.', 'debug');
     return codex;
   }
   if (codex.error) {
     errors.push(codex.error);
-    logTranscription(`Codex transcription fallback failed: ${codex.error}`);
+    logTranscription(`Codex transcription fallback failed: ${codex.error}`, 'debug');
   }
 
   return {

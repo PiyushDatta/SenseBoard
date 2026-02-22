@@ -20,6 +20,29 @@ export const roomStatusPillStyles = StyleSheet.create({
   statusSubText: {
     fontSize: 12,
   },
+  boardToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 4,
+    flexWrap: 'wrap',
+  },
+  boardToggleLabel: {
+    fontSize: 11,
+  },
+  boardToggleChip: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  boardToggleText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  boardTogglePressed: {
+    opacity: 0.82,
+  },
 });
 
 export const createRoomStatusPillThemeStyles = (theme: SenseTheme) => ({
@@ -39,4 +62,12 @@ export const createRoomStatusPillThemeStyles = (theme: SenseTheme) => ({
     color: theme.colors.textMuted,
     fontFamily: theme.fonts.body,
   },
+  boardToggleChip: (active: boolean) => ({
+    borderColor: active ? theme.colors.accent : theme.colors.inputBorder,
+    backgroundColor: active ? theme.colors.accentSoft : theme.colors.inputBg,
+  }),
+  boardToggleText: (active: boolean) => ({
+    color: active ? theme.colors.accentText : theme.colors.textSecondary,
+    fontFamily: theme.fonts.body,
+  }),
 });

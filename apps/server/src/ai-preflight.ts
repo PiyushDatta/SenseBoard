@@ -7,6 +7,171 @@ interface CodexProbe {
   loggedIn: boolean;
 }
 
+interface ServerHealthProbe {
+  url: string;
+  startedAt: number;
+}
+
+const REQUEST_TIMEOUT_MS = 1200;
+const WS_ACK_TIMEOUT_MS = 4000;
+const WS_PROTOCOL = 'senseboard-ws-v1';
+
+const parsePositiveInt = (value: string | undefined, fallback: number): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+};
+
+const getServerCandidates = (defaultPort: number, defaultSpan: number): string[] => {
+  const explicitUrl = process.env.EXPO_PUBLIC_SERVER_URL?.trim().replace(/\/+$/, '');
+  if (explicitUrl) {
+    return [explicitUrl];
+  }
+  const startPort = parsePositiveInt(process.env.EXPO_PUBLIC_SERVER_PORT, defaultPort);
+  const span = parsePositiveInt(process.env.EXPO_PUBLIC_SERVER_PORT_SPAN, defaultSpan);
+  const candidates: string[] = [];
+  for (let offset = 0; offset < span; offset += 1) {
+    candidates.push(`http://localhost:${startPort + offset}`);
+  }
+  return candidates;
+};
+
+const probeServerHealth = async (baseUrl: string): Promise<ServerHealthProbe | null> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${baseUrl}/health`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json().catch(() => ({}))) as { instanceStartedAt?: unknown };
+    const startedAt =
+      typeof payload.instanceStartedAt === 'number' && Number.isFinite(payload.instanceStartedAt)
+        ? payload.instanceStartedAt
+        : 0;
+    return {
+      url: baseUrl,
+      startedAt,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const resolveHandshakeServerUrl = async (defaultPort: number, defaultSpan: number): Promise<string | null> => {
+  const candidates = getServerCandidates(defaultPort, defaultSpan);
+  const probes = await Promise.all(candidates.map((candidate) => probeServerHealth(candidate)));
+  const reachable = probes.filter((probe): probe is ServerHealthProbe => probe !== null);
+  if (reachable.length === 0) {
+    return null;
+  }
+  let best = reachable[0]!;
+  for (let index = 1; index < reachable.length; index += 1) {
+    const candidate = reachable[index]!;
+    if (candidate.startedAt > best.startedAt) {
+      best = candidate;
+    }
+  }
+  return best.url;
+};
+
+const randomPreflightRoomId = (): string => {
+  const token = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `PREFLT${token}`;
+};
+
+const runWebsocketHandshakePreflight = async (baseUrl: string): Promise<{ ok: boolean; error?: string }> => {
+  return new Promise((resolve) => {
+    const roomId = randomPreflightRoomId();
+    const wsBase = baseUrl.replace(/^http/i, 'ws');
+    const params = new URLSearchParams({
+      roomId,
+      name: 'Preflight',
+    });
+    const wsUrl = `${wsBase}/ws?${params.toString()}`;
+
+    let settled = false;
+    let socket: WebSocket | null = null;
+
+    const settle = (ok: boolean, error?: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        socket?.close();
+      } catch {
+        // no-op
+      }
+      resolve({ ok, error });
+    };
+
+    const timeout = setTimeout(() => {
+      settle(false, `WebSocket ACK timeout after ${WS_ACK_TIMEOUT_MS}ms (${wsUrl})`);
+    }, WS_ACK_TIMEOUT_MS);
+
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch (error) {
+      clearTimeout(timeout);
+      const message = error instanceof Error ? error.message : String(error);
+      resolve({ ok: false, error: `Failed to open websocket: ${message}` });
+      return;
+    }
+
+    socket.onopen = () => {
+      socket.send(
+        JSON.stringify({
+          type: 'client:ack',
+          payload: {
+            protocol: WS_PROTOCOL,
+            sentAt: Date.now(),
+          },
+        }),
+      );
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(String(event.data)) as {
+          type?: string;
+          payload?: {
+            protocol?: string;
+            message?: string;
+          };
+        };
+        if (message.type === 'server:ack' && message.payload?.protocol === WS_PROTOCOL) {
+          settle(true);
+          return;
+        }
+        if (message.type === 'room:error') {
+          settle(false, message.payload?.message || 'Server returned room:error during handshake.');
+        }
+      } catch {
+        settle(false, 'Invalid JSON message during websocket handshake preflight.');
+      }
+    };
+
+    socket.onerror = () => {
+      settle(false, `WebSocket error during handshake preflight (${wsUrl})`);
+    };
+
+    socket.onclose = () => {
+      if (!settled) {
+        settle(false, 'WebSocket closed before server ACK.');
+      }
+    };
+  });
+};
+
 const isCodexLoggedIn = (exitCode: number, output: string): boolean => {
   if (exitCode !== 0) {
     return false;
@@ -81,6 +246,26 @@ const main = async () => {
     console.log('AI preflight skipped (preflight.enabled=false in senseboard.config.toml).');
     return;
   }
+
+  const handshakeServerUrl = await resolveHandshakeServerUrl(config.server.port, config.server.portScanSpan);
+  if (!handshakeServerUrl) {
+    const candidates = getServerCandidates(config.server.port, config.server.portScanSpan).join(', ');
+    console.error('Realtime handshake preflight failed: no reachable SenseBoard server.');
+    console.error(`Checked: ${candidates}`);
+    console.error('Start the server first with: bun run server');
+    process.exit(1);
+  }
+
+  const handshake = await runWebsocketHandshakePreflight(handshakeServerUrl);
+  if (!handshake.ok) {
+    console.error(`Realtime handshake preflight failed on ${handshakeServerUrl}`);
+    if (handshake.error) {
+      console.error(handshake.error);
+    }
+    process.exit(1);
+  }
+  console.log(`Realtime handshake preflight ok (${handshakeServerUrl})`);
+
   const provider = config.ai.provider;
   const codexPrimary =
     provider === 'codex_cli' ||

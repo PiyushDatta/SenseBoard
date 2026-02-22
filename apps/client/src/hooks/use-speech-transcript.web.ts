@@ -44,6 +44,7 @@ export interface SpeechTranscriptController {
 }
 
 const DEFAULT_CHUNK_MS = 2600;
+const MIN_AUDIO_CHUNK_BYTES = 1024;
 
 const pickMediaMimeType = (): string => {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
@@ -76,6 +77,7 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
   const onAudioChunkRef = useRef(onAudioChunk);
   const bufferedFinalRef = useRef('');
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recorderSegmentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const uploadQueueRef = useRef<Array<{ blob: Blob; mimeType: string }>>([]);
   const uploadRunningRef = useRef(false);
   const lastEmittedRef = useRef('');
@@ -104,8 +106,12 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
         }
         try {
           await onAudioChunkRef.current(next.blob, next.mimeType);
-        } catch {
-          setError('Audio transcription request failed.');
+        } catch (uploadError) {
+          const message =
+            uploadError instanceof Error && uploadError.message.trim().length > 0
+              ? uploadError.message
+              : 'Audio transcription request failed.';
+          setError(message);
         }
       }
     } finally {
@@ -113,10 +119,30 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
     }
   }, []);
 
+  const stopRecorderSegmentTimer = useCallback(() => {
+    if (recorderSegmentTimerRef.current) {
+      clearTimeout(recorderSegmentTimerRef.current);
+      recorderSegmentTimerRef.current = null;
+    }
+  }, []);
+
   const stopMediaStream = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+    }
+  }, []);
+
+  const stopRecorder = useCallback(() => {
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (!recorder || recorder.state === 'inactive') {
+      return;
+    }
+    try {
+      recorder.stop();
+    } catch {
+      // Ignore stop failures if recorder already stopped.
     }
   }, []);
 
@@ -206,35 +232,65 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
       const beginRecording = async () => {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          const mimeType = pickMediaMimeType();
-          const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
           streamRef.current = stream;
-          recorderRef.current = recorder;
-
-          recorder.ondataavailable = (event) => {
-            if (!event.data || event.data.size === 0) {
-              return;
-            }
-            const type = recorder.mimeType || event.data.type || 'audio/webm';
-            uploadQueueRef.current.push({ blob: event.data, mimeType: type });
-            void processUploadQueue();
-          };
-
-          recorder.onerror = () => {
-            setError('Unable to read microphone audio stream.');
-            setListening(false);
-            setInterimText('');
-            stopMediaStream();
-          };
-
-          recorder.onstop = () => {
-            setInterimText('');
-            setListening(false);
-            stopMediaStream();
-          };
 
           const cadenceMs = Math.max(1200, Math.floor(chunkMs));
-          recorder.start(cadenceMs);
+
+          const startRecordingSegment = () => {
+            if (!shouldKeepListening.current || !streamRef.current) {
+              return;
+            }
+            const mimeType = pickMediaMimeType();
+            const recorder = mimeType ? new MediaRecorder(streamRef.current, { mimeType }) : new MediaRecorder(streamRef.current);
+            recorderRef.current = recorder;
+
+            recorder.ondataavailable = (event) => {
+              if (!event.data || event.data.size === 0) {
+                return;
+              }
+              if (event.data.size < MIN_AUDIO_CHUNK_BYTES) {
+                return;
+              }
+              const type = recorder.mimeType || event.data.type || 'audio/webm';
+              uploadQueueRef.current.push({ blob: event.data, mimeType: type });
+              void processUploadQueue();
+            };
+
+            recorder.onerror = () => {
+              shouldKeepListening.current = false;
+              setError('Unable to read microphone audio stream.');
+              setListening(false);
+              setInterimText('');
+              stopRecorderSegmentTimer();
+              stopMediaStream();
+            };
+
+            recorder.onstop = () => {
+              stopRecorderSegmentTimer();
+              if (!shouldKeepListening.current) {
+                setInterimText('');
+                setListening(false);
+                stopMediaStream();
+                return;
+              }
+              startRecordingSegment();
+            };
+
+            recorder.start();
+            stopRecorderSegmentTimer();
+            recorderSegmentTimerRef.current = setTimeout(() => {
+              if (recorder.state === 'recording') {
+                try {
+                  recorder.stop();
+                } catch {
+                  // Ignore stop failures if recorder already stopped.
+                }
+              }
+            }, cadenceMs);
+          };
+
+          shouldKeepListening.current = true;
+          startRecordingSegment();
           setListening(true);
           setInterimText('Listening...');
           setError(null);
@@ -242,6 +298,7 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
           setError('Unable to start microphone transcription.');
           setListening(false);
           setInterimText('');
+          shouldKeepListening.current = false;
           stopMediaStream();
         }
       };
@@ -265,20 +322,13 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
     } catch {
       setError('Unable to start microphone transcription.');
     }
-  }, [chunkMs, processUploadQueue, shouldUseAudioUpload, stopMediaStream]);
+  }, [chunkMs, processUploadQueue, shouldUseAudioUpload, stopMediaStream, stopRecorderSegmentTimer]);
 
   const stop = useCallback(() => {
     if (recorderRef.current) {
-      const recorder = recorderRef.current;
-      recorderRef.current = null;
-      if (recorder.state !== 'inactive') {
-        try {
-          recorder.requestData();
-        } catch {
-          // ignore requestData failures while stopping
-        }
-        recorder.stop();
-      }
+      shouldKeepListening.current = false;
+      stopRecorderSegmentTimer();
+      stopRecorder();
       setListening(false);
       setInterimText('');
       return;
@@ -293,15 +343,16 @@ export const useSpeechTranscript = ({ onChunk, onAudioChunk, chunkMs = DEFAULT_C
     recognitionRef.current?.stop();
     setListening(false);
     setInterimText('');
-  }, [flushBufferedFinal]);
+  }, [flushBufferedFinal, stopRecorder, stopRecorderSegmentTimer]);
 
   useEffect(() => {
     return () => {
-      recorderRef.current?.stop();
-      recorderRef.current = null;
+      shouldKeepListening.current = false;
+      stopRecorderSegmentTimer();
+      stopRecorder();
       stopMediaStream();
     };
-  }, [stopMediaStream]);
+  }, [stopMediaStream, stopRecorder, stopRecorderSegmentTimer]);
 
   return useMemo(
     () => ({

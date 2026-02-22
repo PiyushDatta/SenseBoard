@@ -154,6 +154,24 @@ export const sidebarStyles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 14,
   },
+  actionButtonRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  flexButton: {
+    flex: 1,
+  },
+  secondaryActionButton: {
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 11,
+    borderWidth: 1,
+  },
+  secondaryActionButtonText: {
+    fontWeight: '700',
+    fontSize: 12,
+  },
   pressed: {
     opacity: 0.78,
   },
@@ -255,6 +273,14 @@ export const createSidebarThemeStyles = (theme: SenseTheme) => ({
   primaryButtonText: {
     color: theme.colors.accentText,
     fontFamily: theme.fonts.heading,
+  },
+  secondaryActionButton: {
+    backgroundColor: theme.colors.inputBg,
+    borderColor: theme.colors.inputBorder,
+  },
+  secondaryActionButtonText: {
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fonts.body,
   },
   tabText: {
     color: theme.colors.textSecondary,

@@ -11,6 +11,7 @@ SenseBoard is a Bun + Expo (React Native Web) hackathon MVP for live meeting ill
 - controls: Freeze AI, Pin Diagram, Focus Mode, Regenerate, Undo AI
 - theme modes: Auto (system), Light, Dark toggle in join and room top bar
 - topic clarity: auto-clear on topic shifts + archived diagram restore
+- dual board views: shared main board + per-user personalized board toggle
 
 ## Config (TOML)
 
@@ -26,6 +27,14 @@ level = "debug" # debug | info | warn | error | silent (keep debug on for demo)
 
 [preflight]
 enabled = true # set false to skip ai:preflight on bun run start:web
+
+[capture.transcription_chunks]
+enabled = true # capture raw mic chunks to disk for debugging/fixtures
+directory = "test_recording_data" # repo-local capture folder for replayable fixtures
+
+[personalization]
+sqlite_path = "data/senseboard-personalization.sqlite" # per-name personalization store
+max_context_lines = 64 # keep latest N context lines per name
 
 [ai]
 provider = "auto" # auto | openai | anthropic | codex_cli | deterministic
@@ -52,12 +61,21 @@ Review env overrides:
 - `AI_REVIEW_MAX_REVISIONS`
 - `AI_REVIEW_CONFIDENCE_THRESHOLD`
 
+`capture.transcription_chunks` is TOML-only (no env override).
+When enabled, the server stores incoming audio blobs from `/rooms/:id/transcribe` and logs the file path in debug mode.
+Recommended layout for replay tests:
+
+- `test_recording_data/valid` for chunks that should transcribe successfully
+- `test_recording_data/legacy_invalid` for old malformed chunks used to reproduce failures
+- `personalization.sqlite_path` stores per-name personalization context (SQLite)
+
 ## Project Structure
 
 - `apps/client`: SenseBoard web UI modules
 - `apps/server`: Bun websocket + AI patch API
 - `apps/shared`: shared room and DSL types
 - `app`: Expo Router entrypoint (`app/index.tsx` uses `apps/client`)
+- `prompts`: prompt templates loaded by the main board-ops AI route
 
 ## Local Run
 
@@ -71,6 +89,7 @@ bun install
 
 `bun run start:web` now requires a local `.env` file.
 Preflight runs by default; disable it with `preflight.enabled = false` in `senseboard.config.toml`.
+Preflight now checks realtime websocket handshake (`client:ack` -> `server:ack`) against a live server.
 
 ```bash
 cp .env.example .env
@@ -103,6 +122,7 @@ bun run start:web
 ```
 
 Open web in browser from Expo output.
+Join/create requires a non-empty display name (used as personalization key in MVP).
 
 If your server is on a custom host/port range, set:
 
@@ -124,6 +144,14 @@ bun run test
 ```
 
 `bun run typecheck` validates both client and server TypeScript projects.
+`bun run test` runs fast local tests only (`apps/**`) and excludes paid integration tests.
+Run paid/provider integration checks explicitly with:
+
+```bash
+bun run integration_test
+```
+
+`integration_test` replays audio fixtures from `test_recording_data` so you can reproduce transcription behavior on real captured chunks.
 
 ## AI Flow
 
@@ -140,11 +168,22 @@ bun run test
 
 ### AI Diagram Generation (Understand Text + Draw)
 1. AI patch job runs from server queue.
-2. Server builds prompt context from transcript/chat/context bank + current board state.
-3. Provider routing for diagram ops:
+2. Server loads prompt templates from `prompts/main_ai_board_system_prompt.txt` and `prompts/main_ai_board_delta_prompt.txt`.
+3. On startup/first use, server primes a one-time AI prompt session for the board-ops route.
+4. Server builds prompt context from transcript/chat/context bank + current board state.
+5. Provider routing for diagram ops:
    - If `provider = "anthropic"`: `Claude -> Codex CLI`
    - If `provider = "auto"`: `Claude -> Codex CLI -> OpenAI` (OpenAI only if Claude/Codex unavailable)
-4. Returned board ops are applied to shared board state and broadcast to room members.
+6. If model output is empty/non-visual but transcript lines exist, server emits deterministic transcript-based board ops fallback.
+7. Returned board ops are applied to shared board state and broadcast to room members.
+
+### Personalized Board Flow
+1. Users switch board view with `Main / Personal` toggle in the room status pill.
+2. Main board remains shared and always has queue priority.
+3. Personalized board runs in a separate lower-priority queue per `(roomId, name)`.
+4. Personalized generation waits for main queue drain, then applies user-tailored board ops.
+5. User personalization context is stored in SQLite by name and can be updated from chat via `Add to personalization`.
+6. Client fetches personalized board via `GET /rooms/:roomId/personal-board?name=<displayName>`.
 
 ### Logging
 - Transcription routing/fallback logs:

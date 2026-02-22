@@ -53,6 +53,11 @@ interface AIInput {
   };
 }
 
+export interface PersonalizedBoardOptions {
+  memberName: string;
+  contextLines: string[];
+}
+
 const HIGH_WORDS = ['must', 'always', 'constraint', 'required', 'priority'];
 const TREE_WORDS = ['tree', 'dfs', 'bfs', 'pre-order', 'post-order', 'traversal', 'node', 'children'];
 const SYSTEM_WORDS = ['architecture', 'gateway', 'service', 'postgres', 'redis', 'cache', 'api', 'rps'];
@@ -157,9 +162,453 @@ type AIProvider = 'deterministic' | 'openai' | 'anthropic' | 'codex_cli' | 'auto
 let codexCliStatus: 'unknown' | 'ready' | 'unavailable' = 'unknown';
 const CODEX_REASONING_EFFORT = 'high';
 const ANTHROPIC_API_VERSION = '2023-06-01';
+const PROMPTS_DIR = join(process.cwd(), 'prompts');
+const BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_system_prompt.txt');
+const BOARD_OPS_DELTA_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_delta_prompt.txt');
 
-const logAiRouter = (message: string) => {
-  console.log(`[AI Router] ${message}`);
+const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
+  'You are an AI whiteboard sketch engine.',
+  'Return JSON only. No markdown.',
+  'Output exactly one object: {"kind":"board_ops","summary":"...","ops":[...]}',
+  'Ops must use this API only:',
+  '- upsertElement: {type:"upsertElement", element:{id,kind,...}}',
+  '- appendStrokePoints: {type:"appendStrokePoints", id, points:[[x,y],...]}',
+  '- deleteElement: {type:"deleteElement", id}',
+  '- clearBoard: {type:"clearBoard"}',
+  '- setViewport: {type:"setViewport", viewport:{x?,y?,zoom?}}',
+  '- batch: {type:"batch", ops:[...]}',
+  'Element kinds: stroke, rect, ellipse, diamond, arrow, line, text.',
+  'Prefer sketches over prose. Use arrows/lines to connect ideas.',
+  'Modality priority: corrections > pinned high context > pinned normal context > transcript.',
+  'Avoid excessive text. Keep labels short. Keep coordinates in a readable range.',
+].join('\n');
+
+const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
+  'You are receiving the latest transcript/context window for a live whiteboard.',
+  'For each line in transcriptWindow, choose a concrete visual representation.',
+  'When transcriptWindow has text, return drawable ops (upsertElement/appendStrokePoints), not only metadata ops.',
+  'If uncertain, draw simple labeled rectangles/text for each transcript idea rather than returning empty output.',
+  'Keep updates incremental and anchored to currentBoardHint.',
+].join('\n');
+
+const BOARD_OPS_FALLBACK_MAX_LINES = 6;
+
+let cachedBoardOpsPrompts: {
+  system: string;
+  delta: string;
+} | null = null;
+let boardOpsPromptSessionPrimed = false;
+let boardOpsPromptSessionPriming: Promise<void> | null = null;
+
+const logAiRouter = (message: string, level: 'info' | 'debug' = 'info') => {
+  if (level === 'debug' && getRuntimeConfig().logging?.level !== 'debug') {
+    return;
+  }
+  const prefix = level === 'debug' ? '[AI Router][debug]' : '[AI Router]';
+  console.log(`${prefix} ${message}`);
+};
+
+const readPromptTemplate = (filePath: string, fallback: string, label: string): string => {
+  if (!existsSync(filePath)) {
+    logAiRouter(`Prompt file missing for ${label}; using default. path=${filePath}`, 'debug');
+    return fallback;
+  }
+  try {
+    const text = readFileSync(filePath, 'utf8').trim();
+    if (!text) {
+      logAiRouter(`Prompt file empty for ${label}; using default. path=${filePath}`, 'debug');
+      return fallback;
+    }
+    return text;
+  } catch (error) {
+    logAiRouter(
+      `Prompt file read failed for ${label}; using default. path=${filePath} error=${error instanceof Error ? error.message : String(error)}`,
+      'debug',
+    );
+    return fallback;
+  }
+};
+
+const getBoardOpsPromptTemplates = (): { system: string; delta: string } => {
+  if (cachedBoardOpsPrompts) {
+    return cachedBoardOpsPrompts;
+  }
+  cachedBoardOpsPrompts = {
+    system: readPromptTemplate(BOARD_OPS_SYSTEM_PROMPT_PATH, DEFAULT_BOARD_OPS_SYSTEM_PROMPT, 'board_ops.system'),
+    delta: readPromptTemplate(BOARD_OPS_DELTA_PROMPT_PATH, DEFAULT_BOARD_OPS_DELTA_PROMPT, 'board_ops.delta'),
+  };
+  logAiRouter(
+    `Loaded board prompts system=${BOARD_OPS_SYSTEM_PROMPT_PATH} delta=${BOARD_OPS_DELTA_PROMPT_PATH}`,
+    'debug',
+  );
+  return cachedBoardOpsPrompts;
+};
+
+const truncatePromptText = (value: string, maxLength = 120): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
+
+const transcriptLineToPlainText = (line: string): string => {
+  const separatorIndex = line.indexOf(':');
+  const text = separatorIndex >= 0 ? line.slice(separatorIndex + 1) : line;
+  return truncatePromptText(text, 180);
+};
+
+const buildDeterministicBoardOpsFallback = (input: AIInput): BoardOp[] => {
+  const lines = input.transcriptWindow
+    .map(transcriptLineToPlainText)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(-BOARD_OPS_FALLBACK_MAX_LINES);
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const now = Date.now();
+  const baseX = 280;
+  const baseY = 280;
+  const cardWidth = 980;
+  const cardHeight = 120;
+  const verticalGap = 56;
+
+  const ops: BoardOp[] = [];
+  ops.push({
+    type: 'upsertElement',
+    element: {
+      id: 'ai:auto:title',
+      kind: 'text',
+      x: baseX,
+      y: baseY - 42,
+      text: 'Live transcript sketch',
+      createdAt: now,
+      createdBy: 'ai',
+      style: {
+        fontSize: 28,
+        strokeColor: '#1f3c5c',
+      },
+    },
+  });
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const text = lines[index]!;
+    const topY = baseY + index * (cardHeight + verticalGap);
+    ops.push({
+      type: 'upsertElement',
+      element: {
+        id: `ai:auto:block:${index}`,
+        kind: 'rect',
+        x: baseX,
+        y: topY,
+        w: cardWidth,
+        h: cardHeight,
+        createdAt: now,
+        createdBy: 'ai',
+        style: {
+          strokeColor: '#2d5a82',
+          fillColor: '#dfefff',
+          strokeWidth: 2,
+          roughness: 1.4,
+        },
+      },
+    });
+    ops.push({
+      type: 'upsertElement',
+      element: {
+        id: `ai:auto:text:${index}`,
+        kind: 'text',
+        x: baseX + 24,
+        y: topY + 66,
+        text: truncatePromptText(text, 130),
+        createdAt: now,
+        createdBy: 'ai',
+        style: {
+          fontSize: 24,
+          strokeColor: '#16324a',
+        },
+      },
+    });
+  }
+
+  for (let index = 0; index < BOARD_OPS_FALLBACK_MAX_LINES - 1; index += 1) {
+    if (index < lines.length - 1) {
+      const startY = baseY + index * (cardHeight + verticalGap) + cardHeight;
+      const endY = baseY + (index + 1) * (cardHeight + verticalGap);
+      ops.push({
+        type: 'upsertElement',
+        element: {
+          id: `ai:auto:link:${index}`,
+          kind: 'arrow',
+          points: [
+            [baseX + cardWidth / 2, startY],
+            [baseX + cardWidth / 2, endY],
+          ],
+          createdAt: now,
+          createdBy: 'ai',
+          style: {
+            strokeColor: '#527493',
+            strokeWidth: 2,
+            roughness: 1.4,
+          },
+        },
+      });
+    } else {
+      ops.push({ type: 'deleteElement', id: `ai:auto:link:${index}` });
+    }
+  }
+
+  for (let index = lines.length; index < BOARD_OPS_FALLBACK_MAX_LINES; index += 1) {
+    ops.push({ type: 'deleteElement', id: `ai:auto:block:${index}` });
+    ops.push({ type: 'deleteElement', id: `ai:auto:text:${index}` });
+  }
+
+  return ops;
+};
+
+const normalizePersonalizationContextLines = (lines: string[], maxLines = 16): string[] => {
+  return lines
+    .map((line) => line.trim().replace(/\s+/g, ' '))
+    .filter((line) => line.length > 0)
+    .slice(-Math.max(1, maxLines));
+};
+
+const buildPersonalizedBoardOpsSystemPrompt = (options: PersonalizedBoardOptions): string => {
+  const templates = getBoardOpsPromptTemplates();
+  const member = options.memberName.trim() || 'Member';
+  return [
+    templates.system,
+    '',
+    'You are generating a personalized board for one participant.',
+    `Participant: ${member}`,
+    'This participant prefers concise bullet-point notes over visual diagrams.',
+    'Use text-forward output: short bullet statements, compact grouping, and minimal decorative shapes.',
+    'When transcriptWindow has content, always produce drawable operations.',
+    'Clear stale personalized items if needed to keep the board focused on current discussion.',
+  ].join('\n');
+};
+
+const buildPersonalizedBoardOpsUserPrompt = (payload: AIInput, options: PersonalizedBoardOptions): string => {
+  const templates = getBoardOpsPromptTemplates();
+  const contextLines = normalizePersonalizationContextLines(options.contextLines);
+  const input = {
+    metadata: {
+      roomId: payload.roomId,
+      nowIso: payload.nowIso,
+      trigger: payload.trigger,
+      participant: options.memberName.trim() || 'Member',
+    },
+    personalization: {
+      preferredMode: 'bullet_points_over_visuals',
+      contextLines,
+    },
+    context: {
+      corrections: payload.correctionDirectives,
+      contextPinnedHigh: payload.contextPinnedHigh,
+      contextPinnedNormal: payload.contextPinnedNormal,
+      transcriptWindow: payload.transcriptWindow,
+      recentChat: payload.recentChat,
+    },
+    visualHint: payload.visualHint,
+    currentBoardHint: {
+      topic: payload.currentDiagramSummary.topic,
+      diagramType: payload.currentDiagramSummary.diagramType,
+      nodeCount: payload.currentDiagramSummary.nodeCount,
+      edgeCount: payload.currentDiagramSummary.edgeCount,
+    },
+  };
+  return [
+    templates.delta,
+    'Personalization directive: summarize ideas as concise bullet points for this user.',
+    'Prefer text elements and simple containers; avoid dense diagram geometry unless absolutely necessary.',
+    'Every transcript line should map to at least one bullet-style drawable operation.',
+    'Return board_ops JSON only.',
+    JSON.stringify(input, null, 2),
+  ].join('\n\n');
+};
+
+const buildDeterministicPersonalizedBoardOpsFallback = (
+  input: AIInput,
+  options: PersonalizedBoardOptions,
+): BoardOp[] => {
+  const transcriptLines = input.transcriptWindow
+    .map(transcriptLineToPlainText)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(-10);
+  if (transcriptLines.length === 0) {
+    return [];
+  }
+
+  const profileLines = normalizePersonalizationContextLines(options.contextLines, 3);
+  const member = options.memberName.trim() || 'Member';
+  const now = Date.now();
+  const left = 260;
+  const top = 240;
+  const width = 1280;
+  const lineHeight = 54;
+
+  const ops: BoardOp[] = [{ type: 'clearBoard' }];
+  ops.push({
+    type: 'upsertElement',
+    element: {
+      id: 'personal:title',
+      kind: 'text',
+      x: left,
+      y: top - 34,
+      text: `${member} - Personalized Notes`,
+      createdAt: now,
+      createdBy: 'ai',
+      style: {
+        fontSize: 30,
+        strokeColor: '#173a58',
+      },
+    },
+  });
+
+  if (profileLines.length > 0) {
+    ops.push({
+      type: 'upsertElement',
+      element: {
+        id: 'personal:profile',
+        kind: 'text',
+        x: left,
+        y: top + 10,
+        text: `Preferences: ${truncatePromptText(profileLines.join(' | '), 140)}`,
+        createdAt: now,
+        createdBy: 'ai',
+        style: {
+          fontSize: 20,
+          strokeColor: '#2d607f',
+        },
+      },
+    });
+  } else {
+    ops.push({ type: 'deleteElement', id: 'personal:profile' });
+  }
+
+  const bulletStartY = top + 72;
+  for (let index = 0; index < transcriptLines.length; index += 1) {
+    const line = transcriptLines[index]!;
+    ops.push({
+      type: 'upsertElement',
+      element: {
+        id: `personal:bullet:${index}`,
+        kind: 'text',
+        x: left,
+        y: bulletStartY + index * lineHeight,
+        text: `- ${truncatePromptText(line, 150)}`,
+        createdAt: now,
+        createdBy: 'ai',
+        style: {
+          fontSize: 24,
+          strokeColor: '#1f3c5c',
+        },
+      },
+    });
+  }
+  for (let index = transcriptLines.length; index < 10; index += 1) {
+    ops.push({ type: 'deleteElement', id: `personal:bullet:${index}` });
+  }
+
+  ops.push({
+    type: 'upsertElement',
+    element: {
+      id: 'personal:frame',
+      kind: 'rect',
+      x: left - 24,
+      y: top - 64,
+      w: width,
+      h: 140 + transcriptLines.length * lineHeight,
+      createdAt: now,
+      createdBy: 'ai',
+      style: {
+        strokeColor: '#3b6c8e',
+        fillColor: '#e8f4ff',
+        strokeWidth: 2,
+        roughness: 1.2,
+      },
+    },
+  });
+
+  return ops;
+};
+
+const buildBoardOpsPrimeInput = (): AIInput => ({
+  roomId: 'PRIME',
+  nowIso: new Date().toISOString(),
+  trigger: {
+    reason: 'manual',
+    regenerate: false,
+    windowSeconds: 30,
+  },
+  transcriptWindow: ['Host: Prime board drawing cache for live transcript updates.'],
+  recentChat: [],
+  corrections: [],
+  correctionDirectives: [],
+  contextPinnedHigh: [],
+  contextPinnedNormal: [],
+  contextDirectiveLines: [],
+  visualHint: '',
+  currentDiagramSummary: {
+    groupId: 'prime',
+    topic: 'Prime',
+    diagramType: 'flowchart',
+    nodeCount: 0,
+    edgeCount: 0,
+  },
+  activeDiagramSnapshot: {
+    pinned: false,
+    title: '',
+    notes: [],
+    nodeIds: [],
+    nodeLabels: [],
+    edgePairs: [],
+  },
+  aiConfig: {
+    frozen: false,
+    focusMode: false,
+    pinnedGroups: [],
+  },
+});
+
+export const primeAiPromptSession = async (): Promise<void> => {
+  if (boardOpsPromptSessionPrimed) {
+    return;
+  }
+  if (boardOpsPromptSessionPriming) {
+    await boardOpsPromptSessionPriming;
+    return;
+  }
+
+  boardOpsPromptSessionPriming = (async () => {
+    getBoardOpsPromptTemplates();
+
+    const agent = getAgent();
+    if (!agent) {
+      logAiRouter('Board prompt session prime skipped: no AI agent available.', 'debug');
+      return;
+    }
+
+    const primeInput = buildBoardOpsPrimeInput();
+    const systemPrompt = buildBoardOpsSystemPrompt();
+    const userPrompt = buildBoardOpsUserPrompt(primeInput);
+    const primeResult = await agent.completeJson(systemPrompt, userPrompt).catch(() => null);
+    if (primeResult) {
+      logAiRouter('Board prompt session primed with main AI route.', 'debug');
+    } else {
+      logAiRouter('Board prompt session prime completed without response.', 'debug');
+    }
+    boardOpsPromptSessionPrimed = true;
+  })()
+    .catch(() => undefined)
+    .finally(() => {
+      boardOpsPromptSessionPriming = null;
+    });
+
+  await boardOpsPromptSessionPriming;
 };
 
 const readErrorText = async (response: Response): Promise<string> => {
@@ -991,25 +1440,11 @@ const buildDiagramPatchUserPrompt = (payload: AIInput): string => {
 };
 
 const buildBoardOpsSystemPrompt = (): string => {
-  return [
-    'You are an AI whiteboard sketch engine.',
-    'Return JSON only. No markdown.',
-    'Output exactly one object: {"kind":"board_ops","summary":"...","ops":[...]}',
-    'Ops must use this API only:',
-    '- upsertElement: {type:"upsertElement", element:{id,kind,...}}',
-    '- appendStrokePoints: {type:"appendStrokePoints", id, points:[[x,y],...]}',
-    '- deleteElement: {type:"deleteElement", id}',
-    '- clearBoard: {type:"clearBoard"}',
-    '- setViewport: {type:"setViewport", viewport:{x?,y?,zoom?}}',
-    '- batch: {type:"batch", ops:[...]}',
-    'Element kinds: stroke, rect, ellipse, diamond, arrow, line, text.',
-    'Prefer sketches over prose. Use arrows/lines to connect ideas.',
-    'Modality priority: corrections > pinned high context > pinned normal context > transcript.',
-    'Avoid excessive text. Keep labels short. Keep coordinates in a readable range.',
-  ].join('\n');
+  return getBoardOpsPromptTemplates().system;
 };
 
 const buildBoardOpsUserPrompt = (payload: AIInput): string => {
+  const templates = getBoardOpsPromptTemplates();
   const input = {
     metadata: {
       roomId: payload.roomId,
@@ -1023,14 +1458,19 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
       transcriptWindow: payload.transcriptWindow,
       recentChat: payload.recentChat,
     },
+    visualHint: payload.visualHint,
     currentBoardHint: {
       topic: payload.currentDiagramSummary.topic,
       diagramType: payload.currentDiagramSummary.diagramType,
       nodeCount: payload.currentDiagramSummary.nodeCount,
       edgeCount: payload.currentDiagramSummary.edgeCount,
     },
+    aiConfig: payload.aiConfig,
   };
   return [
+    templates.delta,
+    'Transcript mapping rule: every transcriptWindow line must map to at least one drawable operation.',
+    'If transcriptWindow is not empty, output upsertElement/appendStrokePoints and not only setViewport/deleteElement metadata.',
     'Generate the next sketch operations for this meeting moment.',
     'Return board_ops JSON only.',
     JSON.stringify(input, null, 2),
@@ -1101,7 +1541,7 @@ const runOpenAiJsonPrompt = async (systemPrompt: string, userPrompt: string): Pr
   });
   if (!response.ok) {
     const detail = await readErrorText(response);
-    logAiRouter(`OpenAI text call failed (${response.status})${detail ? `: ${detail}` : ''}`);
+    logAiRouter(`OpenAI JSON call failed (${response.status})${detail ? `: ${detail}` : ''}`);
     return null;
   }
   const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
@@ -1156,7 +1596,7 @@ const runAnthropicJsonPrompt = async (systemPrompt: string, userPrompt: string):
   });
   if (!response.ok) {
     const detail = await readErrorText(response);
-    logAiRouter(`OpenAI JSON call failed (${response.status})${detail ? `: ${detail}` : ''}`);
+    logAiRouter(`Anthropic JSON call failed (${response.status})${detail ? `: ${detail}` : ''}`);
     return null;
   }
   const data = (await response.json().catch(() => null)) as unknown;
@@ -1322,7 +1762,7 @@ const getAgent = (): AiAgent | null => {
         completeJson: runOpenAiJsonPrompt,
         completeText: runOpenAiTextPrompt,
       });
-      logAiRouter('AUTO provider fell back to OpenAI because Claude/Codex were unavailable.');
+      logAiRouter('AUTO provider fell back to OpenAI because Claude/Codex were unavailable.', 'debug');
     }
   }
 
@@ -1336,17 +1776,17 @@ const getAgent = (): AiAgent | null => {
       if (index === 0) {
         logAiRouter(`JSON route primary=${entry.id}`);
       } else {
-        logAiRouter(`JSON fallback -> ${entry.id}`);
+        logAiRouter(`JSON fallback -> ${entry.id}`, 'debug');
       }
       const response = await entry.completeJson(systemPrompt, userPrompt).catch(() => null);
       if (response !== null) {
         if (index > 0) {
-          logAiRouter(`JSON fallback succeeded with ${entry.id}`);
+          logAiRouter(`JSON fallback succeeded with ${entry.id}`, 'debug');
         }
         return response;
       }
     }
-    logAiRouter('JSON route exhausted all providers.');
+    logAiRouter('JSON route exhausted all providers.', 'debug');
     return null;
   };
 
@@ -1356,13 +1796,13 @@ const getAgent = (): AiAgent | null => {
       if (index === 0) {
         logAiRouter(`Text route primary=${entry.id}`);
       } else {
-        logAiRouter(`Text fallback -> ${entry.id}`);
+        logAiRouter(`Text fallback -> ${entry.id}`, 'debug');
       }
       const response = await entry.completeText(prompt).catch(() => null);
       const trimmed = response?.trim() ?? '';
       if (trimmed.length > 0) {
         if (index > 0) {
-          logAiRouter(`Text fallback succeeded with ${entry.id}`);
+          logAiRouter(`Text fallback succeeded with ${entry.id}`, 'debug');
         }
         return {
           provider: entry.id,
@@ -1370,7 +1810,7 @@ const getAgent = (): AiAgent | null => {
         };
       }
     }
-    logAiRouter('Text route exhausted all providers.');
+    logAiRouter('Text route exhausted all providers.', 'debug');
     return null;
   };
 
@@ -1746,6 +2186,9 @@ export const generateBoardOps = async (
   room: RoomState,
   request: TriggerPatchRequest,
 ): Promise<{ ops: BoardOp[]; fingerprint: string } | null> => {
+  getBoardOpsPromptTemplates();
+  await primeAiPromptSession();
+
   const agent = getAgent();
   if (!agent) {
     return null;
@@ -1761,13 +2204,84 @@ export const generateBoardOps = async (
   const parsed = await agent.completeJson(systemPrompt, userPrompt).catch(() => null);
 
   const envelope = coerceBoardOpsEnvelope(parsed);
-  if (!envelope || envelope.ops.length === 0) {
+  if (envelope && envelope.ops.length > 0) {
+    return {
+      ops: envelope.ops,
+      fingerprint,
+    };
+  }
+
+  const fallbackOps = buildDeterministicBoardOpsFallback(input);
+  if (fallbackOps.length > 0) {
+    logAiRouter(`Board ops fallback -> deterministic_transcript lines=${input.transcriptWindow.length}`, 'debug');
+    return {
+      ops: fallbackOps,
+      fingerprint,
+    };
+  }
+  return null;
+};
+
+export const generatePersonalizedBoardOps = async (
+  room: RoomState,
+  request: TriggerPatchRequest,
+  options: PersonalizedBoardOptions,
+): Promise<{ ops: BoardOp[]; fingerprint: string } | null> => {
+  getBoardOpsPromptTemplates();
+  await primeAiPromptSession();
+
+  const input = collectAiInput(room, request.windowSeconds ?? 30, {
+    reason: request.reason,
+    regenerate: request.regenerate,
+  });
+  const normalizedContextLines = normalizePersonalizationContextLines(options.contextLines);
+  const personalizationSignature = hashString(
+    JSON.stringify({
+      member: normalizeForMatch(options.memberName),
+      context: normalizedContextLines,
+    }),
+  );
+  const fingerprint = `${getAiFingerprint(input)}:${personalizationSignature}:personal_board_ops`;
+  const agent = getAgent();
+  if (!agent) {
+    const fallbackWithoutAgent = buildDeterministicPersonalizedBoardOpsFallback(input, options);
+    if (fallbackWithoutAgent.length > 0) {
+      logAiRouter(
+        `Personalized board fallback -> deterministic_no_agent member=${options.memberName || 'Member'} lines=${input.transcriptWindow.length}`,
+        'debug',
+      );
+      return {
+        ops: fallbackWithoutAgent,
+        fingerprint,
+      };
+    }
     return null;
   }
-  return {
-    ops: envelope.ops,
-    fingerprint,
-  };
+
+  const systemPrompt = buildPersonalizedBoardOpsSystemPrompt(options);
+  const userPrompt = buildPersonalizedBoardOpsUserPrompt(input, options);
+  const parsed = await agent.completeJson(systemPrompt, userPrompt).catch(() => null);
+
+  const envelope = coerceBoardOpsEnvelope(parsed);
+  if (envelope && envelope.ops.length > 0) {
+    return {
+      ops: envelope.ops,
+      fingerprint,
+    };
+  }
+
+  const fallbackOps = buildDeterministicPersonalizedBoardOpsFallback(input, options);
+  if (fallbackOps.length > 0) {
+    logAiRouter(
+      `Personalized board fallback -> deterministic member=${options.memberName || 'Member'} lines=${input.transcriptWindow.length}`,
+      'debug',
+    );
+    return {
+      ops: fallbackOps,
+      fingerprint,
+    };
+  }
+  return null;
 };
 
 export const runAiPreflightCheck = async (): Promise<{
@@ -1826,27 +2340,27 @@ export const generateDiagramPatch = async (
     logAiRouter('Diagram route primary=anthropic');
     providerPatch = await maybeRunAnthropic(input).catch(() => null);
     if (!providerPatch) {
-      logAiRouter('Diagram fallback -> codex_cli');
+      logAiRouter('Diagram fallback -> codex_cli', 'debug');
       providerPatch = await maybeRunCodexCli(input).catch(() => null);
       if (providerPatch) {
-        logAiRouter('Diagram fallback succeeded with codex_cli');
+        logAiRouter('Diagram fallback succeeded with codex_cli', 'debug');
       }
     }
     if (!providerPatch && provider === 'auto') {
-      logAiRouter('Diagram AUTO fallback -> openai');
+      logAiRouter('Diagram AUTO fallback -> openai', 'debug');
       providerPatch = await maybeRunOpenAi(input).catch(() => null);
       if (providerPatch) {
-        logAiRouter('Diagram fallback succeeded with openai');
+        logAiRouter('Diagram fallback succeeded with openai', 'debug');
       }
     }
   } else if (provider === 'openai') {
     logAiRouter('Diagram route primary=openai');
     providerPatch = await maybeRunOpenAi(input).catch(() => null);
     if (!providerPatch) {
-      logAiRouter('Diagram fallback -> codex_cli');
+      logAiRouter('Diagram fallback -> codex_cli', 'debug');
       providerPatch = await maybeRunCodexCli(input).catch(() => null);
       if (providerPatch) {
-        logAiRouter('Diagram fallback succeeded with codex_cli');
+        logAiRouter('Diagram fallback succeeded with codex_cli', 'debug');
       }
     }
   }

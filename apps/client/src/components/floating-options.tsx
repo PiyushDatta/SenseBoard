@@ -33,6 +33,7 @@ interface FloatingOptionsProps {
   onToggleShowAiNotes: () => void;
   onThemeModeChange: (mode: ThemeMode) => void;
   onSendQuickChat: (text: string) => void;
+  onAddQuickPersonalization: (text: string) => void;
   onToggleDebugPanel: () => void;
   onLeaveRoom: () => void;
 }
@@ -65,6 +66,7 @@ export const FloatingOptions = ({
   onToggleShowAiNotes,
   onThemeModeChange,
   onSendQuickChat,
+  onAddQuickPersonalization,
   onToggleDebugPanel,
   onLeaveRoom,
 }: FloatingOptionsProps) => {
@@ -223,6 +225,21 @@ export const FloatingOptions = ({
           />
           <View style={floatingOptionsStyles.row}>
             <OptionButton text="Send to AI" onPress={submitQuickChat} themeStyles={themeStyles} />
+            <OptionButton
+              text="Add to personalization"
+              onPress={() => {
+                const text = chatDraft.trim();
+                if (!text) {
+                  return;
+                }
+                onAddQuickPersonalization(text);
+                setChatDraft('');
+                setTimeout(() => {
+                  chatInputRef.current?.focus();
+                }, 0);
+              }}
+              themeStyles={themeStyles}
+            />
             <OptionButton text="Close" onPress={() => setChatOpen(false)} themeStyles={themeStyles} />
           </View>
         </View>

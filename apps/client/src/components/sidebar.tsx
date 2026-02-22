@@ -34,6 +34,7 @@ interface SidebarProps {
   onChatDraftChange: (value: string) => void;
   onChatKindChange: (value: NoteKind) => void;
   onSendChat: () => void;
+  onAddChatToPersonalization: () => void;
   onContextDraftChange: (value: ContextDraft) => void;
   onAddContext: () => void;
 }
@@ -55,6 +56,7 @@ export const Sidebar = ({
   onChatDraftChange,
   onChatKindChange,
   onSendChat,
+  onAddChatToPersonalization,
   onContextDraftChange,
   onAddContext,
 }: SidebarProps) => {
@@ -118,6 +120,7 @@ export const Sidebar = ({
           onChatDraftChange={onChatDraftChange}
           onChatKindChange={onChatKindChange}
           onSendChat={onSendChat}
+          onAddChatToPersonalization={onAddChatToPersonalization}
         />
       ) : null}
 
@@ -195,6 +198,7 @@ const ChatPanel = ({
   onChatDraftChange,
   onChatKindChange,
   onSendChat,
+  onAddChatToPersonalization,
 }: {
   messages: ChatMessage[];
   chatDraft: string;
@@ -203,6 +207,7 @@ const ChatPanel = ({
   onChatDraftChange: (value: string) => void;
   onChatKindChange: (value: NoteKind) => void;
   onSendChat: () => void;
+  onAddChatToPersonalization: () => void;
 }) => {
   return (
     <View style={sidebarStyles.panel}>
@@ -229,13 +234,40 @@ const ChatPanel = ({
           multiline
         />
         <View style={sidebarStyles.pillRow}>
-          <KindPill label="Normal" value="normal" current={chatKind} onChange={onChatKindChange} themeStyles={themeStyles} />
-          <KindPill label="Correction" value="correction" current={chatKind} onChange={onChatKindChange} themeStyles={themeStyles} />
-          <KindPill label="Suggestion" value="suggestion" current={chatKind} onChange={onChatKindChange} themeStyles={themeStyles} />
+          <KindPill
+            label="Normal"
+            value="normal"
+            current={chatKind}
+            onChange={(value) => onChatKindChange(value as NoteKind)}
+            themeStyles={themeStyles}
+          />
+          <KindPill
+            label="Correction"
+            value="correction"
+            current={chatKind}
+            onChange={(value) => onChatKindChange(value as NoteKind)}
+            themeStyles={themeStyles}
+          />
+          <KindPill
+            label="Suggestion"
+            value="suggestion"
+            current={chatKind}
+            onChange={(value) => onChatKindChange(value as NoteKind)}
+            themeStyles={themeStyles}
+          />
         </View>
-        <Pressable style={[sidebarStyles.primaryButton, themeStyles.primaryButton]} onPress={onSendChat}>
-          <Text style={[sidebarStyles.primaryButtonText, themeStyles.primaryButtonText]}>Send message</Text>
-        </Pressable>
+        <View style={sidebarStyles.actionButtonRow}>
+          <Pressable style={[sidebarStyles.primaryButton, sidebarStyles.flexButton, themeStyles.primaryButton]} onPress={onSendChat}>
+            <Text style={[sidebarStyles.primaryButtonText, themeStyles.primaryButtonText]}>Send to AI</Text>
+          </Pressable>
+          <Pressable
+            style={[sidebarStyles.secondaryActionButton, sidebarStyles.flexButton, themeStyles.secondaryActionButton]}
+            onPress={onAddChatToPersonalization}>
+            <Text style={[sidebarStyles.secondaryActionButtonText, themeStyles.secondaryActionButtonText]}>
+              Add to personalization
+            </Text>
+          </Pressable>
+        </View>
       </View>
     </View>
   );

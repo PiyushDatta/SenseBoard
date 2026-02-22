@@ -94,6 +94,10 @@ describe('runtime-config', () => {
         expect(runtimeConfig.ai.review.confidenceThreshold).toBe(0.98);
         expect(runtimeConfig.logging.level).toBe('debug');
         expect(runtimeConfig.preflight.enabled).toBe(true);
+        expect(runtimeConfig.capture.transcriptionChunks.enabled).toBe(false);
+        expect(runtimeConfig.capture.transcriptionChunks.directory).toBeNull();
+        expect(runtimeConfig.personalization.sqlitePath).toBe('data/senseboard-personalization.sqlite');
+        expect(runtimeConfig.personalization.maxContextLines).toBe(64);
         expect(runtimeConfig.sourcePath).toBeNull();
       },
     );
@@ -125,6 +129,14 @@ level = "warn"
 
 [preflight]
 enabled = false
+
+[capture.transcription_chunks]
+enabled = true
+directory = ".tmp-captured"
+
+[personalization]
+sqlite_path = ".tmp-personalization.sqlite"
+max_context_lines = 22
       `.trim(),
     );
 
@@ -147,6 +159,10 @@ enabled = false
         expect(runtimeConfig.server.portScanSpan).toBe(5);
         expect(runtimeConfig.logging.level).toBe('warn');
         expect(runtimeConfig.preflight.enabled).toBe(false);
+        expect(runtimeConfig.capture.transcriptionChunks.enabled).toBe(true);
+        expect(runtimeConfig.capture.transcriptionChunks.directory).toBe('.tmp-captured');
+        expect(runtimeConfig.personalization.sqlitePath).toBe('.tmp-personalization.sqlite');
+        expect(runtimeConfig.personalization.maxContextLines).toBe(22);
         expect(runtimeConfig.sourcePath?.endsWith('config-a.toml')).toBe(true);
       },
     );
@@ -178,6 +194,14 @@ level = "error"
 
 [preflight]
 enabled = true
+
+[capture.transcription_chunks]
+enabled = true
+directory = ".tmp-from-file"
+
+[personalization]
+sqlite_path = ".tmp-from-file-personal.sqlite"
+max_context_lines = 19
       `.trim(),
     );
 
@@ -211,6 +235,10 @@ enabled = true
         expect(runtimeConfig.ai.review.confidenceThreshold).toBeCloseTo(0.86, 5);
         expect(runtimeConfig.logging.level).toBe('error');
         expect(runtimeConfig.preflight.enabled).toBe(true);
+        expect(runtimeConfig.capture.transcriptionChunks.enabled).toBe(true);
+        expect(runtimeConfig.capture.transcriptionChunks.directory).toBe('.tmp-from-file');
+        expect(runtimeConfig.personalization.sqlitePath).toBe('.tmp-from-file-personal.sqlite');
+        expect(runtimeConfig.personalization.maxContextLines).toBe(19);
       },
     );
   });
@@ -252,6 +280,14 @@ level = "loud"
 
 [preflight]
 enabled = "maybe"
+
+[capture.transcription_chunks]
+enabled = "sometimes"
+directory = 42
+
+[personalization]
+sqlite_path = 7
+max_context_lines = 0
       `.trim(),
     );
 
@@ -273,6 +309,10 @@ enabled = "maybe"
         expect(runtimeConfig.ai.review.confidenceThreshold).toBe(0.98);
         expect(runtimeConfig.logging.level).toBe('debug');
         expect(runtimeConfig.preflight.enabled).toBe(true);
+        expect(runtimeConfig.capture.transcriptionChunks.enabled).toBe(false);
+        expect(runtimeConfig.capture.transcriptionChunks.directory).toBeNull();
+        expect(runtimeConfig.personalization.sqlitePath).toBe('data/senseboard-personalization.sqlite');
+        expect(runtimeConfig.personalization.maxContextLines).toBe(64);
       },
     );
   });

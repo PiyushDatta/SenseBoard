@@ -139,6 +139,57 @@ describe('api client', () => {
     }
   });
 
+  it('requests personalized board and personalization context endpoints', async () => {
+    const api = await loadApiModule();
+    const calls: Array<{ url: string; body?: string }> = [];
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({
+        url: String(input),
+        body: typeof init?.body === 'string' ? init.body : undefined,
+      });
+      return new Response(
+        JSON.stringify({
+          board: {
+            elements: {},
+            order: [],
+            revision: 0,
+            lastUpdatedAt: Date.now(),
+            viewport: { x: 0, y: 0, zoom: 1 },
+          },
+          updatedAt: Date.now(),
+          ok: true,
+          profile: {
+            nameKey: 'alex',
+            displayName: 'Alex',
+            contextLines: ['Prefers bullet points'],
+            updatedAt: Date.now(),
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      await api.getPersonalBoard('room-xyz', 'Alex');
+      expect(calls[0]?.url.endsWith('/rooms/ROOM-XYZ/personal-board?name=Alex')).toBe(true);
+
+      await api.triggerPersonalBoardPatch('room-xyz', 'Alex', { reason: 'manual' });
+      expect(calls[1]?.url.endsWith('/rooms/ROOM-XYZ/personal-board/ai-patch')).toBe(true);
+      expect(calls[1]?.body).toBe(JSON.stringify({ reason: 'manual', name: 'Alex' }));
+
+      const profile = await api.addPersonalizationContext('Alex', 'No diagrams, use bullets');
+      expect(profile.displayName).toBe('Alex');
+      expect(calls[2]?.url.endsWith('/personalization/context')).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('surfaces HTTP status details in thrown errors', async () => {
     const api = await loadApiModule();
     const originalFetch = globalThis.fetch;

@@ -1,4 +1,4 @@
-import type { RoomState, TriggerPatchRequest } from '../../../shared/types';
+import type { BoardState, RoomState, TriggerPatchRequest } from '../../../shared/types';
 import { SERVER_URL, SERVER_URL_CANDIDATES } from './config';
 
 const jsonHeaders = {
@@ -7,6 +7,10 @@ const jsonHeaders = {
 
 const REQUEST_TIMEOUT_MS = 10000;
 const HEALTHCHECK_TIMEOUT_MS = 900;
+interface HealthProbeResult {
+  url: string;
+  startedAt: number;
+}
 
 class HttpStatusError extends Error {
   status: number;
@@ -49,7 +53,7 @@ const executeRequest = async <T>(baseUrl: string, path: string, options: Request
   }
 };
 
-const isServerReachable = async (baseUrl: string): Promise<boolean> => {
+const probeServerHealth = async (baseUrl: string): Promise<HealthProbeResult | null> => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), HEALTHCHECK_TIMEOUT_MS);
   try {
@@ -57,19 +61,39 @@ const isServerReachable = async (baseUrl: string): Promise<boolean> => {
       method: 'GET',
       signal: controller.signal,
     });
-    return response.ok;
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json().catch(() => ({}))) as {
+      instanceStartedAt?: unknown;
+    };
+    const startedAt =
+      typeof payload.instanceStartedAt === 'number' && Number.isFinite(payload.instanceStartedAt)
+        ? payload.instanceStartedAt
+        : 0;
+    return {
+      url: baseUrl,
+      startedAt,
+    };
   } catch {
-    return false;
+    return null;
   } finally {
     clearTimeout(timeout);
   }
 };
 
 const findReachableServerUrl = async (): Promise<string> => {
-  for (const candidate of SERVER_URL_CANDIDATES) {
-    if (await isServerReachable(candidate)) {
-      return candidate;
+  const probes = await Promise.all(SERVER_URL_CANDIDATES.map((candidate) => probeServerHealth(candidate)));
+  const reachable = probes.filter((probe): probe is HealthProbeResult => probe !== null);
+  if (reachable.length > 0) {
+    let best = reachable[0]!;
+    for (let index = 1; index < reachable.length; index += 1) {
+      const candidate = reachable[index]!;
+      if (candidate.startedAt > best.startedAt) {
+        best = candidate;
+      }
     }
+    return best.url;
   }
   return SERVER_URL;
 };
@@ -83,6 +107,9 @@ const resolveServerUrl = async (): Promise<string> => {
     resolvingServerUrl = findReachableServerUrl()
       .then((url) => {
         resolvedServerUrl = url;
+        if (typeof console !== 'undefined' && typeof console.info === 'function') {
+          console.info(`[SenseBoard API] using server ${url}`);
+        }
         return url;
       })
       .finally(() => {
@@ -197,4 +224,67 @@ export const transcribeAudioChunk = async (
     },
     `Transcribe audio for room ${roomId.toUpperCase()}`,
   );
+};
+
+export interface PersonalBoardResponse {
+  board: BoardState;
+  updatedAt: number;
+}
+
+export const getPersonalBoard = async (roomId: string, memberName: string): Promise<PersonalBoardResponse> => {
+  return requestJson<PersonalBoardResponse>(
+    `/rooms/${encodeURIComponent(roomId.toUpperCase())}/personal-board?name=${encodeURIComponent(memberName.trim())}`,
+    {
+      method: 'GET',
+    },
+    `Get personal board for ${memberName.trim() || 'member'} in room ${roomId.toUpperCase()}`,
+  );
+};
+
+export const triggerPersonalBoardPatch = async (
+  roomId: string,
+  memberName: string,
+  request: TriggerPatchRequest,
+) => {
+  return requestJson<{
+    applied: boolean;
+    reason?: string;
+  }>(
+    `/rooms/${encodeURIComponent(roomId.toUpperCase())}/personal-board/ai-patch`,
+    {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        ...request,
+        name: memberName.trim(),
+      }),
+    },
+    `Trigger personal AI patch for ${memberName.trim() || 'member'} in room ${roomId.toUpperCase()}`,
+  );
+};
+
+export interface PersonalizationProfile {
+  nameKey: string;
+  displayName: string;
+  contextLines: string[];
+  updatedAt: number;
+}
+
+export const addPersonalizationContext = async (memberName: string, text: string): Promise<PersonalizationProfile> => {
+  const payload = await requestJson<{
+    ok: boolean;
+    profile: PersonalizationProfile;
+  }>(
+    '/personalization/context',
+    {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        name: memberName.trim(),
+        text: text.trim(),
+      }),
+    },
+    `Add personalization context for ${memberName.trim() || 'member'}`,
+  );
+  return payload.profile;
 };

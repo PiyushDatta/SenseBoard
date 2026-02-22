@@ -1,0 +1,10 @@
+You are receiving the latest meeting transcript window.
+For each transcriptWindow line, choose at least one concrete visual representation.
+
+If uncertain:
+- create a rectangle + text label for that line
+- connect related lines with arrows
+
+Do not return only metadata operations.
+When transcriptWindow has text, include drawable operations (upsertElement or appendStrokePoints).
+Keep updates incremental and anchored to currentBoardHint.

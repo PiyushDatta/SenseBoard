@@ -28,6 +28,16 @@ interface ServerRuntimeConfig {
   preflight: {
     enabled: boolean;
   };
+  capture: {
+    transcriptionChunks: {
+      enabled: boolean;
+      directory: string | null;
+    };
+  };
+  personalization: {
+    sqlitePath: string;
+    maxContextLines: number;
+  };
   sourcePath: string | null;
 }
 
@@ -51,6 +61,13 @@ interface ParsedTomlConfig {
   };
   preflight: {
     enabled?: unknown;
+  };
+  capture: {
+    transcription_chunks?: unknown;
+  };
+  personalization: {
+    sqlite_path?: unknown;
+    max_context_lines?: unknown;
   };
 }
 
@@ -77,6 +94,16 @@ const DEFAULT_CONFIG: Omit<ServerRuntimeConfig, 'sourcePath'> = {
   },
   preflight: {
     enabled: true,
+  },
+  capture: {
+    transcriptionChunks: {
+      enabled: false,
+      directory: null,
+    },
+  },
+  personalization: {
+    sqlitePath: 'data/senseboard-personalization.sqlite',
+    maxContextLines: 64,
   },
 };
 
@@ -170,7 +197,10 @@ const readTomlConfig = (): { config: ParsedTomlConfig; sourcePath: string | null
   const sourcePath = explicitPath ? resolve(explicitPath) : resolve(process.cwd(), 'senseboard.config.toml');
 
   if (!existsSync(sourcePath)) {
-    parsedTomlCache = { config: { ai: {}, server: {}, logging: {}, preflight: {} }, sourcePath: null };
+    parsedTomlCache = {
+      config: { ai: {}, server: {}, logging: {}, preflight: {}, capture: {}, personalization: {} },
+      sourcePath: null,
+    };
     return parsedTomlCache;
   }
 
@@ -184,13 +214,18 @@ const readTomlConfig = (): { config: ParsedTomlConfig; sourcePath: string | null
         server: toRecord(root.server),
         logging: toRecord(root.logging),
         preflight: toRecord(root.preflight),
+        capture: toRecord(root.capture),
+        personalization: toRecord(root.personalization),
       },
       sourcePath,
     };
     return parsedTomlCache;
   } catch (error) {
     console.warn(`Failed to parse ${sourcePath}: ${error instanceof Error ? error.message : String(error)}`);
-    parsedTomlCache = { config: { ai: {}, server: {}, logging: {}, preflight: {} }, sourcePath };
+    parsedTomlCache = {
+      config: { ai: {}, server: {}, logging: {}, preflight: {}, capture: {}, personalization: {} },
+      sourcePath,
+    };
     return parsedTomlCache;
   }
 };
@@ -256,6 +291,15 @@ export const getRuntimeConfig = (): ServerRuntimeConfig => {
 
   const logLevel = toLogLevelOrUndefined(config.logging.level) ?? DEFAULT_CONFIG.logging.level;
   const preflightEnabled = toBooleanOrUndefined(config.preflight.enabled) ?? DEFAULT_CONFIG.preflight.enabled;
+  const chunkCaptureConfig = toRecord(config.capture.transcription_chunks);
+  const transcriptionChunkCaptureEnabled =
+    toBooleanOrUndefined(chunkCaptureConfig.enabled) ?? DEFAULT_CONFIG.capture.transcriptionChunks.enabled;
+  const transcriptionChunkCaptureDirectory =
+    toStringOrUndefined(chunkCaptureConfig.directory) ?? DEFAULT_CONFIG.capture.transcriptionChunks.directory;
+  const personalizationSqlitePath =
+    toStringOrUndefined(config.personalization.sqlite_path) ?? DEFAULT_CONFIG.personalization.sqlitePath;
+  const personalizationMaxContextLines =
+    toPositiveIntOrUndefined(config.personalization.max_context_lines) ?? DEFAULT_CONFIG.personalization.maxContextLines;
 
   return {
     ai: {
@@ -280,6 +324,16 @@ export const getRuntimeConfig = (): ServerRuntimeConfig => {
     },
     preflight: {
       enabled: preflightEnabled,
+    },
+    capture: {
+      transcriptionChunks: {
+        enabled: transcriptionChunkCaptureEnabled,
+        directory: transcriptionChunkCaptureDirectory,
+      },
+    },
+    personalization: {
+      sqlitePath: personalizationSqlitePath,
+      maxContextLines: personalizationMaxContextLines,
     },
     sourcePath,
   };

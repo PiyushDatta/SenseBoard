@@ -21,9 +21,12 @@ export const useRoomSocket = ({
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const endpointIndexRef = useRef(0);
+  const handshakeAckedRef = useRef(false);
+  const pendingMessagesRef = useRef<ClientMessage[]>([]);
   const snapshotHandlerRef = useRef(onSnapshot);
   const errorHandlerRef = useRef(onError);
   const [connected, setConnected] = useState(false);
+  const MAX_PENDING_MESSAGES = 200;
 
   useEffect(() => {
     snapshotHandlerRef.current = onSnapshot;
@@ -34,18 +37,35 @@ export const useRoomSocket = ({
   }, [onError]);
 
   const endpointCandidates = useMemo(() => {
-    if (!roomId) {
+    const normalizedName = displayName.trim();
+    if (!roomId || !normalizedName) {
       return [] as string[];
     }
     const params = new URLSearchParams({
       roomId: roomId.toUpperCase(),
-      name: displayName || 'Guest',
+      name: normalizedName,
     });
     return WS_URL_CANDIDATES.map((baseUrl) => `${baseUrl}/ws?${params.toString()}`);
   }, [roomId, displayName]);
 
+  const flushPendingMessages = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !handshakeAckedRef.current) {
+      return;
+    }
+    while (pendingMessagesRef.current.length > 0) {
+      const next = pendingMessagesRef.current.shift();
+      if (!next) {
+        continue;
+      }
+      ws.send(JSON.stringify(next));
+    }
+  }, []);
+
   useEffect(() => {
     endpointIndexRef.current = 0;
+    handshakeAckedRef.current = false;
+    pendingMessagesRef.current = [];
   }, [roomId, displayName]);
 
   useEffect(() => {
@@ -76,12 +96,27 @@ export const useRoomSocket = ({
         opened = true;
         failedAttempts = 0;
         clearTimeout(connectWatchdog);
-        setConnected(true);
+        setConnected(false);
+        handshakeAckedRef.current = false;
+        const ack: ClientMessage = {
+          type: 'client:ack',
+          payload: {
+            protocol: 'senseboard-ws-v1',
+            sentAt: Date.now(),
+          },
+        };
+        ws.send(JSON.stringify(ack));
       };
 
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(String(event.data)) as ServerMessage;
+          if (message.type === 'server:ack') {
+            handshakeAckedRef.current = true;
+            setConnected(true);
+            flushPendingMessages();
+            return;
+          }
           if (message.type === 'room:snapshot') {
             snapshotHandlerRef.current(message.payload);
             return;
@@ -101,6 +136,7 @@ export const useRoomSocket = ({
       ws.onclose = () => {
         clearTimeout(connectWatchdog);
         setConnected(false);
+        handshakeAckedRef.current = false;
         if (!disposed) {
           if (!opened) {
             failedAttempts += 1;
@@ -119,22 +155,31 @@ export const useRoomSocket = ({
     return () => {
       disposed = true;
       setConnected(false);
+      handshakeAckedRef.current = false;
+      pendingMessagesRef.current = [];
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current);
       }
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [enabled, endpointCandidates]);
+  }, [enabled, endpointCandidates, flushPendingMessages]);
 
   const send = useCallback((message: ClientMessage) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return false;
     }
+    if (!handshakeAckedRef.current) {
+      while (pendingMessagesRef.current.length >= MAX_PENDING_MESSAGES) {
+        pendingMessagesRef.current.shift();
+      }
+      pendingMessagesRef.current.push(message);
+      return true;
+    }
     ws.send(JSON.stringify(message));
     return true;
-  }, []);
+  }, [MAX_PENDING_MESSAGES]);
 
   return {
     connected,

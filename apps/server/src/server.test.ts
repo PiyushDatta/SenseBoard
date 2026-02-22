@@ -1,13 +1,47 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 type ServerModule = typeof import('./server');
 
 interface AiMockOverrides {
   generateBoardOps?: () => Promise<{ ops: unknown[]; fingerprint: string }>;
+  generateDiagramPatch?: () => Promise<{
+    patch: {
+      topic: string;
+      diagramType: 'flowchart' | 'system_blocks' | 'tree';
+      confidence: number;
+      actions: Array<
+        | {
+            op: 'upsertNode';
+            id: string;
+            label: string;
+            x: number;
+            y: number;
+          }
+        | {
+            op: 'setTitle';
+            text: string;
+          }
+      >;
+      openQuestions: string[];
+      conflicts: Array<{ type: 'topic' | 'context' | 'correction'; detail: string }>;
+    };
+    fingerprint: string;
+  }>;
   hasAiSignal?: () => boolean;
   runAiPreflightCheck?: () => Promise<{ ok: boolean }>;
   transcribeAudioBlob?: () => Promise<{ ok: boolean; text: string; error?: string }>;
+  logLevel?: 'debug' | 'info' | 'warn' | 'error' | 'silent';
+  preflightEnabled?: boolean;
+  captureConfig?: {
+    enabled: boolean;
+    directory: string | null;
+  };
 }
+
+const tempDirs = new Set<string>();
 
 const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<ServerModule> => {
   mock.restore();
@@ -31,11 +65,51 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
         port: 8787,
         portScanSpan: 8,
       },
+      logging: {
+        level: overrides.logLevel ?? 'debug',
+      },
+      preflight: {
+        enabled: overrides.preflightEnabled ?? true,
+      },
+      capture: {
+        transcriptionChunks: {
+          enabled: overrides.captureConfig?.enabled ?? false,
+          directory: overrides.captureConfig?.directory ?? null,
+        },
+      },
       sourcePath: null,
     }),
   }));
 
   mock.module('./ai-engine', () => ({
+    collectAiInput: () => ({
+      transcriptWindow: [],
+    }),
+    generateDiagramPatch:
+      overrides.generateDiagramPatch ??
+      (async () => ({
+        patch: {
+          topic: 'Mock Diagram',
+          diagramType: 'flowchart',
+          confidence: 0.7,
+          actions: [
+            {
+              op: 'upsertNode',
+              id: 'N1',
+              label: 'Mock Node',
+              x: 120,
+              y: 120,
+            },
+            {
+              op: 'setTitle',
+              text: 'Mock Diagram',
+            },
+          ],
+          openQuestions: [],
+          conflicts: [],
+        },
+        fingerprint: 'fp-mock-diagram',
+      })),
     generateBoardOps:
       overrides.generateBoardOps ??
       (async () => ({
@@ -56,9 +130,44 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
         ],
         fingerprint: 'fp-default',
       })),
+    generatePersonalizedBoardOps: async () => ({
+      ops: [
+        {
+          type: 'upsertElement',
+          element: {
+            id: 'personal-shape',
+            kind: 'text',
+            x: 10,
+            y: 10,
+            text: '- personalized',
+            createdAt: Date.now(),
+            createdBy: 'ai',
+          },
+        },
+      ],
+      fingerprint: 'fp-personal-default',
+    }),
     getAiProviderLabel: () => 'mock-provider',
     hasAiSignal: overrides.hasAiSignal ?? (() => true),
+    primeAiPromptSession: async () => undefined,
     runAiPreflightCheck: overrides.runAiPreflightCheck ?? (async () => ({ ok: true })),
+  }));
+
+  mock.module('./personalization-store', () => ({
+    getPersonalizationStorePath: () => '.tmp/test-personalization.sqlite',
+    getPersonalizationProfile: (name: string) => ({
+      nameKey: name.trim().toLowerCase(),
+      displayName: name.trim() || 'Guest',
+      contextLines: [],
+      updatedAt: Date.now(),
+    }),
+    appendPersonalizationContext: (name: string, text: string) => ({
+      nameKey: name.trim().toLowerCase(),
+      displayName: name.trim() || 'Guest',
+      contextLines: [text.trim()],
+      updatedAt: Date.now(),
+    }),
+    getPersonalizationPromptLines: () => [],
   }));
 
   mock.module('./transcription', () => ({
@@ -76,6 +185,12 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
 
 afterEach(() => {
   mock.restore();
+  for (const dirPath of tempDirs) {
+    if (existsSync(dirPath)) {
+      rmSync(dirPath, { recursive: true, force: true });
+    }
+  }
+  tempDirs.clear();
 });
 
 describe('server fetchHandler', () => {
@@ -118,6 +233,39 @@ describe('server fetchHandler', () => {
     expect(roomPayload?.room?.id).toBe(created?.roomId);
   });
 
+  it('manages personalization context and personal board endpoints', async () => {
+    const server = await loadServerModule();
+
+    const addResponse = await server.fetchHandler(
+      new Request('http://localhost/personalization/context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Alex', text: 'Prefers concise bullet points.' }),
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+    expect(addResponse?.status).toBe(200);
+
+    const getResponse = await server.fetchHandler(new Request('http://localhost/personalization/context?name=Alex', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(getResponse?.status).toBe(200);
+    const profilePayload = await getResponse?.json();
+    expect(profilePayload?.profile?.displayName).toBe('Alex');
+
+    const personalBoardResponse = await server.fetchHandler(
+      new Request('http://localhost/rooms/ROOM-PERSONAL/personal-board?name=Alex', { method: 'GET' }),
+      {
+        upgrade: () => false,
+      },
+    );
+    expect(personalBoardResponse?.status).toBe(200);
+    const boardPayload = await personalBoardResponse?.json();
+    expect(boardPayload?.board).toBeDefined();
+  });
+
   it('runs AI preflight and maps non-ok to 503', async () => {
     const healthyServer = await loadServerModule({
       runAiPreflightCheck: async () => ({ ok: true }),
@@ -151,6 +299,11 @@ describe('server fetchHandler', () => {
       upgrade: () => false,
     });
     expect(failedUpgrade?.status).toBe(500);
+
+    const missingName = await server.fetchHandler(new Request('http://localhost/ws?roomId=roomx', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(missingName?.status).toBe(400);
 
     const upgraded = await server.fetchHandler(new Request('http://localhost/ws?roomId=roomx&name=Alex', { method: 'GET' }), {
       upgrade: (_request: Request, options: unknown) => {
@@ -237,6 +390,73 @@ describe('server fetchHandler', () => {
     });
   });
 
+  it('falls back to diagram patch when board ops are non-visual only', async () => {
+    const server = await loadServerModule({
+      generateBoardOps: async () => ({
+        ops: [{ type: 'clearBoard' }],
+        fingerprint: 'fp-clear-only',
+      }),
+      generateDiagramPatch: async () => ({
+        patch: {
+          topic: 'Tree discussion',
+          diagramType: 'tree',
+          confidence: 0.92,
+          actions: [
+            {
+              op: 'upsertNode',
+              id: 'A',
+              label: 'A',
+              x: 120,
+              y: 120,
+            },
+            {
+              op: 'setTitle',
+              text: 'Tree discussion',
+            },
+          ],
+          openQuestions: [],
+          conflicts: [],
+        },
+        fingerprint: 'fp-diagram-fallback',
+      }),
+    });
+
+    const response = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-ai-fallback/ai-patch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: 'manual' }),
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(response?.status).toBe(200);
+    const payload = await response?.json();
+    expect(payload).toMatchObject({
+      applied: true,
+      patch: {
+        kind: 'diagram_patch',
+      },
+    });
+
+    const roomResponse = await server.fetchHandler(new Request('http://localhost/rooms/ROOM-AI-FALLBACK', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(roomResponse?.status).toBe(200);
+    const roomPayload = (await roomResponse?.json()) as {
+      room: {
+        board: {
+          order: string[];
+        };
+      };
+    };
+    expect(roomPayload.room.board.order.length).toBeGreaterThan(0);
+  });
+
   it('accepts multipart audio transcription and appends transcript to room state', async () => {
     const server = await loadServerModule({
       transcribeAudioBlob: async () => ({
@@ -247,7 +467,7 @@ describe('server fetchHandler', () => {
 
     const form = new FormData();
     form.append('speaker', 'Host');
-    form.append('audio', new File(['fake-audio'], 'chunk.webm', { type: 'audio/webm' }));
+    form.append('audio', new File([new Uint8Array(2048).fill(7)], 'chunk.webm', { type: 'audio/webm' }));
 
     const transcribeResponse = await server.fetchHandler(
       new Request('http://localhost/rooms/room-audio-1/transcribe', {
@@ -286,6 +506,43 @@ describe('server fetchHandler', () => {
     server.__resetAiQueueForTests();
   });
 
+  it('captures raw audio chunks when capture is enabled', async () => {
+    const captureDir = mkdtempSync(join(tmpdir(), 'senseboard-chunk-capture-test-'));
+    tempDirs.add(captureDir);
+
+    const server = await loadServerModule({
+      captureConfig: {
+        enabled: true,
+        directory: captureDir,
+      },
+      transcribeAudioBlob: async () => ({
+        ok: true,
+        text: 'captured transcript',
+      }),
+    });
+
+    const form = new FormData();
+    form.append('speaker', 'Host');
+    form.append('audio', new File([new Uint8Array(2048).fill(9)], 'chunk.webm', { type: 'audio/webm' }));
+
+    const transcribeResponse = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-audio-capture/transcribe', {
+        method: 'POST',
+        body: form,
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(transcribeResponse?.status).toBe(200);
+    const files = readdirSync(captureDir);
+    expect(files.length).toBe(1);
+    expect(files[0]?.endsWith('.webm')).toBe(true);
+
+    server.__resetAiQueueForTests();
+  });
+
   it('returns 400 on transcribe endpoint when audio file is missing', async () => {
     const server = await loadServerModule();
     const form = new FormData();
@@ -307,6 +564,74 @@ describe('server fetchHandler', () => {
       ok: false,
       error: 'audio file is required',
     });
+  });
+
+  it('skips transcription when audio chunk is too small', async () => {
+    const server = await loadServerModule();
+    const form = new FormData();
+    form.append('speaker', 'Host');
+    form.append('audio', new File(['x'], 'tiny.webm', { type: 'audio/webm' }));
+
+    const response = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-audio-small/transcribe', {
+        method: 'POST',
+        body: form,
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(response?.status).toBe(200);
+    const payload = await response?.json();
+    expect(payload).toEqual({
+      ok: true,
+      text: '',
+      accepted: false,
+      reason: 'audio_too_small',
+    });
+  });
+
+  it('skips AI enqueue when transcription returns empty text', async () => {
+    const server = await loadServerModule({
+      transcribeAudioBlob: async () => ({
+        ok: true,
+        text: '   ',
+      }),
+    });
+    const form = new FormData();
+    form.append('speaker', 'Host');
+    form.append('audio', new File([new Uint8Array(2048).fill(3)], 'empty.webm', { type: 'audio/webm' }));
+
+    const response = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-audio-empty/transcribe', {
+        method: 'POST',
+        body: form,
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(response?.status).toBe(200);
+    const payload = await response?.json();
+    expect(payload).toEqual({
+      ok: true,
+      text: '',
+      accepted: false,
+      reason: 'empty_transcript',
+    });
+
+    const roomResponse = await server.fetchHandler(new Request('http://localhost/rooms/ROOM-AUDIO-EMPTY', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(roomResponse?.status).toBe(200);
+    const roomPayload = (await roomResponse?.json()) as {
+      room: {
+        transcriptChunks: Array<{ text: string }>;
+      };
+    };
+    expect(roomPayload.room.transcriptChunks.length).toBe(0);
   });
 
   it('returns 404 for unknown routes', async () => {
@@ -335,6 +660,19 @@ describe('server websocketHandler', () => {
     };
 
     server.websocketHandler.open(ws);
+    sent.length = 0;
+    server.websocketHandler.message(
+      ws,
+      JSON.stringify({
+        type: 'client:ack',
+        payload: {
+          protocol: 'senseboard-ws-v1',
+          sentAt: Date.now(),
+        },
+      }),
+    );
+    const ackPayload = JSON.parse(sent.at(-1) ?? '{}') as { type: string };
+    expect(ackPayload.type).toBe('server:ack');
     sent.length = 0;
 
     server.websocketHandler.message(
@@ -419,6 +757,17 @@ describe('server websocketHandler', () => {
     };
 
     server.websocketHandler.open(ws);
+    sent.length = 0;
+    server.websocketHandler.message(
+      ws,
+      JSON.stringify({
+        type: 'client:ack',
+        payload: {
+          protocol: 'senseboard-ws-v1',
+          sentAt: Date.now(),
+        },
+      }),
+    );
     sent.length = 0;
 
     server.websocketHandler.message(

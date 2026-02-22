@@ -11,6 +11,18 @@ level = "debug"
 # Run AI + transcription preflight before `bun run start:web`.
 enabled = false
 
+[capture.transcription_chunks]
+# Save raw mic chunks received by /rooms/:id/transcribe for debugging/integration fixtures.
+enabled = false
+# Save recordings inside repo so integration tests can replay them.
+directory = "test_recording_data"
+
+[personalization]
+# SQLite store for per-name personalization context used by personal board generation.
+sqlite_path = "data/senseboard-personalization.sqlite"
+# Keep the latest N context lines for each name.
+max_context_lines = 64
+
 [ai]
 # Active provider: auto | openai | anthropic | codex_cli | deterministic
 provider = "auto"

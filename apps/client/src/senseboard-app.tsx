@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Platform, Pressable, Text, View } from 'react-native';
 
-import type { NoteKind, RoomState } from '../../shared/types';
+import type { BoardState, NoteKind, RoomState } from '../../shared/types';
 import { CanvasSurface } from './components/canvas-surface';
 import { DebugPanel } from './components/debug-panel';
 import { FloatingOptions } from './components/floating-options';
@@ -11,7 +11,15 @@ import { Sidebar, type SidebarTab } from './components/sidebar';
 import { useRoomSocket } from './hooks/use-room-socket';
 import { useSpeechTranscript } from './hooks/use-speech-transcript';
 import { useThemeMode } from './hooks/use-theme-mode';
-import { createRoom, getRoom, transcribeAudioChunk, triggerAiPatch } from './lib/api';
+import {
+  addPersonalizationContext,
+  createRoom,
+  getPersonalBoard,
+  getRoom,
+  transcribeAudioChunk,
+  triggerAiPatch,
+  triggerPersonalBoardPatch,
+} from './lib/api';
 import { createEmptyRoomFallback, createInitialContextDraft, type ContextDraft } from './lib/room-ui-state';
 import { createSenseBoardAppThemeStyles, senseboardAppStyles } from './styles/senseboard-app.styles';
 
@@ -32,6 +40,8 @@ export const SenseBoardApp = () => {
   const [panelsOpen, setPanelsOpen] = useState(false);
   const [showOptions, setShowOptions] = useState(false);
   const [showAiNotes, setShowAiNotes] = useState(true);
+  const [boardMode, setBoardMode] = useState<'main' | 'personal'>('main');
+  const [personalBoard, setPersonalBoard] = useState<BoardState | null>(null);
 
   const { themeMode, setThemeMode, resolvedTheme, theme } = useThemeMode();
   const appThemeStyles = createSenseBoardAppThemeStyles(theme);
@@ -43,6 +53,14 @@ export const SenseBoardApp = () => {
   const handleSocketError = useCallback((message: string) => {
     setError(message);
   }, []);
+
+  const loadPersonalBoard = useCallback(async () => {
+    if (!roomId || !displayName.trim()) {
+      return;
+    }
+    const payload = await getPersonalBoard(roomId, displayName);
+    setPersonalBoard(payload.board);
+  }, [displayName, roomId]);
 
   const joinRoomById = useCallback(
     async (nextRoomId: string) => {
@@ -133,6 +151,9 @@ export const SenseBoardApp = () => {
       if (!response.ok) {
         throw new Error(response.error || 'Transcription failed.');
       }
+      if (response.accepted === false && response.reason === 'empty_transcript') {
+        throw new Error('No speech detected in the latest mic chunk.');
+      }
     },
     [displayName, roomId],
   );
@@ -156,11 +177,20 @@ export const SenseBoardApp = () => {
       }
       try {
         await triggerAiPatch(roomId, { reason, regenerate });
+        void triggerPersonalBoardPatch(roomId, displayName, {
+          reason,
+          regenerate,
+          windowSeconds: 30,
+        }).then(() => {
+          if (boardMode === 'personal') {
+            void loadPersonalBoard();
+          }
+        });
       } catch (patchError) {
         setError(patchError instanceof Error ? patchError.message : 'Failed to run AI patch.');
       }
     },
-    [roomId],
+    [boardMode, displayName, loadPersonalBoard, roomId],
   );
 
   useEffect(() => {
@@ -172,6 +202,22 @@ export const SenseBoardApp = () => {
     }, 5000);
     return () => clearInterval(timer);
   }, [roomId, currentRoom?.aiConfig.frozen, runAiPatch]);
+
+  useEffect(() => {
+    if (!roomId || boardMode !== 'personal' || !displayName.trim()) {
+      return;
+    }
+    void triggerPersonalBoardPatch(roomId, displayName, {
+      reason: 'manual',
+      regenerate: false,
+      windowSeconds: 30,
+    }).catch(() => undefined);
+    void loadPersonalBoard().catch(() => undefined);
+    const timer = setInterval(() => {
+      void loadPersonalBoard().catch(() => undefined);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [boardMode, displayName, loadPersonalBoard, roomId]);
 
   const onSendManualTranscript = useCallback(() => {
     if (!transcriptDraft.trim()) {
@@ -201,6 +247,45 @@ export const SenseBoardApp = () => {
       }, 120);
     }
   }, [chatDraft, chatKind, runAiPatch, send]);
+
+  const onAddPersonalizationText = useCallback(
+    async (text: string) => {
+      const normalized = text.trim();
+      if (!normalized) {
+        return;
+      }
+      if (!displayName.trim()) {
+        setError('Display name is required.');
+        return;
+      }
+      try {
+        await addPersonalizationContext(displayName, normalized);
+        if (roomId) {
+          void triggerPersonalBoardPatch(roomId, displayName, {
+            reason: 'manual',
+            regenerate: false,
+            windowSeconds: 30,
+          }).then(() => {
+            if (boardMode === 'personal') {
+              void loadPersonalBoard();
+            }
+          });
+        }
+      } catch (updateError) {
+        setError(updateError instanceof Error ? updateError.message : 'Unable to update personalization.');
+      }
+    },
+    [boardMode, displayName, loadPersonalBoard, roomId],
+  );
+
+  const onAddChatToPersonalization = useCallback(() => {
+    const text = chatDraft.trim();
+    if (!text) {
+      return;
+    }
+    void onAddPersonalizationText(text);
+    setChatDraft('');
+  }, [chatDraft, onAddPersonalizationText]);
 
   const onAddContext = useCallback(() => {
     if (!contextDraft.title.trim() && !contextDraft.content.trim()) {
@@ -291,6 +376,8 @@ export const SenseBoardApp = () => {
     setDebugPanelOpen(false);
     setPanelsOpen(false);
     setShowOptions(false);
+    setBoardMode('main');
+    setPersonalBoard(null);
   }, [speech]);
 
   const totalConnectedMembers = currentRoom?.members.length ?? 0;
@@ -324,12 +411,15 @@ export const SenseBoardApp = () => {
     );
   }
 
+  const roomForCanvas =
+    boardMode === 'personal' ? { ...currentRoom, board: personalBoard ?? currentRoom.board } : currentRoom;
+
   return (
     <View style={[senseboardAppStyles.page, appThemeStyles.page]}>
       <View style={senseboardAppStyles.main}>
         {Platform.OS === 'web' ? (
           <CanvasSurface
-            room={currentRoom}
+            room={roomForCanvas}
             focusDrawMode={focusDrawMode}
             onFocusBoxSelected={onSetFocusBox}
             onFocusDrawModeChange={setFocusDrawMode}
@@ -362,6 +452,7 @@ export const SenseBoardApp = () => {
               onChatDraftChange={setChatDraft}
               onChatKindChange={setChatKind}
               onSendChat={onSendChat}
+              onAddChatToPersonalization={onAddChatToPersonalization}
               onContextDraftChange={setContextDraft}
               onAddContext={onAddContext}
             />
@@ -375,7 +466,9 @@ export const SenseBoardApp = () => {
         totalConnectedMembers={totalConnectedMembers}
         connected={connected}
         aiStatus={currentRoom.aiConfig.status}
+        boardMode={boardMode}
         theme={theme}
+        onBoardModeChange={setBoardMode}
       />
 
       <FloatingOptions
@@ -424,6 +517,9 @@ export const SenseBoardApp = () => {
           setTimeout(() => {
             void runAiPatch('correction');
           }, 120);
+        }}
+        onAddQuickPersonalization={(text) => {
+          void onAddPersonalizationText(text);
         }}
         onToggleDebugPanel={() => setDebugPanelOpen((value) => !value)}
         onLeaveRoom={leaveRoom}

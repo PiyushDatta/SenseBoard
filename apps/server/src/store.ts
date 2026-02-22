@@ -8,6 +8,8 @@ interface SocketWithData {
     roomId: string;
     memberId: string;
     memberName: string;
+    handshakeAcked?: boolean;
+    handshakeAckedAt?: number;
   };
 }
 
@@ -98,6 +100,8 @@ export const createSocketData = (roomId: string, memberName: string) => {
     roomId: roomId.trim().toUpperCase(),
     memberId: newId(),
     memberName: memberName.trim() || 'Guest',
+    handshakeAcked: false,
+    handshakeAckedAt: 0,
   };
 };
 

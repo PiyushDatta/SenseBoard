@@ -272,6 +272,13 @@ export interface DiagramPatch {
 
 export type ClientMessage =
   | {
+      type: 'client:ack';
+      payload: {
+        protocol: 'senseboard-ws-v1';
+        sentAt: number;
+      };
+    }
+  | {
       type: 'chat:add';
       payload: {
         text: string;
@@ -340,6 +347,15 @@ export type ClientMessage =
     };
 
 export type ServerMessage =
+  | {
+      type: 'server:ack';
+      payload: {
+        protocol: 'senseboard-ws-v1';
+        roomId: string;
+        memberId: string;
+        receivedAt: number;
+      };
+    }
   | {
       type: 'room:snapshot';
       payload: RoomState;
