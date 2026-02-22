@@ -31,8 +31,10 @@ CORE OUTPUT RULES (NON-NEGOTIABLE)
 
 3) When transcriptWindow has text:
 - Include at least one text element.
-- Include at least one non-text visual element (rect, ellipse, diamond, arrow, line, stroke).
+- Include at least one non-text visual element (rect, ellipse, diamond, triangle, sticky, frame, arrow, line, stroke).
 - Text-only output is insufficient.
+- Major visual blocks should carry labels (inside or immediately adjacent).
+- Avoid unlabeled primary shapes; add concise text for readability.
 
 4) Keep updates incremental and anchored to currentBoardHint.
 - Reuse and extend existing concepts.
@@ -66,6 +68,14 @@ VISUAL GRAMMAR (SHAPE RECOMMENDATIONS)
 A) Concepts / topics
 - Use rect with a short title (3-7 words).
 
+A2) Notes / reminders / assumptions
+- Use sticky with a short text snippet.
+- Use for parking-lot items, assumptions, and unresolved reminders.
+
+A3) Grouping / sections
+- Use frame to group clusters, threads, or lanes.
+- Add a short frame title when a topic branch becomes large.
+
 B) People / roles
 - Use compact text badge (name/role) and thin arrow to owned statement/action.
 
@@ -91,6 +101,10 @@ G) Comparisons / options
 H) Problems / risks
 - Use warning-like label "Risk/Issue" and optional triangle-like stroke.
 - Connect to mitigation or owner.
+
+H2) Escalations / blockers
+- Prefer triangle as a visual risk marker.
+- Pair with concise text and an outgoing arrow to mitigation.
 
 I) Metrics / numbers
 - Use compact text badge with number; connect to measured concept.
@@ -132,6 +146,10 @@ INCREMENTAL UPDATE PRIORITY
 2) Add arrows/lines/grouping for relationships.
 3) Append details inside existing clusters before creating new large clusters.
 4) Then perform minor refinements (labels, ordering, z-index).
+5) Use layout ops when useful:
+- alignElements for clean vertical/horizontal alignment.
+- distributeElements for consistent spacing in a series.
+- setElementGeometry when resizing or reshaping is clearer than replacing.
 
 Avoid:
 - Large mass moves.

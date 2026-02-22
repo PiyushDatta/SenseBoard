@@ -111,6 +111,20 @@ export type TldrawDraftShape =
   | TldrawDraftLineShape
   | TldrawDraftArrowShape;
 
+interface TextContainerBounds {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const SIZE_TO_APPROX_FONT_PX: Record<TldrawSizeStyle, number> = {
+  s: 14,
+  m: 18,
+  l: 24,
+  xl: 32,
+};
+
 const TL_COLOR_PALETTE: Array<{ name: TldrawColorName; rgb: [number, number, number] }> = [
   { name: 'black', rgb: [30, 40, 48] },
   { name: 'grey', rgb: [129, 141, 152] },
@@ -240,23 +254,170 @@ const toSizeFromStrokeWidth = (strokeWidth: number | undefined): TldrawSizeStyle
 
 const toSizeFromFont = (fontSize: number | undefined): TldrawSizeStyle => {
   if (typeof fontSize !== 'number' || !Number.isFinite(fontSize)) {
-    return 'm';
-  }
-  if (fontSize < 16) {
     return 's';
   }
-  if (fontSize <= 22) {
-    return 'm';
+  if (fontSize <= 18) {
+    return 's';
   }
   if (fontSize <= 30) {
-    return 'l';
+    return 'm';
   }
-  return 'xl';
+  return 'l';
 };
 
 const toTextWidth = (text: string): number => {
   const characters = Math.max(10, text.trim().length);
-  return Math.max(140, Math.min(620, Math.round(characters * 8.2)));
+  return Math.max(120, Math.min(420, Math.round(characters * 7.8)));
+};
+
+const normalizeTextForLayout = (value: string): string => {
+  return value.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
+};
+
+const clampTextToLines = (lines: string[], maxLines: number): string[] => {
+  if (lines.length <= maxLines) {
+    return lines;
+  }
+  const next = lines.slice(0, Math.max(1, maxLines));
+  const lastIndex = next.length - 1;
+  if (lastIndex >= 0) {
+    const base = next[lastIndex]!.trim();
+    next[lastIndex] = `${base.slice(0, Math.max(0, base.length - 3)).trimEnd()}...`;
+  }
+  return next;
+};
+
+const wrapTextLine = (line: string, maxCharsPerLine: number): string[] => {
+  if (line.length <= maxCharsPerLine) {
+    return [line];
+  }
+
+  const words = line.split(' ').filter((word) => word.length > 0);
+  const wrapped: string[] = [];
+  let current = '';
+
+  const pushCurrent = () => {
+    if (current.trim().length > 0) {
+      wrapped.push(current.trim());
+      current = '';
+    }
+  };
+
+  for (let index = 0; index < words.length; index += 1) {
+    let word = words[index]!;
+    while (word.length > maxCharsPerLine) {
+      const head = word.slice(0, Math.max(1, maxCharsPerLine - 1));
+      word = word.slice(head.length);
+      if (current.length > 0) {
+        pushCurrent();
+      }
+      wrapped.push(`${head}-`);
+    }
+
+    const candidate = current.length > 0 ? `${current} ${word}` : word;
+    if (candidate.length > maxCharsPerLine) {
+      pushCurrent();
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+
+  pushCurrent();
+  return wrapped.length > 0 ? wrapped : [line];
+};
+
+const wrapTextToShape = (
+  value: string,
+  width: number,
+  size: TldrawSizeStyle,
+  maxLines: number,
+): string => {
+  const normalized = normalizeTextForLayout(value);
+  if (!normalized) {
+    return '';
+  }
+
+  const approxFontPx = SIZE_TO_APPROX_FONT_PX[size];
+  const approxCharWidth = Math.max(7, Math.round(approxFontPx * 0.54));
+  const maxCharsPerLine = Math.max(10, Math.floor(Math.max(80, width) / approxCharWidth));
+
+  const paragraphLines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  const wrapped: string[] = [];
+  for (let index = 0; index < paragraphLines.length; index += 1) {
+    wrapped.push(...wrapTextLine(paragraphLines[index]!, maxCharsPerLine));
+  }
+
+  const clamped = clampTextToLines(wrapped, Math.max(1, maxLines));
+  return clamped.join('\n');
+};
+
+const maxLinesForHeight = (height: number, size: TldrawSizeStyle): number => {
+  const approxFontPx = SIZE_TO_APPROX_FONT_PX[size];
+  const lineHeight = Math.max(16, Math.round(approxFontPx * 1.25));
+  const contentHeight = Math.max(24, height - 18);
+  return Math.max(1, Math.floor(contentHeight / lineHeight));
+};
+
+const clampNumber = (value: number, min: number, max: number): number => {
+  if (min > max) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, value));
+};
+
+const isContainerElement = (
+  element: BoardElement,
+): element is Extract<BoardElement, { kind: 'rect' | 'ellipse' | 'diamond' | 'triangle' | 'sticky' | 'frame' }> => {
+  return (
+    element.kind === 'rect' ||
+    element.kind === 'ellipse' ||
+    element.kind === 'diamond' ||
+    element.kind === 'triangle' ||
+    element.kind === 'sticky' ||
+    element.kind === 'frame'
+  );
+};
+
+const toContainerBounds = (element: BoardElement): TextContainerBounds | null => {
+  if (!isContainerElement(element)) {
+    return null;
+  }
+  return {
+    x: element.x,
+    y: element.y,
+    w: Math.max(1, element.w),
+    h: Math.max(1, element.h),
+  };
+};
+
+const findContainingTextBounds = (
+  element: Extract<BoardElement, { kind: 'text' }>,
+  containers: TextContainerBounds[],
+): TextContainerBounds | null => {
+  let best: TextContainerBounds | null = null;
+  let bestArea = Number.POSITIVE_INFINITY;
+
+  for (let index = 0; index < containers.length; index += 1) {
+    const container = containers[index]!;
+    const padding = 4;
+    const insideX = element.x >= container.x + padding && element.x <= container.x + container.w - padding;
+    const insideY = element.y >= container.y + padding && element.y <= container.y + container.h - padding;
+    if (!insideX || !insideY) {
+      continue;
+    }
+    const area = container.w * container.h;
+    if (area < bestArea) {
+      bestArea = area;
+      best = container;
+    }
+  }
+
+  return best;
 };
 
 const toRelativeLinePoints = (points: BoardPoint[]): { x: number; y: number; points: TldrawDraftPoint[] } | null => {
@@ -329,7 +490,12 @@ const toFillStyle = (fillColor: string | undefined): TldrawFillStyle => {
   return 'solid';
 };
 
-const toDraftShape = (element: BoardElement, orderIndex: number, showAiNotes: boolean): TldrawDraftShape | null => {
+const toDraftShape = (
+  element: BoardElement,
+  orderIndex: number,
+  showAiNotes: boolean,
+  textContainers: TextContainerBounds[],
+): TldrawDraftShape | null => {
   const strokeColor = element.style?.strokeColor;
   const fillColor = element.style?.fillColor;
   const strokeWidth = element.style?.strokeWidth;
@@ -342,17 +508,31 @@ const toDraftShape = (element: BoardElement, orderIndex: number, showAiNotes: bo
     if (shouldHideAiText(element.id, showAiNotes)) {
       return null;
     }
+    const textSize = toSizeFromFont(fontSize);
+    const container = findContainingTextBounds(element, textContainers);
+    const width =
+      container !== null ? clampNumber(container.w - 24, 110, 460) : toTextWidth(element.text);
+    const maxLines = container !== null ? maxLinesForHeight(container.h - 10, textSize) : 6;
+    const wrappedText = wrapTextToShape(element.text, width, textSize, maxLines);
+    const x =
+      container !== null
+        ? clampNumber(element.x, container.x + 10, container.x + Math.max(10, container.w - width - 10))
+        : element.x;
+    const y =
+      container !== null
+        ? clampNumber(element.y, container.y + 10, container.y + Math.max(10, container.h - 28))
+        : element.y;
     return {
       kind: 'text',
       id: safeId,
-      x: element.x,
-      y: element.y,
+      x,
+      y,
       zIndex,
       props: {
-        text: element.text,
+        text: wrappedText,
         color: toClosestTldrawColor(strokeColor ?? '', 'black'),
-        size: toSizeFromFont(fontSize),
-        w: toTextWidth(element.text),
+        size: textSize,
+        w: width,
         autoSize: false,
       },
     };
@@ -391,6 +571,10 @@ const toDraftShape = (element: BoardElement, orderIndex: number, showAiNotes: bo
   }
 
   if (element.kind === 'sticky') {
+    const textSize = toSizeFromFont(fontSize);
+    const width = Math.max(24, element.w);
+    const height = Math.max(24, element.h);
+    const wrappedText = wrapTextToShape(element.text, width - 18, textSize, maxLinesForHeight(height, textSize));
     return {
       kind: 'geo',
       id: safeId,
@@ -399,14 +583,14 @@ const toDraftShape = (element: BoardElement, orderIndex: number, showAiNotes: bo
       zIndex,
       props: {
         geo: 'rectangle',
-        w: Math.max(24, element.w),
-        h: Math.max(24, element.h),
+        w: width,
+        h: height,
         color: toClosestTldrawColor(strokeColor ?? '', 'black'),
         labelColor: toClosestTldrawColor(strokeColor ?? '', 'black'),
         fill: 'solid',
-        size: toSizeFromFont(fontSize),
+        size: textSize,
         dash: toDashStyle(roughness),
-        text: element.text,
+        text: wrappedText,
         align: 'start',
         verticalAlign: 'start',
       },
@@ -491,8 +675,12 @@ export const boardToTldrawDraftShapes = (
   }
 
   const ordered = getOrderedElements(board);
+  const textContainers = ordered
+    .map((element) => toContainerBounds(element))
+    .filter((value): value is TextContainerBounds => value !== null)
+    .sort((left, right) => left.w * left.h - right.w * right.h);
   const drafts = ordered
-    .map((element, orderIndex) => toDraftShape(element, orderIndex, showAiNotes))
+    .map((element, orderIndex) => toDraftShape(element, orderIndex, showAiNotes, textContainers))
     .filter((shape): shape is TldrawDraftShape => Boolean(shape));
 
   drafts.sort((left, right) => left.zIndex - right.zIndex);

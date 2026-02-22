@@ -76,7 +76,7 @@ describe('client config', () => {
     );
   });
 
-  it('builds localhost candidate URLs from port/span on web', async () => {
+  it('builds host-aware candidate URLs from port/span on web', async () => {
     await withEnv(
       {
         EXPO_PUBLIC_SERVER_URL: undefined,
@@ -86,14 +86,38 @@ describe('client config', () => {
       async () => {
         const config = await loadConfigModule({ platformOs: 'web', hostname: 'board.local' });
         expect(config.SERVER_URL_CANDIDATES).toEqual([
+          'http://board.local:9100',
+          'http://board.local:9101',
+          'http://board.local:9102',
           'http://localhost:9100',
           'http://localhost:9101',
           'http://localhost:9102',
         ]);
         expect(config.WS_URL_CANDIDATES).toEqual([
+          'ws://board.local:9100',
+          'ws://board.local:9101',
+          'ws://board.local:9102',
           'ws://localhost:9100',
           'ws://localhost:9101',
           'ws://localhost:9102',
+        ]);
+      },
+    );
+  });
+
+  it('dedupes host candidates when the browser host is localhost', async () => {
+    await withEnv(
+      {
+        EXPO_PUBLIC_SERVER_URL: undefined,
+        EXPO_PUBLIC_SERVER_PORT: '9100',
+        EXPO_PUBLIC_SERVER_PORT_SPAN: '3',
+      },
+      async () => {
+        const config = await loadConfigModule({ platformOs: 'web', hostname: 'localhost' });
+        expect(config.SERVER_URL_CANDIDATES).toEqual([
+          'http://localhost:9100',
+          'http://localhost:9101',
+          'http://localhost:9102',
         ]);
       },
     );
@@ -122,8 +146,8 @@ describe('client config', () => {
       },
       async () => {
         const config = await loadConfigModule({ platformOs: 'web', hostname: 'demo-host' });
-        expect(config.SERVER_URL_CANDIDATES[0]).toBe('http://localhost:8787');
-        expect(config.SERVER_URL_CANDIDATES.length).toBe(8);
+        expect(config.SERVER_URL_CANDIDATES[0]).toBe('http://demo-host:8787');
+        expect(config.SERVER_URL_CANDIDATES.length).toBe(16);
       },
     );
   });

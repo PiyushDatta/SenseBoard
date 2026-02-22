@@ -253,4 +253,92 @@ describe('canvas-surface tldraw adapter', () => {
       expect(stroke.props.points[1]).toEqual({ id: 'p1', index: 'a1', x: 30, y: 20 });
     }
   });
+
+  it('wraps and constrains long text labels to avoid horizontal overflow', () => {
+    const base = Date.now();
+    const board = withBoard([
+      {
+        id: 'long-label',
+        kind: 'text',
+        x: 120,
+        y: 140,
+        text: 'Mapping feature-disclosure outlined a feature flow where items generate achievement plans and mermaid chart outputs for follow-up actions',
+        style: { fontSize: 52 },
+        createdAt: base,
+        createdBy: 'ai',
+      },
+    ]);
+
+    const drafts = boardToTldrawDraftShapes(board, true);
+    const label = drafts.find((shape) => shape.kind === 'text');
+    expect(label?.kind).toBe('text');
+    if (label?.kind === 'text') {
+      expect(label.props.w).toBeLessThanOrEqual(460);
+      expect(label.props.size).toBe('l');
+      expect(label.props.text.includes('\n')).toBe(true);
+    }
+  });
+
+  it('wraps sticky text and limits lines by sticky height', () => {
+    const base = Date.now();
+    const board = withBoard([
+      {
+        id: 'sticky-long',
+        kind: 'sticky',
+        x: 80,
+        y: 90,
+        w: 220,
+        h: 110,
+        text: 'Blocker: cannot move forward because dependency review and rollout gating are unresolved and need a concrete owner',
+        createdAt: base,
+        createdBy: 'ai',
+      },
+    ]);
+
+    const drafts = boardToTldrawDraftShapes(board, true);
+    const sticky = drafts.find((shape) => shape.kind === 'geo');
+    expect(sticky?.kind).toBe('geo');
+    if (sticky?.kind === 'geo') {
+      expect(sticky.props.text.length).toBeGreaterThan(0);
+      expect(sticky.props.text.includes('\n')).toBe(true);
+      const lines = sticky.props.text.split('\n');
+      expect(lines.length).toBeLessThanOrEqual(5);
+    }
+  });
+
+  it('constrains free text to containing rectangle bounds', () => {
+    const base = Date.now();
+    const board = withBoard([
+      {
+        id: 'container',
+        kind: 'rect',
+        x: 200,
+        y: 300,
+        w: 320,
+        h: 120,
+        createdAt: base,
+        createdBy: 'ai',
+      },
+      {
+        id: 'contained-text',
+        kind: 'text',
+        x: 230,
+        y: 325,
+        text: 'This text should stay inside the rectangle and should be truncated if it becomes too long for the available height.',
+        createdAt: base + 1,
+        createdBy: 'ai',
+      },
+    ]);
+
+    const drafts = boardToTldrawDraftShapes(board, true);
+    const text = drafts.find((shape) => shape.kind === 'text');
+    expect(text?.kind).toBe('text');
+    if (text?.kind === 'text') {
+      expect(text.props.w).toBeLessThanOrEqual(320);
+      expect(text.x).toBeGreaterThanOrEqual(210);
+      expect(text.y).toBeGreaterThanOrEqual(310);
+      const lines = text.props.text.split('\n');
+      expect(lines.length).toBeLessThanOrEqual(5);
+    }
+  });
 });

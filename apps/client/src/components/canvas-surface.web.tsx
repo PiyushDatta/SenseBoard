@@ -8,8 +8,8 @@ import {
   type TLLineShapePoint,
   type TLShape,
   type TLShapeId,
-} from '@tldraw/tldraw';
-import '@tldraw/tldraw/tldraw.css';
+} from 'tldraw/dist-cjs/index.js';
+import 'tldraw/tldraw.css';
 
 import { SENSEBOARD_AI_CONTENT_MAX_X, SENSEBOARD_AI_CONTENT_MIN_X } from '../../../shared/board-dimensions';
 import type { RoomState } from '../../../shared/types';
@@ -59,7 +59,7 @@ const toTlShapePartial = (draft: TldrawDraftShape): TLCreateShapePartial<TLShape
         color: draft.props.color,
         fill: draft.props.fill,
         size: draft.props.size,
-        font: 'draw',
+        font: 'sans',
         align: draft.props.align,
         verticalAlign: draft.props.verticalAlign,
         richText: toRichText(draft.props.text),
@@ -91,7 +91,7 @@ const toTlShapePartial = (draft: TldrawDraftShape): TLCreateShapePartial<TLShape
       props: {
         color: draft.props.color,
         size: draft.props.size,
-        font: 'draw',
+        font: 'sans',
         textAlign: 'start',
         w: draft.props.w,
         richText: toRichText(draft.props.text),
@@ -132,7 +132,7 @@ const toTlShapePartial = (draft: TldrawDraftShape): TLCreateShapePartial<TLShape
       size: draft.props.size,
       arrowheadStart: draft.props.arrowheadStart,
       arrowheadEnd: draft.props.arrowheadEnd,
-      font: 'draw',
+      font: 'sans',
       start: draft.props.start,
       end: draft.props.end,
       bend: 0,

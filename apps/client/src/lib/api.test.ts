@@ -6,23 +6,39 @@ type ApiModule = typeof import('./api');
 
 const API_BASE_URL = 'http://api.local:9001';
 
-const loadApiModule = async (): Promise<ApiModule> => {
+const loadApiModule = async (options?: {
+  serverUrl?: string | null;
+  serverPort?: string;
+  serverPortSpan?: string;
+  hostname?: string;
+}): Promise<ApiModule> => {
   mock.restore();
+  const port = Number(options?.serverPort ?? '8787');
+  const span = Number(options?.serverPortSpan ?? '8');
+  const normalizedSpan = Number.isFinite(span) && span > 0 ? Math.floor(span) : 8;
+  const serverCandidates =
+    options?.serverUrl === null
+      ? Array.from({ length: normalizedSpan }, (_, offset) => `http://localhost:${port + offset}`)
+      : [options?.serverUrl ?? API_BASE_URL];
+
   mock.module('react-native', () => ({
     Platform: {
       OS: 'web',
     },
   }));
-  process.env.EXPO_PUBLIC_SERVER_URL = API_BASE_URL;
+  mock.module('./config', () => ({
+    SERVER_URL_CANDIDATES: serverCandidates,
+    WS_URL_CANDIDATES: serverCandidates.map((url) => url.replace(/^http/i, 'ws')),
+    SERVER_URL: serverCandidates[0] ?? API_BASE_URL,
+  }));
   (globalThis as { window?: unknown }).window = {
-    location: { hostname: 'ignored-host' },
+    location: { hostname: options?.hostname ?? 'ignored-host' },
   } as unknown as Window;
   return (await import(`./api.ts?test=${Date.now()}-${Math.random()}`)) as ApiModule;
 };
 
 afterEach(() => {
   mock.restore();
-  delete process.env.EXPO_PUBLIC_SERVER_URL;
   delete (globalThis as { window?: unknown }).window;
 });
 
@@ -55,10 +71,11 @@ describe('api client', () => {
     try {
       const payload = await api.createRoom();
       expect(payload.roomId).toBe('ROOM01');
-      expect(calls.length).toBe(1);
-      expect(calls[0]?.url).toBe(`${API_BASE_URL}/rooms`);
-      expect(calls[0]?.method).toBe('POST');
-      expect(calls[0]?.headers).toEqual({ 'Content-Type': 'application/json' });
+      const appCalls = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCalls.length).toBe(1);
+      expect(appCalls[0]?.url).toBe(`${API_BASE_URL}/rooms`);
+      expect(appCalls[0]?.method).toBe('POST');
+      expect(appCalls[0]?.headers).toEqual({ 'Content-Type': 'application/json' });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -91,11 +108,13 @@ describe('api client', () => {
     try {
       const room = await api.getRoom('room-xyz');
       expect(room.id).toBe('ROOM-XYZ');
-      expect(calls[0]?.url.endsWith('/rooms/ROOM-XYZ')).toBe(true);
+      const appCalls = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCalls[0]?.url.endsWith('/rooms/ROOM-XYZ')).toBe(true);
 
       await api.triggerAiPatch('room-xyz', { reason: 'manual', regenerate: true });
-      expect(calls[1]?.url.endsWith('/rooms/ROOM-XYZ/ai-patch')).toBe(true);
-      expect(calls[1]?.body).toBe(JSON.stringify({ reason: 'manual', regenerate: true }));
+      const appCallsAfterPatch = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCallsAfterPatch[1]?.url.endsWith('/rooms/ROOM-XYZ/ai-patch')).toBe(true);
+      expect(appCallsAfterPatch[1]?.body).toBe(JSON.stringify({ reason: 'manual', regenerate: true }));
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -128,10 +147,11 @@ describe('api client', () => {
       const blob = new Blob(['audio-bytes'], { type: 'audio/webm' });
       const payload = await api.transcribeAudioChunk('room-xyz', 'Host', blob, 'audio/webm');
       expect(payload.ok).toBe(true);
-      expect(calls[0]?.url.endsWith('/rooms/ROOM-XYZ/transcribe')).toBe(true);
-      expect(calls[0]?.body).toBeDefined();
-      expect(calls[0]?.body?.get('speaker')).toBe('Host');
-      const audio = calls[0]?.body?.get('audio');
+      const appCalls = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCalls[0]?.url.endsWith('/rooms/ROOM-XYZ/transcribe')).toBe(true);
+      expect(appCalls[0]?.body).toBeDefined();
+      expect(appCalls[0]?.body?.get('speaker')).toBe('Host');
+      const audio = appCalls[0]?.body?.get('audio');
       expect(audio instanceof File).toBe(true);
       expect((audio as File).name.endsWith('.webm')).toBe(true);
     } finally {
@@ -176,15 +196,18 @@ describe('api client', () => {
 
     try {
       await api.getPersonalBoard('room-xyz', 'Alex');
-      expect(calls[0]?.url.endsWith('/rooms/ROOM-XYZ/personal-board?name=Alex')).toBe(true);
+      const appCalls = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCalls[0]?.url.endsWith('/rooms/ROOM-XYZ/personal-board?name=Alex')).toBe(true);
 
       await api.triggerPersonalBoardPatch('room-xyz', 'Alex', { reason: 'manual' });
-      expect(calls[1]?.url.endsWith('/rooms/ROOM-XYZ/personal-board/ai-patch')).toBe(true);
-      expect(calls[1]?.body).toBe(JSON.stringify({ reason: 'manual', name: 'Alex' }));
+      const appCallsAfterPatch = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCallsAfterPatch[1]?.url.endsWith('/rooms/ROOM-XYZ/personal-board/ai-patch')).toBe(true);
+      expect(appCallsAfterPatch[1]?.body).toBe(JSON.stringify({ reason: 'manual', name: 'Alex' }));
 
       const profile = await api.addPersonalizationContext('Alex', 'No diagrams, use bullets');
       expect(profile.displayName).toBe('Alex');
-      expect(calls[2]?.url.endsWith('/personalization/context')).toBe(true);
+      const appCallsAfterContext = calls.filter((call) => !call.url.endsWith('/health'));
+      expect(appCallsAfterContext[2]?.url.endsWith('/personalization/context')).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -215,6 +238,63 @@ describe('api client', () => {
 
     try {
       await expect(api.createRoom()).rejects.toThrow('timed out after 10s');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('falls back to next discovered server URL when the first request target is unreachable', async () => {
+    const api = await loadApiModule({
+      serverUrl: null,
+      serverPort: '9100',
+      serverPortSpan: '2',
+      hostname: 'localhost',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'http://localhost:9100/health' || url === 'http://localhost:9101/health') {
+        throw new TypeError('Failed to fetch');
+      }
+      if (url === 'http://localhost:9100/rooms') {
+        throw new TypeError('Failed to fetch');
+      }
+      if (url === 'http://localhost:9101/rooms') {
+        return new Response(
+          JSON.stringify({
+            roomId: 'ROOM02',
+            room: {
+              id: 'ROOM02',
+            },
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      }
+      return new Response('unexpected', { status: 500 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const payload = await api.createRoom();
+      expect(payload.roomId).toBe('ROOM02');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('adds actionable hint for network failures', async () => {
+    const api = await loadApiModule();
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async () => {
+      throw new TypeError('Failed to fetch');
+    }) as unknown as typeof fetch;
+
+    try {
+      await expect(api.createRoom()).rejects.toThrow('bun run server');
     } finally {
       globalThis.fetch = originalFetch;
     }

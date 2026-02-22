@@ -24,14 +24,21 @@ class HttpStatusError extends Error {
 let resolvedServerUrl: string | null = process.env.EXPO_PUBLIC_SERVER_URL ? SERVER_URL_CANDIDATES[0] ?? SERVER_URL : null;
 let resolvingServerUrl: Promise<string> | null = null;
 
-const buildNetworkError = (context: string, error: unknown) => {
+const buildNetworkError = (context: string, error: unknown, attemptedUrls?: string[]) => {
+  const attemptsSuffix =
+    attemptedUrls && attemptedUrls.length > 1 ? ` Tried: ${attemptedUrls.join(', ')}.` : '';
   if (error instanceof Error && error.name === 'AbortError') {
-    return new Error(`${context} timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s.`);
+    return new Error(`${context} timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s.${attemptsSuffix}`);
+  }
+  if (error instanceof TypeError) {
+    return new Error(
+      `${context} failed: ${error.message}. Start the API server with \`bun run server\` or set \`EXPO_PUBLIC_SERVER_URL\` to a reachable server.${attemptsSuffix}`,
+    );
   }
   if (error instanceof Error && error.message) {
-    return new Error(`${context} failed: ${error.message}`);
+    return new Error(`${context} failed: ${error.message}.${attemptsSuffix}`);
   }
-  return new Error(`${context} failed.`);
+  return new Error(`${context} failed.${attemptsSuffix}`);
 };
 
 const executeRequest = async <T>(baseUrl: string, path: string, options: RequestInit): Promise<T> => {
@@ -120,8 +127,23 @@ const resolveServerUrl = async (): Promise<string> => {
   return resolvingServerUrl;
 };
 
+const uniqueUrls = (urls: string[]): string[] => {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (let index = 0; index < urls.length; index += 1) {
+    const value = urls[index];
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    deduped.push(value);
+  }
+  return deduped;
+};
+
 const requestJson = async <T>(path: string, options: RequestInit, context: string): Promise<T> => {
   const firstUrl = await resolveServerUrl();
+  const attemptedUrls: string[] = [firstUrl];
   try {
     return await executeRequest<T>(firstUrl, path, options);
   } catch (error) {
@@ -130,15 +152,36 @@ const requestJson = async <T>(path: string, options: RequestInit, context: strin
     }
 
     resolvedServerUrl = null;
-    const retryUrl = await resolveServerUrl();
-    if (retryUrl !== firstUrl) {
+    let lastNetworkError: unknown = error;
+    const retryUrls = uniqueUrls(SERVER_URL_CANDIDATES).filter((candidate) => candidate !== firstUrl);
+    for (let index = 0; index < retryUrls.length; index += 1) {
+      const retryUrl = retryUrls[index]!;
+      attemptedUrls.push(retryUrl);
       try {
         return await executeRequest<T>(retryUrl, path, options);
       } catch (retryError) {
-        throw buildNetworkError(`${context} at ${retryUrl}`, retryError);
+        if (retryError instanceof HttpStatusError) {
+          resolvedServerUrl = retryUrl;
+          throw buildNetworkError(`${context} at ${retryUrl}`, retryError);
+        }
+        lastNetworkError = retryError;
       }
     }
-    throw buildNetworkError(`${context} at ${firstUrl}`, error);
+
+    const resolvedRetry = await resolveServerUrl();
+    if (!attemptedUrls.includes(resolvedRetry)) {
+      attemptedUrls.push(resolvedRetry);
+      try {
+        return await executeRequest<T>(resolvedRetry, path, options);
+      } catch (retryError) {
+        if (retryError instanceof HttpStatusError) {
+          resolvedServerUrl = resolvedRetry;
+          throw buildNetworkError(`${context} at ${resolvedRetry}`, retryError);
+        }
+        lastNetworkError = retryError;
+      }
+    }
+    throw buildNetworkError(`${context} at ${firstUrl}`, lastNetworkError, attemptedUrls);
   }
 };
 

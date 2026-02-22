@@ -130,7 +130,7 @@ If your server is on a custom host/port range, set:
 EXPO_PUBLIC_SERVER_URL=http://<host>:8787 bun run start:web
 ```
 
-Without `EXPO_PUBLIC_SERVER_URL`, the client auto-discovers local server ports in a short range starting at `8787`.
+Without `EXPO_PUBLIC_SERVER_URL`, the client auto-discovers server ports on the current browser host, then falls back to `localhost`, in a short range starting at `8787`.
 Override client discovery with:
 
 - `EXPO_PUBLIC_SERVER_PORT` (default `8787`)
@@ -168,7 +168,7 @@ bun run integration_test
 
 ### AI Diagram Generation (Understand Text + Draw)
 1. AI patch job runs from server queue.
-2. Server loads prompt templates from `prompts/main_ai_board_system_prompt.md` and `prompts/main_ai_board_delta_prompt.md`.
+2. Server loads prompt templates from `prompts/main_ai_board_system_prompt.md`, `prompts/main_ai_board_delta_prompt.md`, and `prompts/senseboard-live-visual-notetaker/SKILL.md`.
 3. On startup/first use, server primes a one-time AI prompt session for the board-ops route.
 4. Server builds prompt context from transcript/chat/context bank + current board state.
 5. Provider routing for diagram ops:
