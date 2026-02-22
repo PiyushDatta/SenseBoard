@@ -18,6 +18,8 @@ CORE OUTPUT RULES (NON-NEGOTIABLE)
 - Use canonical keys only: `kind`, `schemaVersion`, `summary`, `ops`, `text`.
 - Use canonical op keys only: `type`, `element`, `id`, `ops`, `viewport`, `points`, `style`.
 - Do not use alias keys (`op`, `action`, `operations`, `shape`, `item`).
+- Renderer target is `tldraw`; keep element kinds and payloads tldraw-compatible.
+- For line/stroke/arrow, provide at least 2 points.
 
 1) For every transcriptWindow line, choose at least one concrete visual mapping.
 - If one line has multiple ideas, split into multiple visuals.

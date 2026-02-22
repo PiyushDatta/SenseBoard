@@ -3,8 +3,10 @@ import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRuntimeConfig } from './runtime-config';
+import { BOARD_OPS_SCHEMA_VERSION } from '../../shared/types';
 import type {
   BoardOp,
+  BoardOpsEnvelope,
   ChatMessage,
   ContextItem,
   DiagramPatch,
@@ -198,7 +200,6 @@ const BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_system_pro
 const LEGACY_BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'DEFAULT_BOARD_OPS_SYSTEM_PROMPT.md');
 const BOARD_OPS_DELTA_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_delta_prompt.md');
 const BOARD_OPS_VISUAL_SKILL_PROMPT_PATH = join(PROMPTS_DIR, 'senseboard-live-visual-notetaker', 'SKILL.md');
-const BOARD_OPS_SCHEMA_VERSION = 1;
 
 const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   'ROLE',
@@ -237,6 +238,16 @@ const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   '- sticky: {id, kind:"sticky", x, y, w, h, text}',
   '- frame: {id, kind:"frame", x, y, w, h, title?}',
   '- stroke|line|arrow: {id, kind, points:[[x,y], ...]}',
+  '',
+  'TLDRAW RENDERER CONTRACT',
+  'The web renderer is tldraw; generate only payloads that map cleanly to tldraw primitives.',
+  '- rect/ellipse/diamond/triangle -> tldraw geo shapes',
+  '- sticky -> tldraw geo rectangle with text',
+  '- frame -> tldraw frame',
+  '- text -> tldraw text',
+  '- line/stroke -> tldraw line (points should contain at least 2 points)',
+  '- arrow -> tldraw arrow (points should contain at least 2 points)',
+  'Do not emit unknown element kinds or custom shape schemas.',
   '',
   'PRIORITY AND TRUTH ORDER',
   '1) correctionDirectives',
@@ -278,6 +289,7 @@ const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
   'Use words + visuals together for each meaningful idea.',
   'Prefer grouped structures (frames/lanes/clusters) when ideas are related.',
   'Use arrows/lines for dependencies, chronology, and transformations.',
+  'Renderer target is tldraw; keep operations and element payloads tldraw-compatible.',
   'Use canonical operation keys only: type, element, id, ops, viewport, points, style.',
   'Do not emit alias keys like op/action/operations/shape/item.',
   '',
@@ -305,6 +317,7 @@ const DEFAULT_BOARD_OPS_VISUAL_SKILL_PROMPT = [
   `Return one JSON object: {"kind":"board_ops","schemaVersion":${BOARD_OPS_SCHEMA_VERSION},"summary":"...","ops":[...],"text":"..."}.`,
   'Use canonical keys only: kind, schemaVersion, summary, ops, text, type, element, id.',
   'Do not use alias keys such as op/action/operations/shape/item.',
+  'Renderer target is tldraw; keep element kinds and payloads compatible with tldraw mapping.',
   '',
   'Always map each transcriptWindow line to at least one drawable op.',
   'When transcriptWindow has text, include at least one text element and one non-text element.',
@@ -572,6 +585,7 @@ const buildPersonalizedBoardOpsSystemPrompt = (options: PersonalizedBoardOptions
     'You are generating a personalized board for one participant.',
     `Participant: ${member}`,
     'Use mixed modality with text-forward output: short bullets plus supporting simple visuals.',
+    'Renderer target is tldraw; keep output operations and element payloads tldraw-compatible.',
     'When transcriptWindow has content, always produce drawable operations.',
     'Clear stale personalized items if needed to keep the board focused on current discussion.',
     'If details do not fit cleanly in ops, include them in top-level "text".',
@@ -615,6 +629,8 @@ const buildPersonalizedBoardOpsUserPrompt = (payload: AIInput, options: Personal
     'Every transcript line should map to at least one bullet-style drawable operation.',
     'Include non-text visual support (rect/line/arrow) when possible, not only text.',
     'If something cannot be represented in ops, put it in top-level "text".',
+    `Set top-level schemaVersion to ${BOARD_OPS_SCHEMA_VERSION}.`,
+    'Renderer target is tldraw; use only supported element kinds and canonical payload keys.',
     'Return board_ops JSON only.',
     JSON.stringify(input, null, 2),
   ].join('\n\n');
@@ -1593,14 +1609,6 @@ const stringifyForLog = (value: unknown, maxLength = 1400): string => {
   }
 };
 
-interface BoardOpsEnvelope {
-  kind: 'board_ops';
-  schemaVersion: number;
-  summary?: string;
-  text?: string;
-  ops: BoardOp[];
-}
-
 const parseJsonWithDebugLog = (providerLabel: string, rawContent: string): unknown | null => {
   logAiRouter(`${providerLabel} JSON raw="${compactForLog(rawContent)}"`, 'debug');
   const parsed = parseJsonObject(rawContent);
@@ -2573,6 +2581,7 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
     'Never return empty ops when transcriptWindow has content.',
     `Set top-level schemaVersion to ${BOARD_OPS_SCHEMA_VERSION}.`,
     'Use canonical keys only: kind, schemaVersion, summary, ops, text, type, element.',
+    'Renderer target is tldraw; keep element kinds and geometry compatible with tldraw mapping.',
     'Generate the next sketch operations for this meeting moment.',
     'Return board_ops JSON only.',
     JSON.stringify(input, null, 2),

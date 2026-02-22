@@ -160,6 +160,16 @@ export type BoardOp =
   | { type: 'setViewport'; viewport: Partial<BoardViewport> }
   | { type: 'batch'; ops: BoardOp[] };
 
+export const BOARD_OPS_SCHEMA_VERSION = 1 as const;
+
+export interface BoardOpsEnvelope {
+  kind: 'board_ops';
+  schemaVersion: number;
+  summary?: string;
+  text?: string;
+  ops: BoardOp[];
+}
+
 export interface FocusBox {
   x: number;
   y: number;

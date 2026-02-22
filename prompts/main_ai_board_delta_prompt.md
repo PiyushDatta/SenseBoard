@@ -12,6 +12,8 @@ Treat transcriptWindow as immediate signal and transcriptContext as rolling memo
 - Keep generated geometry within the primary view lane: x in [380,1480], y in [40,5600], width <= 980, height <= 720.
 - Keep the output envelope canonical: `kind`, `schemaVersion`, `summary`, `ops`, `text`.
 - Set `schemaVersion` to `1`.
+- Renderer target is `tldraw`; keep element kinds and payloads compatible with tldraw mapping.
+- For line/stroke/arrow, include at least 2 points.
 
 ## Creative Op Usage
 - Use richer operations when helpful:

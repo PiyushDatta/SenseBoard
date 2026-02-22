@@ -47,6 +47,16 @@ stroke, rect, ellipse, diamond, triangle, sticky, frame, arrow, line, text.
 - frame: `{id, kind:"frame", x, y, w, h, title?}`
 - stroke|line|arrow: `{id, kind, points:[[x,y], ...]}`
 
+## Tldraw Renderer Contract
+- Web rendering uses `tldraw`; output must stay compatible with this mapping.
+- rect|ellipse|diamond|triangle -> tldraw `geo` shapes
+- sticky -> tldraw rectangle-like `geo` with text
+- frame -> tldraw `frame`
+- text -> tldraw `text`
+- line|stroke -> tldraw `line` (at least 2 points)
+- arrow -> tldraw `arrow` (at least 2 points)
+- Do not emit unknown element kinds or custom shape schemas.
+
 ## Object Guidance
 - `sticky`: quick thoughts, assumptions, reminders, parking-lot items.
 - `frame`: topic boundary, swimlane, section container.
