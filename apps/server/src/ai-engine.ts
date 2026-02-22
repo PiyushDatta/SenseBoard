@@ -405,7 +405,7 @@ const getBoardOpsPromptTemplates = (): { system: string; delta: string; visualSk
   return cachedBoardOpsPrompts;
 };
 
-const truncatePromptText = (value: string, maxLength = 120): string => {
+const truncatePromptText = (value: string, maxLength = 96): string => {
   const normalized = value.replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) {
     return normalized;
@@ -2083,7 +2083,7 @@ const buildAutoLabelCandidates = (
   text?: string,
 ): string[] => {
   const candidates: string[] = [];
-  const push = (value: string | undefined, max = 120) => {
+  const push = (value: string | undefined, max = 80) => {
     if (!value) {
       return;
     }
@@ -2104,17 +2104,17 @@ const buildAutoLabelCandidates = (
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
       .slice(0, 6)
-      .forEach((line) => push(line, 120));
+      .forEach((line) => push(line, 80));
   }
   input.transcriptWindow
     .map(transcriptLineToPlainText)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .slice(-8)
-    .forEach((line) => push(line, 120));
+    .forEach((line) => push(line, 80));
 
   if (candidates.length === 0) {
-    push('Discussion point', 120);
+    push('Discussion point', 80);
   }
   return candidates;
 };
@@ -2165,7 +2165,7 @@ const addAutoLabelsToOps = (
         kind: 'text',
         x: anchor.x + Math.min(22, Math.max(8, anchor.w * 0.1)),
         y: anchor.y + Math.min(42, Math.max(20, anchor.h * 0.32)),
-        text: truncatePromptText(label, 130),
+        text: truncatePromptText(label, 84),
         createdAt: now + index,
         createdBy: 'ai',
         style: {

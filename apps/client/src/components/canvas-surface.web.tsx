@@ -1,7 +1,8 @@
 import type { MouseEvent, ReactElement, WheelEvent } from 'react';
-import { useMemo, useRef, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type { BoardElement, BoardPoint, RoomState } from '../../../shared/types';
+import { SENSEBOARD_AI_CONTENT_MAX_X, SENSEBOARD_AI_CONTENT_MIN_X } from '../../../shared/board-dimensions';
 import type { SenseTheme } from '../lib/theme';
 import {
   CANVAS_BOARD_DIMENSIONS,
@@ -47,6 +48,58 @@ const roughPolyline = (points: BoardPoint[], seedKey: string, roughness = 2): st
   return `M ${first[0]} ${first[1]} ${rest}`.trim();
 };
 
+const wrapTextLines = (value: string, maxCharsPerLine: number, maxLines: number): string[] => {
+  const lineLimit = Math.max(8, maxCharsPerLine);
+  const linesLimit = Math.max(1, maxLines);
+  const sourceLines = value
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (sourceLines.length === 0) {
+    return [];
+  }
+
+  const wrapped: string[] = [];
+  for (const line of sourceLines) {
+    const words = line.split(/\s+/).filter(Boolean);
+    if (words.length === 0) {
+      continue;
+    }
+    let current = words[0] ?? '';
+    for (let index = 1; index < words.length; index += 1) {
+      const word = words[index]!;
+      if (current.length + word.length + 1 <= lineLimit) {
+        current = `${current} ${word}`;
+      } else {
+        wrapped.push(current);
+        current = word;
+        if (wrapped.length >= linesLimit) {
+          break;
+        }
+      }
+    }
+    if (wrapped.length >= linesLimit) {
+      break;
+    }
+    wrapped.push(current);
+    if (wrapped.length >= linesLimit) {
+      break;
+    }
+  }
+
+  if (wrapped.length === 0) {
+    return [];
+  }
+
+  const fullText = sourceLines.join(' ');
+  const compactWrapped = wrapped.join(' ');
+  if (fullText.length > compactWrapped.length && wrapped.length > 0) {
+    const tail = wrapped[wrapped.length - 1] ?? '';
+    wrapped[wrapped.length - 1] = `${tail.slice(0, Math.max(0, lineLimit - 3)).trimEnd()}...`;
+  }
+  return wrapped.slice(0, linesLimit);
+};
+
 const renderElement = (element: BoardElement, theme: SenseTheme, showAiNotes: boolean) => {
   const stroke = element.style?.strokeColor || '#2B3540';
   const strokeWidth = element.style?.strokeWidth ?? 2;
@@ -57,16 +110,26 @@ const renderElement = (element: BoardElement, theme: SenseTheme, showAiNotes: bo
     if (!showAiNotes && (element.id.startsWith('notes:') || element.id.startsWith('order:'))) {
       return null;
     }
+    const fontSize = element.style?.fontSize ?? 18;
+    const lineHeight = Math.max(18, Math.round(fontSize * 1.24));
+    const maxChars = Math.max(14, Math.round(42 - fontSize * 0.55));
+    const lines = wrapTextLines(element.text, maxChars, 4);
     return (
       <text
         key={element.id}
         x={element.x}
         y={element.y}
         fill={element.style?.strokeColor || '#1E2A34'}
-        fontSize={element.style?.fontSize ?? 18}
+        fontSize={fontSize}
         fontWeight={600}
         fontFamily={theme.fonts.body}>
-        {element.text}
+        {lines.length > 0
+          ? lines.map((line, index) => (
+              <tspan key={`${element.id}:line:${index}`} x={element.x} dy={index === 0 ? 0 : lineHeight}>
+                {line}
+              </tspan>
+            ))
+          : element.text}
       </text>
     );
   }
@@ -153,6 +216,11 @@ const renderElement = (element: BoardElement, theme: SenseTheme, showAiNotes: bo
 
   if (element.kind === 'sticky') {
     const fold = Math.max(12, Math.min(28, Math.floor(Math.min(element.w, element.h) * 0.16)));
+    const stickyFontSize = element.style?.fontSize ?? 16;
+    const stickyLineHeight = Math.max(16, Math.round(stickyFontSize * 1.2));
+    const stickyMaxChars = Math.max(8, Math.floor((element.w - 24) / Math.max(6, stickyFontSize * 0.54)));
+    const stickyMaxLines = Math.max(1, Math.floor((element.h - 28) / stickyLineHeight));
+    const stickyLines = wrapTextLines(element.text, stickyMaxChars, Math.min(6, stickyMaxLines));
     const bodyPoints: BoardPoint[] = [
       [element.x, element.y],
       [element.x + element.w - fold, element.y],
@@ -186,10 +254,14 @@ const renderElement = (element: BoardElement, theme: SenseTheme, showAiNotes: bo
           x={element.x + 12}
           y={element.y + 26}
           fill={element.style?.strokeColor || '#1E2A34'}
-          fontSize={element.style?.fontSize ?? 16}
+          fontSize={stickyFontSize}
           fontWeight={600}
           fontFamily={theme.fonts.body}>
-          {element.text}
+          {(stickyLines.length > 0 ? stickyLines : [element.text]).map((line, index) => (
+            <tspan key={`${element.id}:sticky:${index}`} x={element.x + 12} dy={index === 0 ? 0 : stickyLineHeight}>
+              {line}
+            </tspan>
+          ))}
         </text>
       </g>
     );
@@ -238,6 +310,8 @@ export const CanvasSurface = ({ room, showAiNotes, theme }: CanvasSurfaceProps) 
   const [zoom, setZoom] = useState(1);
   const [panning, setPanning] = useState(false);
   const [panStart, setPanStart] = useState<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const [userMoved, setUserMoved] = useState(false);
+  const [autoCentered, setAutoCentered] = useState(false);
 
   const orderedElements = useMemo(() => {
     if (!room?.board) {
@@ -255,6 +329,7 @@ export const CanvasSurface = ({ room, showAiNotes, theme }: CanvasSurfaceProps) 
   );
 
   const onMouseDown = (event: MouseEvent<HTMLDivElement>) => {
+    setUserMoved(true);
     setPanning(true);
     setPanStart({
       x: event.clientX,
@@ -285,11 +360,31 @@ export const CanvasSurface = ({ room, showAiNotes, theme }: CanvasSurfaceProps) 
     if (!event.ctrlKey) {
       return;
     }
+    setUserMoved(true);
     event.preventDefault();
     const delta = -event.deltaY;
     const factor = delta > 0 ? 1.08 : 0.92;
     setZoom((previous) => Math.max(0.3, Math.min(3.2, previous * factor)));
   };
+
+  useLayoutEffect(() => {
+    if (!viewportRef.current) {
+      return;
+    }
+    if (userMoved || zoom !== 1) {
+      return;
+    }
+    const viewportWidth = viewportRef.current.clientWidth;
+    if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
+      return;
+    }
+    const laneWidth = Math.max(1, SENSEBOARD_AI_CONTENT_MAX_X - SENSEBOARD_AI_CONTENT_MIN_X);
+    const desiredX = Math.min(0, Math.round((viewportWidth - laneWidth) / 2 - SENSEBOARD_AI_CONTENT_MIN_X));
+    if (!autoCentered || Math.abs(desiredX - pan.x) > 1) {
+      setPan((prev) => ({ ...prev, x: desiredX }));
+      setAutoCentered(true);
+    }
+  }, [autoCentered, pan.x, room?.board?.revision, userMoved, zoom]);
 
   return (
     <div

@@ -1,4 +1,11 @@
 import { applyBoardOps, clampBoardToCanvasBoundsInPlace, createEmptyBoardState } from '../../shared/board-state';
+import {
+  SENSEBOARD_AI_CONTENT_MAX_X,
+  SENSEBOARD_AI_CONTENT_MIN_X,
+  SENSEBOARD_CANVAS_HEIGHT,
+  SENSEBOARD_CANVAS_PADDING,
+  SENSEBOARD_CANVAS_WIDTH,
+} from '../../shared/board-dimensions';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -366,6 +373,133 @@ const createLayerId = (): string => {
   return `layer_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 };
 
+const estimateTextBounds = (element: Extract<BoardElement, { kind: 'text' }>): { minX: number; maxX: number; minY: number; maxY: number } => {
+  const fontSize = element.style?.fontSize ?? 18;
+  const lines = element.text.split(/\r?\n/g).filter((line) => line.trim().length > 0);
+  const lineCount = Math.max(1, Math.min(4, lines.length));
+  const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
+  const estimatedWidth = Math.min(820, Math.max(80, Math.round(longest * fontSize * 0.55)));
+  const estimatedHeight = Math.max(24, Math.round(lineCount * fontSize * 1.25));
+  return {
+    minX: element.x,
+    maxX: element.x + estimatedWidth,
+    minY: element.y - Math.round(fontSize * 0.85),
+    maxY: element.y - Math.round(fontSize * 0.85) + estimatedHeight,
+  };
+};
+
+const mergeBounds = (
+  target: { minX: number; maxX: number; minY: number; maxY: number } | null,
+  next: { minX: number; maxX: number; minY: number; maxY: number } | null,
+) => {
+  if (!next) {
+    return target;
+  }
+  if (!target) {
+    return { ...next };
+  }
+  return {
+    minX: Math.min(target.minX, next.minX),
+    maxX: Math.max(target.maxX, next.maxX),
+    minY: Math.min(target.minY, next.minY),
+    maxY: Math.max(target.maxY, next.maxY),
+  };
+};
+
+const getOpBounds = (op: BoardOp): { minX: number; maxX: number; minY: number; maxY: number } | null => {
+  if (op.type === 'batch') {
+    return op.ops.reduce<{ minX: number; maxX: number; minY: number; maxY: number } | null>(
+      (acc, nested) => mergeBounds(acc, getOpBounds(nested)),
+      null,
+    );
+  }
+  if (op.type !== 'upsertElement') {
+    return null;
+  }
+  const element = op.element;
+  if (element.kind === 'text') {
+    return estimateTextBounds(element);
+  }
+  if (
+    element.kind === 'rect' ||
+    element.kind === 'ellipse' ||
+    element.kind === 'diamond' ||
+    element.kind === 'triangle' ||
+    element.kind === 'sticky' ||
+    element.kind === 'frame'
+  ) {
+    return {
+      minX: element.x,
+      maxX: element.x + element.w,
+      minY: element.y,
+      maxY: element.y + element.h,
+    };
+  }
+  if (element.kind === 'stroke' || element.kind === 'line' || element.kind === 'arrow') {
+    if (element.points.length === 0) {
+      return null;
+    }
+    let minX = element.points[0]![0];
+    let maxX = element.points[0]![0];
+    let minY = element.points[0]![1];
+    let maxY = element.points[0]![1];
+    for (const [x, y] of element.points) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    }
+    return { minX, maxX, minY, maxY };
+  }
+  return null;
+};
+
+const wrapOpsWithFrame = (ops: BoardOp[], createdAt: number): BoardOp[] => {
+  const bounds = ops.reduce<{ minX: number; maxX: number; minY: number; maxY: number } | null>(
+    (acc, op) => mergeBounds(acc, getOpBounds(op)),
+    null,
+  );
+  if (!bounds) {
+    return ops;
+  }
+  const padding = 32;
+  const minX = Math.max(SENSEBOARD_CANVAS_PADDING, Math.min(bounds.minX - padding, SENSEBOARD_CANVAS_WIDTH - 1));
+  const maxX = Math.max(minX + 1, Math.min(bounds.maxX + padding, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING));
+  const minY = Math.max(SENSEBOARD_CANVAS_PADDING, Math.min(bounds.minY - padding, SENSEBOARD_CANVAS_HEIGHT - 1));
+  const maxY = Math.max(minY + 1, Math.min(bounds.maxY + padding, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING));
+  const laneWidth = Math.max(1, SENSEBOARD_AI_CONTENT_MAX_X - SENSEBOARD_AI_CONTENT_MIN_X);
+  const frameWidth = Math.max(120, Math.min(maxX - minX, laneWidth));
+  const frameHeight = Math.max(90, maxY - minY);
+  const frameX = Math.min(
+    Math.max(minX, SENSEBOARD_AI_CONTENT_MIN_X),
+    SENSEBOARD_AI_CONTENT_MAX_X - frameWidth,
+  );
+  const frameY = Math.min(
+    Math.max(minY, SENSEBOARD_CANVAS_PADDING),
+    SENSEBOARD_CANVAS_HEIGHT - frameHeight - SENSEBOARD_CANVAS_PADDING,
+  );
+  const frameOp: BoardOp = {
+    type: 'upsertElement',
+    element: {
+      id: `render-frame-${createdAt.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      kind: 'frame',
+      x: frameX,
+      y: frameY,
+      w: Math.min(frameWidth, SENSEBOARD_AI_CONTENT_MAX_X - frameX),
+      h: Math.min(frameHeight, SENSEBOARD_CANVAS_HEIGHT - frameY - SENSEBOARD_CANVAS_PADDING),
+      createdAt,
+      createdBy: 'ai',
+      zIndex: -10,
+      style: {
+        strokeColor: '#3b556b',
+        strokeWidth: 1.6,
+        roughness: 1.5,
+      },
+    },
+  };
+  return [frameOp, ...ops];
+};
+
 const shiftElementDown = (element: BoardElement, deltaY: number): BoardElement => {
   if (element.kind === 'text') {
     return {
@@ -599,7 +733,8 @@ const applyStackedBoardOps = (
   boundaryAdjustedCount: number;
 } => {
   const shifted = shiftAiElementsDown(board, AI_LAYER_SHIFT_Y, AI_LAYER_BOUNDARY_Y);
-  const layeredOps = namespaceBoardOpsForLayer(ops, createLayerId());
+  const framedOps = wrapOpsWithFrame(ops, Date.now());
+  const layeredOps = namespaceBoardOpsForLayer(framedOps, createLayerId());
   const boardAfterOps = applyBoardOps(shifted.board, layeredOps);
   const boundaryAdjustedCount = clampBoardToCanvasBoundsInPlace(boardAfterOps);
 

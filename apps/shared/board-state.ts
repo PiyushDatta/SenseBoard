@@ -1,5 +1,9 @@
 import type { BoardElement, BoardOp, BoardPoint, BoardState, BoardViewport } from './types';
 import {
+  SENSEBOARD_AI_CONTENT_MAX_X,
+  SENSEBOARD_AI_CONTENT_MIN_X,
+  SENSEBOARD_AI_ELEMENT_MAX_HEIGHT,
+  SENSEBOARD_AI_ELEMENT_MAX_WIDTH,
   SENSEBOARD_CANVAS_HEIGHT,
   SENSEBOARD_CANVAS_PADDING,
   SENSEBOARD_CANVAS_WIDTH,
@@ -731,25 +735,36 @@ export const applyBoardOps = (state: BoardState, ops: BoardOp[]): BoardState => 
   return next;
 };
 
-const clampToCanvasX = (value: number) =>
-  clamp(value, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING);
-const clampToCanvasY = (value: number) =>
-  clamp(value, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING);
-
 export const clampBoardToCanvasBoundsInPlace = (state: BoardState): number => {
   let adjustedCount = 0;
-  const maxWidth = Math.max(1, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING * 2);
-  const maxHeight = Math.max(1, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING * 2);
+  const canvasMinX = SENSEBOARD_CANVAS_PADDING;
+  const canvasMaxX = SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING;
+  const canvasMinY = SENSEBOARD_CANVAS_PADDING;
+  const canvasMaxY = SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING;
+  const aiMinX = clamp(SENSEBOARD_AI_CONTENT_MIN_X, canvasMinX, canvasMaxX);
+  const aiMaxX = clamp(SENSEBOARD_AI_CONTENT_MAX_X, aiMinX + 1, canvasMaxX);
+  const canvasMaxWidth = Math.max(1, canvasMaxX - canvasMinX);
+  const canvasMaxHeight = Math.max(1, canvasMaxY - canvasMinY);
+  const aiLaneMaxWidth = Math.max(1, aiMaxX - aiMinX);
 
   for (const id of Object.keys(state.elements)) {
     const element = state.elements[id];
     if (!element) {
       continue;
     }
+    const useAiLane = element.createdBy === 'ai';
+    const minX = useAiLane ? aiMinX : canvasMinX;
+    const maxX = useAiLane ? aiMaxX : canvasMaxX;
+    const minY = canvasMinY;
+    const maxY = canvasMaxY;
+    const maxWidth = useAiLane
+      ? Math.max(1, Math.min(canvasMaxWidth, aiLaneMaxWidth, SENSEBOARD_AI_ELEMENT_MAX_WIDTH))
+      : canvasMaxWidth;
+    const maxHeight = useAiLane ? Math.max(1, Math.min(canvasMaxHeight, SENSEBOARD_AI_ELEMENT_MAX_HEIGHT)) : canvasMaxHeight;
 
     if (element.kind === 'text') {
-      const nextX = clampToCanvasX(element.x);
-      const nextY = clampToCanvasY(element.y);
+      const nextX = clamp(element.x, minX, maxX);
+      const nextY = clamp(element.y, minY, maxY);
       if (nextX !== element.x || nextY !== element.y) {
         state.elements[id] = {
           ...element,
@@ -771,8 +786,8 @@ export const clampBoardToCanvasBoundsInPlace = (state: BoardState): number => {
     ) {
       const nextW = clamp(element.w, 1, maxWidth);
       const nextH = clamp(element.h, 1, maxHeight);
-      const nextX = clamp(element.x, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING - nextW);
-      const nextY = clamp(element.y, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING - nextH);
+      const nextX = clamp(element.x, minX, Math.max(minX, maxX - nextW));
+      const nextY = clamp(element.y, minY, Math.max(minY, maxY - nextH));
       if (nextX !== element.x || nextY !== element.y || nextW !== element.w || nextH !== element.h) {
         state.elements[id] = {
           ...element,
@@ -790,8 +805,8 @@ export const clampBoardToCanvasBoundsInPlace = (state: BoardState): number => {
       let changed = false;
       const nextPoints: BoardPoint[] = [];
       for (const [x, y] of element.points) {
-        const nx = clampToCanvasX(x);
-        const ny = clampToCanvasY(y);
+        const nx = clamp(x, minX, maxX);
+        const ny = clamp(y, minY, maxY);
         if (nx !== x || ny !== y) {
           changed = true;
         }

@@ -9,6 +9,7 @@ Treat transcriptWindow as immediate signal and transcriptContext as rolling memo
 - Use arrows and lines for chronology, dependency, feedback loops, and transformations.
 - Keep IDs stable for concepts that persist over time.
 - Add labels to the shapes you draw. Important blocks should not be unlabeled.
+- Keep generated geometry within the primary view lane: x in [380,1480], y in [40,5600], width <= 980, height <= 720.
 
 ## Creative Op Usage
 - Use richer operations when helpful:

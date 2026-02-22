@@ -3,7 +3,15 @@
 import { describe, expect, it } from 'bun:test';
 
 import { applyBoardOp, applyBoardOps, clampBoardToCanvasBoundsInPlace, createEmptyBoardState } from './board-state';
-import { SENSEBOARD_CANVAS_HEIGHT, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_WIDTH } from './board-dimensions';
+import {
+  SENSEBOARD_AI_CONTENT_MAX_X,
+  SENSEBOARD_AI_CONTENT_MIN_X,
+  SENSEBOARD_AI_ELEMENT_MAX_HEIGHT,
+  SENSEBOARD_AI_ELEMENT_MAX_WIDTH,
+  SENSEBOARD_CANVAS_HEIGHT,
+  SENSEBOARD_CANVAS_PADDING,
+  SENSEBOARD_CANVAS_WIDTH,
+} from './board-dimensions';
 import type { BoardElement } from './types';
 
 const rect = (id: string): BoardElement => ({
@@ -90,19 +98,18 @@ describe('board-state reducer', () => {
     expect(adjusted).toBeGreaterThan(0);
 
     const rectElement = state.elements['oob-rect'];
-    expect(rectElement && rectElement.kind === 'rect' && rectElement.x).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.x).toBeGreaterThanOrEqual(SENSEBOARD_AI_CONTENT_MIN_X);
     expect(rectElement && rectElement.kind === 'rect' && rectElement.y).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
-    expect(rectElement && rectElement.kind === 'rect' && rectElement.x + rectElement.w).toBeLessThanOrEqual(
-      SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING,
-    );
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.w).toBeLessThanOrEqual(SENSEBOARD_AI_ELEMENT_MAX_WIDTH);
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.h).toBeLessThanOrEqual(SENSEBOARD_AI_ELEMENT_MAX_HEIGHT);
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.x + rectElement.w).toBeLessThanOrEqual(SENSEBOARD_AI_CONTENT_MAX_X);
     expect(rectElement && rectElement.kind === 'rect' && rectElement.y + rectElement.h).toBeLessThanOrEqual(
       SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING,
     );
 
     const textElement = state.elements['oob-text'];
-    expect(textElement && textElement.kind === 'text' && textElement.x).toBeLessThanOrEqual(
-      SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING,
-    );
+    expect(textElement && textElement.kind === 'text' && textElement.x).toBeGreaterThanOrEqual(SENSEBOARD_AI_CONTENT_MIN_X);
+    expect(textElement && textElement.kind === 'text' && textElement.x).toBeLessThanOrEqual(SENSEBOARD_AI_CONTENT_MAX_X);
     expect(textElement && textElement.kind === 'text' && textElement.y).toBeLessThanOrEqual(
       SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING,
     );
@@ -110,8 +117,8 @@ describe('board-state reducer', () => {
     const lineElement = state.elements['oob-line'];
     if (lineElement && lineElement.kind === 'line') {
       lineElement.points.forEach(([x, y]) => {
-        expect(x).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
-        expect(x).toBeLessThanOrEqual(SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING);
+        expect(x).toBeGreaterThanOrEqual(SENSEBOARD_AI_CONTENT_MIN_X);
+        expect(x).toBeLessThanOrEqual(SENSEBOARD_AI_CONTENT_MAX_X);
         expect(y).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
         expect(y).toBeLessThanOrEqual(SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING);
       });

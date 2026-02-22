@@ -224,4 +224,25 @@ describe('canvas-surface.web', () => {
     const html = render(room, true);
     expect(html.indexOf('Low Z')).toBeLessThan(html.indexOf('High Z'));
   });
+
+  it('wraps long text labels into multiple tspans', () => {
+    const base = Date.now();
+    const room = withBoard([
+      {
+        id: 'wrap:text',
+        kind: 'text',
+        x: 120,
+        y: 120,
+        text: 'Host introduces themselves and explains a very long context line that should wrap cleanly.',
+        createdAt: base,
+        createdBy: 'ai',
+        style: {
+          fontSize: 20,
+        },
+      },
+    ]);
+
+    const html = render(room, true);
+    expect(html).toContain('<tspan');
+  });
 });

@@ -61,6 +61,8 @@ Highest to lowest:
 - Prefer stable IDs for persistent concepts to reduce churn.
 - Use short readable labels, not long paragraphs, inside board elements.
 - Keep geometry organized and visible in a normal whiteboard viewport.
+- Keep primary content inside the practical view lane:
+  x in [380, 1480], y in [40, 5600], shape width <= 980, shape height <= 720.
 - Use connectors (arrow or line) to show relationships, sequence, dependency, and causality.
 
 ## Creative Guidance
