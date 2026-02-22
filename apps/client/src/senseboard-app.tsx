@@ -183,9 +183,9 @@ export const SenseBoardApp = () => {
           windowSeconds: 30,
         }).then(() => {
           if (boardMode === 'personal') {
-            void loadPersonalBoard();
+            void loadPersonalBoard().catch(() => undefined);
           }
-        });
+        }).catch(() => undefined);
       } catch (patchError) {
         setError(patchError instanceof Error ? patchError.message : 'Failed to run AI patch.');
       }
@@ -267,9 +267,9 @@ export const SenseBoardApp = () => {
             windowSeconds: 30,
           }).then(() => {
             if (boardMode === 'personal') {
-              void loadPersonalBoard();
+              void loadPersonalBoard().catch(() => undefined);
             }
-          });
+          }).catch(() => undefined);
         }
       } catch (updateError) {
         setError(updateError instanceof Error ? updateError.message : 'Unable to update personalization.');

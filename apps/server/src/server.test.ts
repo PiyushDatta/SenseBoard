@@ -457,6 +457,83 @@ describe('server fetchHandler', () => {
     expect(roomPayload.room.board.order.length).toBeGreaterThan(0);
   });
 
+  it('falls back to diagram patch when board ops are invalid and produce no board mutation', async () => {
+    const server = await loadServerModule({
+      generateBoardOps: async () => ({
+        ops: [
+          {
+            type: 'upsertElement',
+            element: {
+              id: 'invalid-shape',
+              kind: 'not-a-real-kind',
+              createdAt: Date.now(),
+              createdBy: 'ai',
+            } as any,
+          },
+        ],
+        fingerprint: 'fp-invalid-board-ops',
+      }),
+      generateDiagramPatch: async () => ({
+        patch: {
+          topic: 'Recovered diagram',
+          diagramType: 'flowchart',
+          confidence: 0.85,
+          actions: [
+            {
+              op: 'upsertNode',
+              id: 'recover-1',
+              label: 'Recovered Node',
+              x: 140,
+              y: 120,
+            },
+            {
+              op: 'setTitle',
+              text: 'Recovered diagram',
+            },
+          ],
+          openQuestions: [],
+          conflicts: [],
+        },
+        fingerprint: 'fp-diagram-recovered',
+      }),
+    });
+
+    const response = await server.fetchHandler(
+      new Request('http://localhost/rooms/room-ai-invalid-ops/ai-patch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: 'manual' }),
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    expect(response?.status).toBe(200);
+    const payload = await response?.json();
+    expect(payload).toMatchObject({
+      applied: true,
+      patch: {
+        kind: 'diagram_patch',
+      },
+    });
+
+    const roomResponse = await server.fetchHandler(new Request('http://localhost/rooms/ROOM-AI-INVALID-OPS', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(roomResponse?.status).toBe(200);
+    const roomPayload = (await roomResponse?.json()) as {
+      room: {
+        board: {
+          order: string[];
+        };
+      };
+    };
+    expect(roomPayload.room.board.order.length).toBeGreaterThan(0);
+  });
+
   it('accepts multipart audio transcription and appends transcript to room state', async () => {
     const server = await loadServerModule({
       transcribeAudioBlob: async () => ({

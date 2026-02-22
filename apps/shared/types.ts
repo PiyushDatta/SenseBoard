@@ -371,4 +371,5 @@ export interface TriggerPatchRequest {
   reason: 'tick' | 'correction' | 'context' | 'regenerate' | 'manual';
   regenerate?: boolean;
   windowSeconds?: number;
+  transcriptChunkCount?: number;
 }

@@ -117,9 +117,17 @@ const hasUsefulTranscriptSignal = (text: string): boolean => {
   return true;
 };
 
-const buildTranscriptWindow = (chunks: TranscriptChunk[], threshold: number): string[] => {
+const buildTranscriptWindow = (
+  chunks: TranscriptChunk[],
+  threshold: number,
+  transcriptChunkCount?: number,
+): string[] => {
   const lines: Array<{ speaker: string; text: string }> = [];
-  const windowChunks = chunks
+  const cappedChunks =
+    typeof transcriptChunkCount === 'number' && Number.isFinite(transcriptChunkCount) && transcriptChunkCount >= 0
+      ? chunks.slice(0, Math.max(0, Math.floor(transcriptChunkCount)))
+      : chunks;
+  const windowChunks = cappedChunks
     .filter((chunk) => chunk.createdAt >= threshold)
     .sort((left, right) => left.createdAt - right.createdAt);
 
@@ -181,6 +189,10 @@ const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   'Prefer sketches over prose. Use arrows/lines to connect ideas.',
   'Modality priority: corrections > pinned high context > pinned normal context > transcript.',
   'Avoid excessive text. Keep labels short. Keep coordinates in a readable range.',
+  'Hard requirement: always return board_ops JSON.',
+  'When transcriptWindow has text, never return empty ops.',
+  'When uncertain, still produce simple drawable placeholders from transcript lines.',
+  'Do not return metadata-only responses when transcriptWindow is non-empty.',
 ].join('\n');
 
 const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
@@ -189,6 +201,8 @@ const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
   'When transcriptWindow has text, return drawable ops (upsertElement/appendStrokePoints), not only metadata ops.',
   'If uncertain, draw simple labeled rectangles/text for each transcript idea rather than returning empty output.',
   'Keep updates incremental and anchored to currentBoardHint.',
+  'Use transcriptTaskChain to process cumulative tasks task1, task2, task3, ...',
+  'Each new task must build on prior board context instead of resetting the board.',
 ].join('\n');
 
 const BOARD_OPS_FALLBACK_MAX_LINES = 6;
@@ -256,6 +270,15 @@ const transcriptLineToPlainText = (line: string): string => {
   const separatorIndex = line.indexOf(':');
   const text = separatorIndex >= 0 ? line.slice(separatorIndex + 1) : line;
   return truncatePromptText(text, 180);
+};
+
+const buildTranscriptTaskChain = (lines: string[], maxTasks = 12): string[] => {
+  const limited = lines.slice(-Math.max(1, maxTasks));
+  const tasks: string[] = [];
+  for (let index = 0; index < limited.length; index += 1) {
+    tasks.push(`task${index + 1}: ${limited.slice(0, index + 1).join(' || ')}`);
+  }
+  return tasks;
 };
 
 const buildDeterministicBoardOpsFallback = (input: AIInput): BoardOp[] => {
@@ -1445,6 +1468,7 @@ const buildBoardOpsSystemPrompt = (): string => {
 
 const buildBoardOpsUserPrompt = (payload: AIInput): string => {
   const templates = getBoardOpsPromptTemplates();
+  const transcriptTaskChain = buildTranscriptTaskChain(payload.transcriptWindow);
   const input = {
     metadata: {
       roomId: payload.roomId,
@@ -1456,6 +1480,7 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
       contextPinnedHigh: payload.contextPinnedHigh,
       contextPinnedNormal: payload.contextPinnedNormal,
       transcriptWindow: payload.transcriptWindow,
+      transcriptTaskChain,
       recentChat: payload.recentChat,
     },
     visualHint: payload.visualHint,
@@ -1469,8 +1494,11 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
   };
   return [
     templates.delta,
+    'Primary objective: generate visible board drawing operations quickly.',
+    'If transcriptTaskChain has tasks, use the latest task while preserving cumulative context.',
     'Transcript mapping rule: every transcriptWindow line must map to at least one drawable operation.',
     'If transcriptWindow is not empty, output upsertElement/appendStrokePoints and not only setViewport/deleteElement metadata.',
+    'Never return empty ops when transcriptWindow has content.',
     'Generate the next sketch operations for this meeting moment.',
     'Return board_ops JSON only.',
     JSON.stringify(input, null, 2),
@@ -1843,11 +1871,14 @@ const maybeRunAnthropic = async (payload: AIInput): Promise<DiagramPatch | null>
 export const collectAiInput = (
   room: RoomState,
   windowSeconds = 30,
-  trigger: Pick<TriggerPatchRequest, 'reason' | 'regenerate'> = { reason: 'manual', regenerate: false },
+  trigger: Pick<TriggerPatchRequest, 'reason' | 'regenerate' | 'transcriptChunkCount'> = {
+    reason: 'manual',
+    regenerate: false,
+  },
 ): AIInput => {
   const now = Date.now();
   const threshold = now - windowSeconds * 1000;
-  const transcriptWindow = buildTranscriptWindow(room.transcriptChunks, threshold);
+  const transcriptWindow = buildTranscriptWindow(room.transcriptChunks, threshold, trigger.transcriptChunkCount);
 
   const recentChat = limitList(room.chatMessages, 12);
   const correctionDirectives = recentChat
@@ -2196,6 +2227,7 @@ export const generateBoardOps = async (
   const input = collectAiInput(room, request.windowSeconds ?? 30, {
     reason: request.reason,
     regenerate: request.regenerate,
+    transcriptChunkCount: request.transcriptChunkCount,
   });
   const fingerprint = `${getAiFingerprint(input)}:board_ops`;
   const systemPrompt = buildBoardOpsSystemPrompt();
@@ -2233,6 +2265,7 @@ export const generatePersonalizedBoardOps = async (
   const input = collectAiInput(room, request.windowSeconds ?? 30, {
     reason: request.reason,
     regenerate: request.regenerate,
+    transcriptChunkCount: request.transcriptChunkCount,
   });
   const normalizedContextLines = normalizePersonalizationContextLines(options.contextLines);
   const personalizationSignature = hashString(
@@ -2324,6 +2357,7 @@ export const generateDiagramPatch = async (
   const input = collectAiInput(room, request.windowSeconds ?? 30, {
     reason: request.reason,
     regenerate: request.regenerate,
+    transcriptChunkCount: request.transcriptChunkCount,
   });
   const fingerprint = getAiFingerprint(input);
   const provider = getConfiguredProvider();
@@ -2417,6 +2451,7 @@ export const createSystemPromptPayloadPreview = (room: RoomState, request: Trigg
   const payload = collectAiInput(room, request.windowSeconds ?? 30, {
     reason: request.reason,
     regenerate: request.regenerate,
+    transcriptChunkCount: request.transcriptChunkCount,
   });
   return {
     id: newId(),

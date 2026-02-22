@@ -157,14 +157,12 @@ const getRoomPathParts = (url: URL) => url.pathname.split('/').filter(Boolean);
 
 const AI_MIN_INTERVAL_MS = 2000;
 const AI_MAX_QUEUE_LENGTH = 120;
-const AI_TRANSCRIPT_DEBOUNCE_MS = 500;
 const PERSONAL_AI_MIN_INTERVAL_MS = 2500;
 const PERSONAL_AI_MAX_QUEUE_LENGTH = 120;
 const MAIN_QUEUE_WAIT_SLICE_MS = 80;
 const MAIN_QUEUE_WAIT_TIMEOUT_MS = 6000;
 const MIN_TRANSCRIBE_AUDIO_BYTES = 1024;
 const aiQueueByRoom = new Map<string, AiQueueState>();
-const transcriptDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const personalBoardStateByRoom = new Map<string, Map<string, PersonalBoardState>>();
 const personalAiQueueByKey = new Map<string, PersonalizedAiQueueState>();
 
@@ -246,6 +244,10 @@ const boardOpsContainRenderableOutput = (ops: BoardOp[]): boolean => {
   return ops.some((op) => hasRenderable(op));
 };
 
+const boardStateChanged = (before: BoardState, after: BoardState): boolean => {
+  return after.revision !== before.revision;
+};
+
 const runAiPatchRequest = async (
   roomId: string,
   request: TriggerPatchRequest,
@@ -258,12 +260,13 @@ const runAiPatchRequest = async (
     ? collectAiInput(room, windowSeconds, {
         reason,
         regenerate,
+        transcriptChunkCount: request.transcriptChunkCount,
       })
     : null;
   if (aiInputPreview) {
     const transcriptForAi = aiInputPreview.transcriptWindow.slice(-6).join(' || ');
     logDebug(
-      `Main AI input room=${room.id} reason=${reason} regenerate=${regenerate} transcriptLines=${aiInputPreview.transcriptWindow.length} text="${compactLogText(transcriptForAi, 720)}"`,
+      `Main AI input room=${room.id} reason=${reason} regenerate=${regenerate} transcriptLines=${aiInputPreview.transcriptWindow.length} transcriptCursor=${request.transcriptChunkCount ?? room.transcriptChunks.length} text="${compactLogText(transcriptForAi, 720)}"`,
     );
   }
 
@@ -290,16 +293,24 @@ const runAiPatchRequest = async (
     reason,
     regenerate,
     windowSeconds,
+    transcriptChunkCount: request.transcriptChunkCount,
   }).catch(() => null);
+  const boardAfterBoardOps = boardOpsResult ? applyBoardOps(room.board, boardOpsResult.ops) : null;
+  const boardOpsMutatedBoard = boardAfterBoardOps ? boardStateChanged(room.board, boardAfterBoardOps) : false;
 
   const shouldFallbackToDiagramPatch =
     !boardOpsResult ||
     boardOpsResult.ops.length === 0 ||
-    !boardOpsContainRenderableOutput(boardOpsResult.ops);
+    !boardOpsContainRenderableOutput(boardOpsResult.ops) ||
+    !boardOpsMutatedBoard;
 
   if (shouldFallbackToDiagramPatch) {
     if (!boardOpsResult || boardOpsResult.ops.length === 0) {
       logDebug(`Main AI board-ops result room=${room.id} reason=ai_no_response fallback=diagram_patch`);
+    } else if (!boardOpsMutatedBoard) {
+      logDebug(
+        `Main AI board-ops result room=${room.id} reason=no_effect ops=${boardOpsResult.ops.length} fallback=diagram_patch`,
+      );
     } else {
       logDebug(
         `Main AI board-ops result room=${room.id} reason=non_visual_ops_only ops=${boardOpsResult.ops.length} fallback=diagram_patch`,
@@ -309,6 +320,7 @@ const runAiPatchRequest = async (
       reason,
       regenerate,
       windowSeconds,
+      transcriptChunkCount: request.transcriptChunkCount,
     }).catch(() => null);
     if (!diagramPatchResult) {
       logDebug(`Main AI fallback room=${room.id} reason=diagram_patch_failed`);
@@ -341,12 +353,12 @@ const runAiPatchRequest = async (
     return { applied: false, reason: 'no_change' };
   }
 
-  room.board = applyBoardOps(room.board, boardOpsResult.ops);
+  room.board = boardAfterBoardOps;
   room.lastAiPatchAt = Date.now();
   room.lastAiFingerprint = boardOpsResult.fingerprint;
   room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
   logDebug(
-    `Main AI applied room=${room.id} ops=${boardOpsResult.ops.length} fingerprint=${boardOpsResult.fingerprint}`,
+    `Main AI applied room=${room.id} ops=${boardOpsResult.ops.length} elements=${room.board.order.length} fingerprint=${boardOpsResult.fingerprint}`,
   );
   broadcastSnapshot(room.id);
   return { applied: true, patch: { kind: 'board_ops', ops: boardOpsResult.ops } };
@@ -461,7 +473,7 @@ const enqueueAiPatch = (
   request: TriggerPatchRequest,
 ): Promise<{ applied: boolean; reason?: string; patch?: unknown }> => {
   const queueState = getQueueState(roomId);
-  if (request.reason === 'tick' && !request.regenerate) {
+  if (request.reason === 'tick' && !request.regenerate && request.transcriptChunkCount === undefined) {
     const pendingTick = queueState.jobs.some((job) => job.request.reason === 'tick' && !job.request.regenerate);
     if (pendingTick) {
       return Promise.resolve({ applied: false, reason: 'queued' });
@@ -487,7 +499,7 @@ const enqueuePersonalizedAiPatch = (
     return Promise.resolve({ applied: false, reason: 'missing_name' });
   }
   const queueState = getPersonalizedQueueState(roomId, normalizedMemberName);
-  if (request.reason === 'tick' && !request.regenerate) {
+  if (request.reason === 'tick' && !request.regenerate && request.transcriptChunkCount === undefined) {
     const pendingTick = queueState.jobs.some((job) => job.request.reason === 'tick' && !job.request.regenerate);
     if (pendingTick) {
       return Promise.resolve({ applied: false, reason: 'queued' });
@@ -520,30 +532,24 @@ const enqueuePersonalizedAiPatchForRoomMembers = (
   });
 };
 
-const scheduleTranscriptPatch = (roomId: string) => {
-  logDebug(`Schedule transcript AI patch room=${roomId} debounceMs=${AI_TRANSCRIPT_DEBOUNCE_MS}`);
-  const existing = transcriptDebounceTimers.get(roomId);
-  if (existing) {
-    clearTimeout(existing);
+const scheduleTranscriptPatch = (roomId: string, transcriptChunkCount?: number) => {
+  const room = getOrCreateRoom(roomId);
+  if (room.aiConfig.frozen) {
+    logDebug(`Skip transcript AI patch room=${room.id} reason=frozen`);
+    return;
   }
-  const timer = setTimeout(() => {
-    transcriptDebounceTimers.delete(roomId);
-    const room = getOrCreateRoom(roomId);
-    if (room.aiConfig.frozen) {
-      logDebug(`Skip transcript AI patch room=${room.id} reason=frozen`);
-      return;
-    }
-    logDebug(`Enqueue transcript AI patch room=${room.id} reason=tick`);
-    void enqueueAiPatch(roomId, {
-      reason: 'tick',
-      windowSeconds: 30,
-    });
-    enqueuePersonalizedAiPatchForRoomMembers(room.id, {
-      reason: 'tick',
-      windowSeconds: 30,
-    });
-  }, AI_TRANSCRIPT_DEBOUNCE_MS);
-  transcriptDebounceTimers.set(roomId, timer);
+  const cursor =
+    typeof transcriptChunkCount === 'number' && Number.isFinite(transcriptChunkCount)
+      ? Math.max(0, Math.floor(transcriptChunkCount))
+      : room.transcriptChunks.length;
+  logDebug(`Enqueue transcript AI patch room=${room.id} reason=tick transcriptCursor=${cursor}`);
+  const request: TriggerPatchRequest = {
+    reason: 'tick',
+    windowSeconds: 30,
+    transcriptChunkCount: cursor,
+  };
+  void enqueueAiPatch(room.id, request);
+  enqueuePersonalizedAiPatchForRoomMembers(room.id, request);
 };
 
 export const fetchHandler = async (
@@ -674,12 +680,19 @@ export const fetchHandler = async (
       if (!memberName) {
         return json({ error: 'name is required' }, 400);
       }
-      const result = await enqueuePersonalizedAiPatch(roomId, memberName, {
+      const queueRequest: TriggerPatchRequest = {
         reason: payload.reason ?? 'manual',
         regenerate: Boolean(payload.regenerate),
         windowSeconds: payload.windowSeconds ?? 30,
+      };
+      logDebug(
+        `Personal AI enqueue requested room=${roomId} member=${memberName} reason=${queueRequest.reason ?? 'manual'} regenerate=${Boolean(queueRequest.regenerate)}`,
+      );
+      void enqueuePersonalizedAiPatch(roomId, memberName, queueRequest).catch(() => undefined);
+      return json({
+        applied: false,
+        reason: 'queued',
       });
-      return json(result);
     }
 
     if (pathParts[0] === 'rooms' && pathParts[2] === 'ai-patch' && request.method === 'POST') {
@@ -785,7 +798,7 @@ export const fetchHandler = async (
         `Transcription accepted room=${room.id} speaker=${speaker} provider=${transcription.provider ?? 'unknown'} text="${compactLogText(text)}"`,
       );
 
-      scheduleTranscriptPatch(room.id);
+      scheduleTranscriptPatch(room.id, room.transcriptChunks.length);
       broadcastSnapshot(room.id);
       return json({
         ok: true,
@@ -839,7 +852,7 @@ export const websocketHandler = {
       }
       applyClientMessage(room, socket.data, parsed);
       if (parsed.type === 'transcript:add') {
-        scheduleTranscriptPatch(room.id);
+        scheduleTranscriptPatch(room.id, room.transcriptChunks.length);
       }
       broadcastSnapshot(room.id);
     } catch {
@@ -920,8 +933,6 @@ export const startServer = () => {
 
 export const __resetAiQueueForTests = () => {
   aiQueueByRoom.clear();
-  transcriptDebounceTimers.forEach((timer) => clearTimeout(timer));
-  transcriptDebounceTimers.clear();
   personalAiQueueByKey.clear();
   personalBoardStateByRoom.clear();
 };
