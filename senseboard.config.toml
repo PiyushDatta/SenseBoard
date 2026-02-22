@@ -28,7 +28,7 @@ max_context_lines = 64
 provider = "auto"
 openai_model = "gpt-5"
 openai_transcription_model = "whisper-1"
-anthropic_model = "claude-opus-4-6"
+anthropic_model = "claude-haiku-4-5"
 codex_model = "gpt-5-codex"
 
 [ai.review]
