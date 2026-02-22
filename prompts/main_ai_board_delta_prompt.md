@@ -10,6 +10,8 @@ Treat transcriptWindow as immediate signal and transcriptContext as rolling memo
 - Keep IDs stable for concepts that persist over time.
 - Add labels to the shapes you draw. Important blocks should not be unlabeled.
 - Keep generated geometry within the primary view lane: x in [380,1480], y in [40,5600], width <= 980, height <= 720.
+- Keep the output envelope canonical: `kind`, `schemaVersion`, `summary`, `ops`, `text`.
+- Set `schemaVersion` to `1`.
 
 ## Creative Op Usage
 - Use richer operations when helpful:
@@ -33,6 +35,8 @@ Treat transcriptWindow as immediate signal and transcriptContext as rolling memo
 - If transcriptWindow has meaningful content, do not return empty ops.
 - If transcriptWindow has meaningful content, do not return metadata-only ops.
 - If uncertain, emit robust placeholder visuals (rectangles + short text + connectors).
+- Use canonical op keys only (`type`, `element`, `id`, `ops`, `viewport`, `points`, `style`).
+- Do not emit alias keys like `op`, `action`, `operations`, `shape`, or `item`.
 
 ## Text Overflow
 - If details cannot fit cleanly in ops, place them in top-level "text".

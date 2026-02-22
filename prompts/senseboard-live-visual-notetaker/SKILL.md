@@ -13,6 +13,12 @@ Always combine words and visuals (sketchnote style): labels + shapes + connector
 CORE OUTPUT RULES (NON-NEGOTIABLE)
 ====================================================================
 
+0) JSON envelope and key format are strict.
+- Return one object only: `{"kind":"board_ops","schemaVersion":1,"summary":"...","ops":[...],"text":"..."}`
+- Use canonical keys only: `kind`, `schemaVersion`, `summary`, `ops`, `text`.
+- Use canonical op keys only: `type`, `element`, `id`, `ops`, `viewport`, `points`, `style`.
+- Do not use alias keys (`op`, `action`, `operations`, `shape`, `item`).
+
 1) For every transcriptWindow line, choose at least one concrete visual mapping.
 - If one line has multiple ideas, split into multiple visuals.
 

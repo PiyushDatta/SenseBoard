@@ -1,49 +1,24 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from 'bun:test';
-import React from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
 
 import { createEmptyBoardState } from '../../../shared/board-state';
-import { createEmptyRoom } from '../../../shared/room-state';
-import type { BoardElement, RoomState } from '../../../shared/types';
-import { THEMES } from '../lib/theme';
-import { CanvasSurface } from './canvas-surface.web';
+import type { BoardElement, BoardState } from '../../../shared/types';
+import { boardToTldrawDraftShapes } from './canvas-surface.tldraw-adapter';
 
-const withBoard = (elements: BoardElement[], order?: string[]): RoomState => {
-  const room = createEmptyRoom('ROOM-CANVAS');
-  room.board = createEmptyBoardState();
-  const nextOrder = order ?? elements.map((element) => element.id);
-  room.board.order = nextOrder;
+const withBoard = (elements: BoardElement[], order?: string[]): BoardState => {
+  const board = createEmptyBoardState();
+  board.order = order ?? elements.map((element) => element.id);
   for (const element of elements) {
-    room.board.elements[element.id] = element;
+    board.elements[element.id] = element;
   }
-  return room;
+  return board;
 };
 
-const render = (room: RoomState, showAiNotes = true) =>
-  renderToStaticMarkup(
-    React.createElement(CanvasSurface, {
-      room,
-      focusDrawMode: false,
-      onFocusBoxSelected: () => {},
-      onFocusDrawModeChange: () => {},
-      showAiNotes,
-      theme: THEMES.light,
-    }),
-  );
-
-describe('canvas-surface.web', () => {
-  it('renders a board container and svg even when room has no elements', () => {
-    const room = createEmptyRoom('ROOM-CANVAS-EMPTY');
-    const html = render(room);
-    expect(html).toContain('<svg');
-    expect(html).toContain('cursor:grab');
-  });
-
-  it('renders all supported element kinds on the SVG board', () => {
+describe('canvas-surface tldraw adapter', () => {
+  it('maps supported board element kinds to tldraw draft shapes', () => {
     const base = Date.now();
-    const room = withBoard([
+    const board = withBoard([
       {
         id: 'shape-rect',
         kind: 'rect',
@@ -148,17 +123,18 @@ describe('canvas-surface.web', () => {
       },
     ]);
 
-    const html = render(room, true);
-    expect(html).toContain('<ellipse');
-    expect(html).toContain('Visible Label');
-    expect(html).toContain('Sticky idea');
-    expect(html).toContain('Frame Group');
-    expect(html.match(/<path/g)?.length ?? 0).toBeGreaterThanOrEqual(5);
+    const drafts = boardToTldrawDraftShapes(board, true);
+    expect(drafts.length).toBe(10);
+    expect(drafts.some((shape) => shape.kind === 'geo')).toBe(true);
+    expect(drafts.some((shape) => shape.kind === 'line')).toBe(true);
+    expect(drafts.some((shape) => shape.kind === 'arrow')).toBe(true);
+    expect(drafts.some((shape) => shape.kind === 'frame')).toBe(true);
+    expect(drafts.some((shape) => shape.kind === 'text')).toBe(true);
   });
 
-  it('hides AI notes/order text when showAiNotes is disabled', () => {
+  it('hides AI notes/order labels when showAiNotes is disabled', () => {
     const base = Date.now();
-    const room = withBoard([
+    const board = withBoard([
       {
         id: 'notes:group-1',
         kind: 'text',
@@ -188,61 +164,93 @@ describe('canvas-surface.web', () => {
       },
     ]);
 
-    const hiddenHtml = render(room, false);
-    expect(hiddenHtml).not.toContain('AI Notes');
-    expect(hiddenHtml).not.toContain('Order: A -&gt; B');
-    expect(hiddenHtml).toContain('Manual text');
+    const hidden = boardToTldrawDraftShapes(board, false);
+    const shown = boardToTldrawDraftShapes(board, true);
 
-    const shownHtml = render(room, true);
-    expect(shownHtml).toContain('AI Notes');
-    expect(shownHtml).toContain('Order: A -&gt; B');
+    expect(hidden.length).toBe(1);
+    expect(hidden[0]?.kind).toBe('text');
+    expect(hidden[0]?.kind === 'text' ? hidden[0].props.text : '').toBe('Manual text');
+
+    expect(shown.length).toBe(3);
   });
 
-  it('orders rendered elements by zIndex (ascending)', () => {
+  it('sorts drafts by zIndex before output', () => {
     const base = Date.now();
-    const low: BoardElement = {
-      id: 'z-low',
-      kind: 'text',
-      x: 10,
-      y: 10,
-      text: 'Low Z',
-      zIndex: 1,
-      createdAt: base,
-      createdBy: 'ai',
-    };
-    const high: BoardElement = {
-      id: 'z-high',
-      kind: 'text',
-      x: 10,
-      y: 30,
-      text: 'High Z',
-      zIndex: 9,
-      createdAt: base + 1,
-      createdBy: 'ai',
-    };
-    const room = withBoard([high, low], [high.id, low.id]);
-    const html = render(room, true);
-    expect(html.indexOf('Low Z')).toBeLessThan(html.indexOf('High Z'));
+    const board = withBoard(
+      [
+        {
+          id: 'z-high',
+          kind: 'text',
+          x: 10,
+          y: 30,
+          text: 'High Z',
+          zIndex: 9,
+          createdAt: base + 1,
+          createdBy: 'ai',
+        },
+        {
+          id: 'z-low',
+          kind: 'text',
+          x: 10,
+          y: 10,
+          text: 'Low Z',
+          zIndex: 1,
+          createdAt: base,
+          createdBy: 'ai',
+        },
+      ],
+      ['z-high', 'z-low'],
+    );
+
+    const drafts = boardToTldrawDraftShapes(board, true);
+    const labels = drafts
+      .filter((shape) => shape.kind === 'text')
+      .map((shape) => (shape.kind === 'text' ? shape.props.text : ''));
+
+    expect(labels).toEqual(['Low Z', 'High Z']);
   });
 
-  it('wraps long text labels into multiple tspans', () => {
+  it('converts line and stroke points to origin-relative point records', () => {
     const base = Date.now();
-    const room = withBoard([
+    const board = withBoard([
       {
-        id: 'wrap:text',
-        kind: 'text',
-        x: 120,
-        y: 120,
-        text: 'Host introduces themselves and explains a very long context line that should wrap cleanly.',
+        id: 'shape-line',
+        kind: 'line',
+        points: [
+          [100, 200],
+          [180, 240],
+          [200, 260],
+        ],
         createdAt: base,
         createdBy: 'ai',
-        style: {
-          fontSize: 20,
-        },
+      },
+      {
+        id: 'shape-stroke',
+        kind: 'stroke',
+        points: [
+          [300, 400],
+          [330, 420],
+        ],
+        createdAt: base + 1,
+        createdBy: 'ai',
       },
     ]);
 
-    const html = render(room, true);
-    expect(html).toContain('<tspan');
+    const drafts = boardToTldrawDraftShapes(board, true);
+    const line = drafts.find((shape) => shape.kind === 'line' && shape.x === 100);
+    const stroke = drafts.find((shape) => shape.kind === 'line' && shape.x === 300);
+
+    expect(line?.kind).toBe('line');
+    expect(stroke?.kind).toBe('line');
+
+    if (line?.kind === 'line') {
+      expect(line.props.points[0]).toEqual({ id: 'p0', index: 'a0', x: 0, y: 0 });
+      expect(line.props.points[1]).toEqual({ id: 'p1', index: 'a1', x: 80, y: 40 });
+    }
+
+    if (stroke?.kind === 'line') {
+      expect(stroke.props.spline).toBe('cubic');
+      expect(stroke.props.points[1]).toEqual({ id: 'p1', index: 'a1', x: 30, y: 20 });
+    }
   });
 });

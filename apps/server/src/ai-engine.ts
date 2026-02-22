@@ -198,6 +198,7 @@ const BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_system_pro
 const LEGACY_BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'DEFAULT_BOARD_OPS_SYSTEM_PROMPT.md');
 const BOARD_OPS_DELTA_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_delta_prompt.md');
 const BOARD_OPS_VISUAL_SKILL_PROMPT_PATH = join(PROMPTS_DIR, 'senseboard-live-visual-notetaker', 'SKILL.md');
+const BOARD_OPS_SCHEMA_VERSION = 1;
 
 const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   'ROLE',
@@ -207,7 +208,9 @@ const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   'OUTPUT CONTRACT',
   'Return JSON only. No markdown, no prose outside JSON, no code fences.',
   'Output exactly one object:',
-  '{"kind":"board_ops","summary":"...","ops":[...],"text":"..."}',
+  '{"kind":"board_ops","schemaVersion":1,"summary":"...","ops":[...],"text":"..."}',
+  'Use canonical keys only: kind, schemaVersion, summary, ops, text.',
+  'Do not use alias keys such as op/action/operations/shape/item.',
   '',
   'BOARD OP API (allowed ops only)',
   '- upsertElement: {type:"upsertElement", element:{id,kind,...}}',
@@ -227,6 +230,13 @@ const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   '',
   'ELEMENT KINDS',
   'stroke, rect, ellipse, diamond, triangle, sticky, frame, arrow, line, text.',
+  '',
+  'ELEMENT PAYLOAD CONTRACT',
+  '- text: {id, kind:"text", x, y, text}',
+  '- rect|ellipse|diamond|triangle: {id, kind, x, y, w, h}',
+  '- sticky: {id, kind:"sticky", x, y, w, h, text}',
+  '- frame: {id, kind:"frame", x, y, w, h, title?}',
+  '- stroke|line|arrow: {id, kind, points:[[x,y], ...]}',
   '',
   'PRIORITY AND TRUTH ORDER',
   '1) correctionDirectives',
@@ -268,6 +278,8 @@ const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
   'Use words + visuals together for each meaningful idea.',
   'Prefer grouped structures (frames/lanes/clusters) when ideas are related.',
   'Use arrows/lines for dependencies, chronology, and transformations.',
+  'Use canonical operation keys only: type, element, id, ops, viewport, points, style.',
+  'Do not emit alias keys like op/action/operations/shape/item.',
   '',
   'CREATIVE OPS',
   'Use richer operations when helpful: offsetElement, setElementGeometry, setElementStyle, setElementText, duplicateElement, setElementZIndex, alignElements, distributeElements.',
@@ -289,6 +301,10 @@ const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
 const DEFAULT_BOARD_OPS_VISUAL_SKILL_PROMPT = [
   'LIVE VISUAL NOTE-TAKER SKILL',
   'Use this visual grammar while producing board_ops output.',
+  '',
+  `Return one JSON object: {"kind":"board_ops","schemaVersion":${BOARD_OPS_SCHEMA_VERSION},"summary":"...","ops":[...],"text":"..."}.`,
+  'Use canonical keys only: kind, schemaVersion, summary, ops, text, type, element, id.',
+  'Do not use alias keys such as op/action/operations/shape/item.',
   '',
   'Always map each transcriptWindow line to at least one drawable op.',
   'When transcriptWindow has text, include at least one text element and one non-text element.',
@@ -1579,6 +1595,7 @@ const stringifyForLog = (value: unknown, maxLength = 1400): string => {
 
 interface BoardOpsEnvelope {
   kind: 'board_ops';
+  schemaVersion: number;
   summary?: string;
   text?: string;
   ops: BoardOp[];
@@ -2194,6 +2211,17 @@ const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
   if (!acceptedKind) {
     return null;
   }
+  const schemaVersionRaw =
+    (typeof candidate.schemaVersion === 'number' ? candidate.schemaVersion : null) ??
+    (typeof candidate.schemaVersion === 'string' ? Number(candidate.schemaVersion) : null) ??
+    (typeof candidate.schema_version === 'number' ? candidate.schema_version : null) ??
+    (typeof candidate.schema_version === 'string' ? Number(candidate.schema_version) : null) ??
+    (typeof candidate.version === 'number' ? candidate.version : null) ??
+    (typeof candidate.version === 'string' ? Number(candidate.version) : null);
+  const schemaVersion =
+    typeof schemaVersionRaw === 'number' && Number.isFinite(schemaVersionRaw) && schemaVersionRaw >= 1
+      ? Math.floor(schemaVersionRaw)
+      : BOARD_OPS_SCHEMA_VERSION;
   const opsSource =
     Array.isArray(candidate.ops) ? candidate.ops :
     Array.isArray(candidate.operations) ? candidate.operations :
@@ -2212,6 +2240,7 @@ const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
   }
   return {
     kind: 'board_ops',
+    schemaVersion,
     summary,
     text,
     ops: mergedOps,
@@ -2394,6 +2423,7 @@ function salvageBoardOpsEnvelopeFromRawText(rawContent: string): BoardOpsEnvelop
 
   return {
     kind: 'board_ops',
+    schemaVersion: BOARD_OPS_SCHEMA_VERSION,
     summary: summary?.slice(0, 240),
     text: text?.slice(0, 2000),
     ops: mergedOps,
@@ -2541,6 +2571,8 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
     'Use both words and visuals: include at least one text element and at least one non-text visual element when transcriptWindow has content.',
     'If any detail cannot fit in ops, put it in top-level "text".',
     'Never return empty ops when transcriptWindow has content.',
+    `Set top-level schemaVersion to ${BOARD_OPS_SCHEMA_VERSION}.`,
+    'Use canonical keys only: kind, schemaVersion, summary, ops, text, type, element.',
     'Generate the next sketch operations for this meeting moment.',
     'Return board_ops JSON only.',
     JSON.stringify(input, null, 2),

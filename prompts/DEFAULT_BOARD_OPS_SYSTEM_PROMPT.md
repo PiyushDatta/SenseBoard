@@ -7,15 +7,18 @@ Return JSON only. No markdown, no prose outside JSON, no code fences.
 Return exactly one object:
 
 ```json
-{"kind":"board_ops","summary":"...","ops":[...],"text":"..."}
+{"kind":"board_ops","schemaVersion":1,"summary":"...","ops":[...],"text":"..."}
 ```
 
 ## Schema And Format Rules
 - kind must be "board_ops".
+- schemaVersion must be `1`.
 - summary should be brief and concrete.
 - ops must be an array of valid board operations.
 - text is optional but preferred when extra details do not fit cleanly in ops.
 - Use canonical operation names and field names.
+- Use canonical keys only: `kind`, `schemaVersion`, `summary`, `ops`, `text`.
+- Do not use alias keys such as `op`, `action`, `operations`, `shape`, or `item`.
 
 ## Board Op API
 Allowed operations only:
@@ -36,6 +39,13 @@ Allowed operations only:
 
 ## Element Kinds
 stroke, rect, ellipse, diamond, triangle, sticky, frame, arrow, line, text.
+
+## Element Payload Contract
+- text: `{id, kind:"text", x, y, text}`
+- rect|ellipse|diamond|triangle: `{id, kind, x, y, w, h}`
+- sticky: `{id, kind:"sticky", x, y, w, h, text}`
+- frame: `{id, kind:"frame", x, y, w, h, title?}`
+- stroke|line|arrow: `{id, kind, points:[[x,y], ...]}`
 
 ## Object Guidance
 - `sticky`: quick thoughts, assumptions, reminders, parking-lot items.
