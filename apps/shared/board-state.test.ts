@@ -2,7 +2,8 @@
 
 import { describe, expect, it } from 'bun:test';
 
-import { applyBoardOp, applyBoardOps, createEmptyBoardState } from './board-state';
+import { applyBoardOp, applyBoardOps, clampBoardToCanvasBoundsInPlace, createEmptyBoardState } from './board-state';
+import { SENSEBOARD_CANVAS_HEIGHT, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_WIDTH } from './board-dimensions';
 import type { BoardElement } from './types';
 
 const rect = (id: string): BoardElement => ({
@@ -47,5 +48,75 @@ describe('board-state reducer', () => {
     const cleared = applyBoardOp(withElement, { type: 'clearBoard' });
     expect(cleared.order.length).toBe(0);
     expect(Object.keys(cleared.elements).length).toBe(0);
+  });
+
+  it('clamps oversized/out-of-bounds geometry into canvas bounds', () => {
+    const state = createEmptyBoardState();
+    const now = Date.now();
+    state.elements = {
+      'oob-rect': {
+        id: 'oob-rect',
+        kind: 'rect',
+        x: SENSEBOARD_CANVAS_WIDTH - 40,
+        y: -200,
+        w: 900,
+        h: 900,
+        createdAt: now,
+        createdBy: 'ai',
+      },
+      'oob-text': {
+        id: 'oob-text',
+        kind: 'text',
+        x: SENSEBOARD_CANVAS_WIDTH + 300,
+        y: SENSEBOARD_CANVAS_HEIGHT + 400,
+        text: 'out',
+        createdAt: now + 1,
+        createdBy: 'ai',
+      },
+      'oob-line': {
+        id: 'oob-line',
+        kind: 'line',
+        points: [
+          [-100, 7000],
+          [9500, -100],
+        ],
+        createdAt: now + 2,
+        createdBy: 'ai',
+      },
+    };
+    state.order = ['oob-rect', 'oob-text', 'oob-line'];
+
+    const adjusted = clampBoardToCanvasBoundsInPlace(state);
+    expect(adjusted).toBeGreaterThan(0);
+
+    const rectElement = state.elements['oob-rect'];
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.x).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.y).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.x + rectElement.w).toBeLessThanOrEqual(
+      SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING,
+    );
+    expect(rectElement && rectElement.kind === 'rect' && rectElement.y + rectElement.h).toBeLessThanOrEqual(
+      SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING,
+    );
+
+    const textElement = state.elements['oob-text'];
+    expect(textElement && textElement.kind === 'text' && textElement.x).toBeLessThanOrEqual(
+      SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING,
+    );
+    expect(textElement && textElement.kind === 'text' && textElement.y).toBeLessThanOrEqual(
+      SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING,
+    );
+
+    const lineElement = state.elements['oob-line'];
+    if (lineElement && lineElement.kind === 'line') {
+      lineElement.points.forEach(([x, y]) => {
+        expect(x).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
+        expect(x).toBeLessThanOrEqual(SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING);
+        expect(y).toBeGreaterThanOrEqual(SENSEBOARD_CANVAS_PADDING);
+        expect(y).toBeLessThanOrEqual(SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING);
+      });
+    } else {
+      expect(lineElement).toBeDefined();
+    }
   });
 });

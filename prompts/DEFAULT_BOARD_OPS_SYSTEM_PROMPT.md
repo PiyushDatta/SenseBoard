@@ -56,6 +56,8 @@ Highest to lowest:
 - Mixed modality is required: combine words and imagery together.
 - When transcriptWindow has content, include at least one text element and at least one non-text visual element.
 - Map every transcriptWindow line to at least one concrete drawable operation.
+- Label major visual blocks: each key shape/group should have visible text in or near it.
+- Avoid unlabeled boxes/icons. If a shape is important enough to draw, add a short label for it.
 - Prefer stable IDs for persistent concepts to reduce churn.
 - Use short readable labels, not long paragraphs, inside board elements.
 - Keep geometry organized and visible in a normal whiteboard viewport.

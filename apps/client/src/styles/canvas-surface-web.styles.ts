@@ -1,7 +1,8 @@
 import type { CSSProperties } from 'react';
+import { SENSEBOARD_CANVAS_HEIGHT, SENSEBOARD_CANVAS_WIDTH } from '../../../shared/board-dimensions';
 
-const BOARD_WIDTH = 9000;
-const BOARD_HEIGHT = 6000;
+const BOARD_WIDTH = SENSEBOARD_CANVAS_WIDTH;
+const BOARD_HEIGHT = SENSEBOARD_CANVAS_HEIGHT;
 
 export const CANVAS_BOARD_DIMENSIONS = {
   width: BOARD_WIDTH,

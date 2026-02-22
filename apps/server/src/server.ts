@@ -1,4 +1,4 @@
-import { applyBoardOps, createEmptyBoardState } from '../../shared/board-state';
+import { applyBoardOps, clampBoardToCanvasBoundsInPlace, createEmptyBoardState } from '../../shared/board-state';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -596,10 +596,12 @@ const applyStackedBoardOps = (
   boardAfterOps: BoardState;
   shiftedCount: number;
   droppedCount: number;
+  boundaryAdjustedCount: number;
 } => {
   const shifted = shiftAiElementsDown(board, AI_LAYER_SHIFT_Y, AI_LAYER_BOUNDARY_Y);
   const layeredOps = namespaceBoardOpsForLayer(ops, createLayerId());
   const boardAfterOps = applyBoardOps(shifted.board, layeredOps);
+  const boundaryAdjustedCount = clampBoardToCanvasBoundsInPlace(boardAfterOps);
 
   return {
     shiftedBoard: shifted.board,
@@ -607,6 +609,7 @@ const applyStackedBoardOps = (
     boardAfterOps,
     shiftedCount: shifted.shiftedCount,
     droppedCount: shifted.droppedCount,
+    boundaryAdjustedCount,
   };
 };
 
@@ -710,9 +713,10 @@ const runAiPatchRequest = async (
       return { applied: false, reason: 'ai_no_response' };
     }
     room.lastAiFingerprint = `${diagramPatchResult.fingerprint}:diagram_patch`;
+    const fallbackBoundaryAdjusted = clampBoardToCanvasBoundsInPlace(room.board);
     markAiActivity(room, 'listening');
     logDebug(
-      `Main AI fallback applied room=${room.id} actions=${diagramPatchResult.patch.actions.length} fingerprint=${room.lastAiFingerprint}`,
+      `Main AI fallback applied room=${room.id} actions=${diagramPatchResult.patch.actions.length} boundaryAdjusted=${fallbackBoundaryAdjusted} fingerprint=${room.lastAiFingerprint}`,
     );
     broadcastSnapshot(room.id);
     return {
@@ -734,7 +738,7 @@ const runAiPatchRequest = async (
   room.lastAiFingerprint = boardOpsResult.fingerprint;
   markAiActivity(room, 'listening');
   logDebug(
-    `Main AI applied room=${room.id} ops=${stackedBoardOps?.layeredOps.length ?? boardOpsResult.ops.length} shifted=${stackedBoardOps?.shiftedCount ?? 0} dropped=${stackedBoardOps?.droppedCount ?? 0} elements=${room.board.order.length} fingerprint=${boardOpsResult.fingerprint}`,
+    `Main AI applied room=${room.id} ops=${stackedBoardOps?.layeredOps.length ?? boardOpsResult.ops.length} shifted=${stackedBoardOps?.shiftedCount ?? 0} dropped=${stackedBoardOps?.droppedCount ?? 0} bounded=${stackedBoardOps?.boundaryAdjustedCount ?? 0} elements=${room.board.order.length} fingerprint=${boardOpsResult.fingerprint}`,
   );
   broadcastSnapshot(room.id);
   return {
@@ -819,7 +823,7 @@ const runPersonalizedPatchRequest = async (
   personalBoardState.lastAiPatchAt = Date.now();
   personalBoardState.updatedAt = Date.now();
   logDebug(
-    `Personal AI applied room=${room.id} member=${normalizedMemberName} ops=${stackedResult.layeredOps.length} shifted=${stackedResult.shiftedCount} dropped=${stackedResult.droppedCount} fingerprint=${result.fingerprint}`,
+    `Personal AI applied room=${room.id} member=${normalizedMemberName} ops=${stackedResult.layeredOps.length} shifted=${stackedResult.shiftedCount} dropped=${stackedResult.droppedCount} bounded=${stackedResult.boundaryAdjustedCount} fingerprint=${result.fingerprint}`,
   );
   return { applied: true };
 };

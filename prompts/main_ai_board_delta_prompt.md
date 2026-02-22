@@ -8,6 +8,7 @@ Treat transcriptWindow as immediate signal and transcriptContext as rolling memo
 - Prefer grouped structures (frames, lanes, clusters) when ideas are related.
 - Use arrows and lines for chronology, dependency, feedback loops, and transformations.
 - Keep IDs stable for concepts that persist over time.
+- Add labels to the shapes you draw. Important blocks should not be unlabeled.
 
 ## Creative Op Usage
 - Use richer operations when helpful:

@@ -1986,6 +1986,199 @@ const hasTextElementOps = (ops: BoardOp[]): boolean => {
   return ops.some((op) => visit(op));
 };
 
+const flattenBoardOps = (ops: BoardOp[]): BoardOp[] => {
+  const output: BoardOp[] = [];
+  const visit = (op: BoardOp) => {
+    output.push(op);
+    if (op.type === 'batch') {
+      op.ops.forEach((nested) => visit(nested));
+    }
+  };
+  ops.forEach((op) => visit(op));
+  return output;
+};
+
+interface VisualLabelAnchor {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  hasIntrinsicText: boolean;
+}
+
+const buildVisualLabelAnchors = (ops: BoardOp[]): VisualLabelAnchor[] => {
+  const anchors: VisualLabelAnchor[] = [];
+  const flat = flattenBoardOps(ops);
+  flat.forEach((op) => {
+    if (op.type !== 'upsertElement') {
+      return;
+    }
+    const element = op.element;
+    if (
+      element.kind !== 'rect' &&
+      element.kind !== 'ellipse' &&
+      element.kind !== 'diamond' &&
+      element.kind !== 'triangle' &&
+      element.kind !== 'sticky' &&
+      element.kind !== 'frame'
+    ) {
+      return;
+    }
+    const hasIntrinsicText =
+      (element.kind === 'sticky' && element.text.trim().length > 0) ||
+      (element.kind === 'frame' && typeof element.title === 'string' && element.title.trim().length > 0);
+    anchors.push({
+      id: element.id,
+      x: element.x,
+      y: element.y,
+      w: element.w,
+      h: element.h,
+      hasIntrinsicText,
+    });
+  });
+  return anchors;
+};
+
+interface TextAnchor {
+  x: number;
+  y: number;
+}
+
+const buildTextAnchors = (ops: BoardOp[]): TextAnchor[] => {
+  const anchors: TextAnchor[] = [];
+  const flat = flattenBoardOps(ops);
+  flat.forEach((op) => {
+    if (op.type !== 'upsertElement') {
+      return;
+    }
+    if (op.element.kind === 'text') {
+      anchors.push({ x: op.element.x, y: op.element.y });
+      return;
+    }
+    if (op.element.kind === 'sticky' && op.element.text.trim().length > 0) {
+      anchors.push({ x: op.element.x + Math.min(40, op.element.w * 0.25), y: op.element.y + Math.min(40, op.element.h * 0.3) });
+      return;
+    }
+    if (op.element.kind === 'frame' && typeof op.element.title === 'string' && op.element.title.trim().length > 0) {
+      anchors.push({ x: op.element.x + 12, y: op.element.y - 8 });
+    }
+  });
+  return anchors;
+};
+
+const isTextNearVisualAnchor = (textAnchor: TextAnchor, visualAnchor: VisualLabelAnchor): boolean => {
+  const marginX = Math.max(120, visualAnchor.w * 0.55);
+  const marginY = Math.max(90, visualAnchor.h * 0.45);
+  const minX = visualAnchor.x - marginX;
+  const maxX = visualAnchor.x + visualAnchor.w + marginX;
+  const minY = visualAnchor.y - marginY;
+  const maxY = visualAnchor.y + visualAnchor.h + marginY;
+  return textAnchor.x >= minX && textAnchor.x <= maxX && textAnchor.y >= minY && textAnchor.y <= maxY;
+};
+
+const buildAutoLabelCandidates = (
+  input: AIInput,
+  summary?: string,
+  text?: string,
+): string[] => {
+  const candidates: string[] = [];
+  const push = (value: string | undefined, max = 120) => {
+    if (!value) {
+      return;
+    }
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return;
+    }
+    if (candidates.includes(normalized)) {
+      return;
+    }
+    candidates.push(truncatePromptText(normalized, max));
+  };
+
+  push(summary, 110);
+  if (text) {
+    text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .slice(0, 6)
+      .forEach((line) => push(line, 120));
+  }
+  input.transcriptWindow
+    .map(transcriptLineToPlainText)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(-8)
+    .forEach((line) => push(line, 120));
+
+  if (candidates.length === 0) {
+    push('Discussion point', 120);
+  }
+  return candidates;
+};
+
+const addAutoLabelsToOps = (
+  ops: BoardOp[],
+  input: AIInput,
+  summary?: string,
+  text?: string,
+): BoardOp[] => {
+  const visualAnchors = buildVisualLabelAnchors(ops);
+  if (visualAnchors.length === 0) {
+    return ops;
+  }
+
+  const textAnchors = buildTextAnchors(ops);
+  const unlabeledAnchors = visualAnchors.filter((anchor) => {
+    if (anchor.hasIntrinsicText) {
+      return false;
+    }
+    return !textAnchors.some((textAnchor) => isTextNearVisualAnchor(textAnchor, anchor));
+  });
+  if (unlabeledAnchors.length === 0) {
+    return ops;
+  }
+
+  const visualCount = visualAnchors.length;
+  const existingTextCount = textAnchors.length;
+  const targetTextCount = Math.max(1, Math.ceil(visualCount * 0.75));
+  const neededLabels = Math.min(10, Math.max(0, targetTextCount - existingTextCount));
+  if (neededLabels === 0) {
+    return ops;
+  }
+
+  const labelCandidates = buildAutoLabelCandidates(input, summary, text);
+  const now = Date.now();
+  const nextOps = [...ops];
+  let candidateIndex = 0;
+
+  for (let index = 0; index < unlabeledAnchors.length && index < neededLabels; index += 1) {
+    const anchor = unlabeledAnchors[index]!;
+    const label = labelCandidates[candidateIndex % labelCandidates.length]!;
+    candidateIndex += 1;
+    nextOps.push({
+      type: 'upsertElement',
+      element: {
+        id: `ai:auto:label:${anchor.id}`,
+        kind: 'text',
+        x: anchor.x + Math.min(22, Math.max(8, anchor.w * 0.1)),
+        y: anchor.y + Math.min(42, Math.max(20, anchor.h * 0.32)),
+        text: truncatePromptText(label, 130),
+        createdAt: now + index,
+        createdBy: 'ai',
+        style: {
+          fontSize: 18,
+          strokeColor: '#173650',
+        },
+      },
+    });
+  }
+
+  return nextOps.slice(0, 900);
+};
+
 const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
   if (!value || typeof value !== 'object') {
     return null;
@@ -2010,7 +2203,8 @@ const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
     Array.isArray(candidate.items) ? candidate.items :
     [];
   const ops = opsSource.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 800);
-  const text = coerceBoardText(candidate.text) ?? coerceBoardText(candidate.notes);
+  const summary = typeof candidate.summary === 'string' ? candidate.summary.slice(0, 240) : undefined;
+  const text = coerceBoardText(candidate.text) ?? coerceBoardText(candidate.notes) ?? summary;
   const textOps = text && !hasTextElementOps(ops) ? buildBoardTextOps(text) : [];
   const mergedOps = [...ops, ...textOps].slice(0, 900);
   if (mergedOps.length === 0) {
@@ -2018,7 +2212,7 @@ const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
   }
   return {
     kind: 'board_ops',
-    summary: typeof candidate.summary === 'string' ? candidate.summary.slice(0, 240) : undefined,
+    summary,
     text,
     ops: mergedOps,
   };
@@ -3095,8 +3289,9 @@ export const generateBoardOps = async (
 
   const envelope = coerceBoardOpsEnvelope(parsed);
   if (envelope && envelope.ops.length > 0) {
+    const augmentedOps = addAutoLabelsToOps(envelope.ops, input, envelope.summary, envelope.text);
     return {
-      ops: envelope.ops,
+      ops: augmentedOps,
       fingerprint,
       text: envelope.text,
     };
@@ -3161,8 +3356,9 @@ export const generatePersonalizedBoardOps = async (
 
   const envelope = coerceBoardOpsEnvelope(parsed);
   if (envelope && envelope.ops.length > 0) {
+    const augmentedOps = addAutoLabelsToOps(envelope.ops, input, envelope.summary, envelope.text);
     return {
-      ops: envelope.ops,
+      ops: augmentedOps,
       fingerprint,
       text: envelope.text,
     };

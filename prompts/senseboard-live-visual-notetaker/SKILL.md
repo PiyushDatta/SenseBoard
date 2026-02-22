@@ -25,6 +25,8 @@ CORE OUTPUT RULES (NON-NEGOTIABLE)
 - Include at least one text element.
 - Include at least one non-text visual element (rect, ellipse, diamond, triangle, sticky, frame, arrow, line, stroke).
 - Text-only output is insufficient.
+- Major visual blocks should carry labels (inside or immediately adjacent).
+- Avoid unlabeled primary shapes; add concise text for readability.
 
 4) Keep updates incremental and anchored to currentBoardHint.
 - Reuse and extend existing concepts.

@@ -1,4 +1,9 @@
 import type { BoardElement, BoardOp, BoardPoint, BoardState, BoardViewport } from './types';
+import {
+  SENSEBOARD_CANVAS_HEIGHT,
+  SENSEBOARD_CANVAS_PADDING,
+  SENSEBOARD_CANVAS_WIDTH,
+} from './board-dimensions';
 
 const MAX_COORD = 200000;
 const MAX_ELEMENTS = 1200;
@@ -724,5 +729,88 @@ export const applyBoardOps = (state: BoardState, ops: BoardOp[]): BoardState => 
     applySingleBoardOp(next, op);
   });
   return next;
+};
+
+const clampToCanvasX = (value: number) =>
+  clamp(value, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING);
+const clampToCanvasY = (value: number) =>
+  clamp(value, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING);
+
+export const clampBoardToCanvasBoundsInPlace = (state: BoardState): number => {
+  let adjustedCount = 0;
+  const maxWidth = Math.max(1, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING * 2);
+  const maxHeight = Math.max(1, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING * 2);
+
+  for (const id of Object.keys(state.elements)) {
+    const element = state.elements[id];
+    if (!element) {
+      continue;
+    }
+
+    if (element.kind === 'text') {
+      const nextX = clampToCanvasX(element.x);
+      const nextY = clampToCanvasY(element.y);
+      if (nextX !== element.x || nextY !== element.y) {
+        state.elements[id] = {
+          ...element,
+          x: nextX,
+          y: nextY,
+        };
+        adjustedCount += 1;
+      }
+      continue;
+    }
+
+    if (
+      element.kind === 'rect' ||
+      element.kind === 'ellipse' ||
+      element.kind === 'diamond' ||
+      element.kind === 'triangle' ||
+      element.kind === 'sticky' ||
+      element.kind === 'frame'
+    ) {
+      const nextW = clamp(element.w, 1, maxWidth);
+      const nextH = clamp(element.h, 1, maxHeight);
+      const nextX = clamp(element.x, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING - nextW);
+      const nextY = clamp(element.y, SENSEBOARD_CANVAS_PADDING, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING - nextH);
+      if (nextX !== element.x || nextY !== element.y || nextW !== element.w || nextH !== element.h) {
+        state.elements[id] = {
+          ...element,
+          x: nextX,
+          y: nextY,
+          w: nextW,
+          h: nextH,
+        };
+        adjustedCount += 1;
+      }
+      continue;
+    }
+
+    if (element.kind === 'stroke' || element.kind === 'line' || element.kind === 'arrow') {
+      let changed = false;
+      const nextPoints: BoardPoint[] = [];
+      for (const [x, y] of element.points) {
+        const nx = clampToCanvasX(x);
+        const ny = clampToCanvasY(y);
+        if (nx !== x || ny !== y) {
+          changed = true;
+        }
+        nextPoints.push([nx, ny]);
+      }
+      if (changed) {
+        state.elements[id] = {
+          ...element,
+          points: nextPoints,
+        };
+        adjustedCount += 1;
+      }
+    }
+  }
+
+  if (adjustedCount > 0) {
+    touch(state);
+  }
+
+  return adjustedCount;
 };
 
