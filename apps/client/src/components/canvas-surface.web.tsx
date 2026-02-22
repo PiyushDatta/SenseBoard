@@ -108,6 +108,93 @@ const renderElement = (element: BoardElement, theme: SenseTheme, showAiNotes: bo
     return <path key={element.id} d={roughPolyline(points, element.id, roughness)} fill={fill} stroke={stroke} strokeWidth={strokeWidth} />;
   }
 
+  if (element.kind === 'triangle') {
+    const points: BoardPoint[] = [
+      [element.x + element.w / 2, element.y],
+      [element.x + element.w, element.y + element.h],
+      [element.x, element.y + element.h],
+      [element.x + element.w / 2, element.y],
+    ];
+    return <path key={element.id} d={roughPolyline(points, element.id, roughness)} fill={fill} stroke={stroke} strokeWidth={strokeWidth} />;
+  }
+
+  if (element.kind === 'frame') {
+    const p = [
+      jitterPoint(element.x, element.y, `${element.id}:p1`, roughness),
+      jitterPoint(element.x + element.w, element.y, `${element.id}:p2`, roughness),
+      jitterPoint(element.x + element.w, element.y + element.h, `${element.id}:p3`, roughness),
+      jitterPoint(element.x, element.y + element.h, `${element.id}:p4`, roughness),
+      jitterPoint(element.x, element.y, `${element.id}:p5`, roughness),
+    ] as BoardPoint[];
+
+    return (
+      <g key={element.id}>
+        <path
+          d={roughPolyline(p, `${element.id}:frame`, roughness)}
+          fill="none"
+          stroke={stroke}
+          strokeWidth={strokeWidth}
+          strokeDasharray="12 8"
+        />
+        {element.title ? (
+          <text
+            x={element.x + 10}
+            y={element.y - 8}
+            fill={element.style?.strokeColor || '#1E2A34'}
+            fontSize={element.style?.fontSize ?? 16}
+            fontWeight={700}
+            fontFamily={theme.fonts.body}>
+            {element.title}
+          </text>
+        ) : null}
+      </g>
+    );
+  }
+
+  if (element.kind === 'sticky') {
+    const fold = Math.max(12, Math.min(28, Math.floor(Math.min(element.w, element.h) * 0.16)));
+    const bodyPoints: BoardPoint[] = [
+      [element.x, element.y],
+      [element.x + element.w - fold, element.y],
+      [element.x + element.w, element.y + fold],
+      [element.x + element.w, element.y + element.h],
+      [element.x, element.y + element.h],
+      [element.x, element.y],
+    ];
+    const foldPoints: BoardPoint[] = [
+      [element.x + element.w - fold, element.y],
+      [element.x + element.w - fold, element.y + fold],
+      [element.x + element.w, element.y + fold],
+      [element.x + element.w - fold, element.y],
+    ];
+
+    return (
+      <g key={element.id}>
+        <path
+          d={roughPolyline(bodyPoints, `${element.id}:body`, roughness)}
+          fill={fill === 'transparent' ? '#fff7c8' : fill}
+          stroke={stroke}
+          strokeWidth={strokeWidth}
+        />
+        <path
+          d={roughPolyline(foldPoints, `${element.id}:fold`, roughness)}
+          fill="#f2dd96"
+          stroke={stroke}
+          strokeWidth={Math.max(1, strokeWidth - 0.5)}
+        />
+        <text
+          x={element.x + 12}
+          y={element.y + 26}
+          fill={element.style?.strokeColor || '#1E2A34'}
+          fontSize={element.style?.fontSize ?? 16}
+          fontWeight={600}
+          fontFamily={theme.fonts.body}>
+          {element.text}
+        </text>
+      </g>
+    );
+  }
+
   if (element.kind === 'line' || element.kind === 'stroke') {
     return (
       <path

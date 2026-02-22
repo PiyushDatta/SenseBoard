@@ -214,16 +214,19 @@ const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
   '- appendStrokePoints: {type:"appendStrokePoints", id, points:[[x,y],...]}',
   '- deleteElement: {type:"deleteElement", id}',
   '- offsetElement: {type:"offsetElement", id, dx, dy}',
+  '- setElementGeometry: {type:"setElementGeometry", id, x?, y?, w?, h?, points?}',
   '- setElementStyle: {type:"setElementStyle", id, style:{strokeColor?,fillColor?,strokeWidth?,roughness?,fontSize?}}',
   '- setElementText: {type:"setElementText", id, text}',
   '- duplicateElement: {type:"duplicateElement", id, newId, dx?, dy?}',
   '- setElementZIndex: {type:"setElementZIndex", id, zIndex}',
+  '- alignElements: {type:"alignElements", ids:[...], axis:"left|center|right|x|top|middle|bottom|y"}',
+  '- distributeElements: {type:"distributeElements", ids:[...], axis:"horizontal|vertical|x|y", gap?}',
   '- clearBoard: {type:"clearBoard"}',
   '- setViewport: {type:"setViewport", viewport:{x?,y?,zoom?}}',
   '- batch: {type:"batch", ops:[...]}',
   '',
   'ELEMENT KINDS',
-  'stroke, rect, ellipse, diamond, arrow, line, text.',
+  'stroke, rect, ellipse, diamond, triangle, sticky, frame, arrow, line, text.',
   '',
   'PRIORITY AND TRUTH ORDER',
   '1) correctionDirectives',
@@ -267,7 +270,7 @@ const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
   'Use arrows/lines for dependencies, chronology, and transformations.',
   '',
   'CREATIVE OPS',
-  'Use richer operations when helpful: offsetElement, setElementStyle, setElementText, duplicateElement, setElementZIndex.',
+  'Use richer operations when helpful: offsetElement, setElementGeometry, setElementStyle, setElementText, duplicateElement, setElementZIndex, alignElements, distributeElements.',
   'Use batch to package coherent sub-updates.',
   '',
   'SAFETY RULES',
@@ -293,6 +296,9 @@ const DEFAULT_BOARD_OPS_VISUAL_SKILL_PROMPT = [
   '',
   'Shape recommendations:',
   '- Concepts/topics: rect + short label.',
+  '- Emphasis/warnings: triangle + short label.',
+  '- Notes/reminders: sticky + short text.',
+  '- Group boundaries: frame with optional title.',
   '- Decisions: diamond + connectors to evidence and next step.',
   '- Action items: rect container + checklist-style short text lines.',
   '- Questions/unknowns: text label prefixed with "Open Q" and a connector.',
@@ -1667,6 +1673,30 @@ const coerceBoardOp = (value: unknown): BoardOp | null => {
       dy,
     };
   }
+  if (type === 'setelementgeometry' || type === 'setgeometry' || type === 'resizeelement' || type === 'resize') {
+    if (!id) {
+      return null;
+    }
+    const points = Array.isArray(item.points)
+      ? item.points
+          .filter((point) => Array.isArray(point) && point.length >= 2)
+          .map((point) => [Number((point as unknown[])[0]), Number((point as unknown[])[1])] as [number, number])
+          .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+      : undefined;
+    return {
+      type: 'setElementGeometry',
+      id,
+      ...(toNumber(item.x) !== undefined ? { x: toNumber(item.x) } : {}),
+      ...(toNumber(item.y) !== undefined ? { y: toNumber(item.y) } : {}),
+      ...(toNumber(item.w) !== undefined || toNumber(item.width) !== undefined
+        ? { w: toNumber(item.w) ?? toNumber(item.width) }
+        : {}),
+      ...(toNumber(item.h) !== undefined || toNumber(item.height) !== undefined
+        ? { h: toNumber(item.h) ?? toNumber(item.height) }
+        : {}),
+      ...(points && points.length > 0 ? { points } : {}),
+    };
+  }
   if ((type === 'setelementstyle' || type === 'styleelement' || type === 'updatestyle') && id) {
     const style = toStylePatch(item.style ?? item.patch ?? item);
     if (!style) {
@@ -1719,6 +1749,63 @@ const coerceBoardOp = (value: unknown): BoardOp | null => {
       type: 'setElementZIndex',
       id,
       zIndex,
+    };
+  }
+  if (type === 'alignelements' || type === 'align') {
+    const idsSource =
+      Array.isArray(item.ids) ? item.ids :
+      Array.isArray(item.elementIds) ? item.elementIds :
+      Array.isArray(item.items) ? item.items :
+      [];
+    const ids = idsSource
+      .map((candidate) => (typeof candidate === 'string' ? candidate.trim() : ''))
+      .filter((candidate) => candidate.length > 0)
+      .slice(0, 240);
+    const axisRaw = typeof item.axis === 'string' ? item.axis.trim().toLowerCase() : '';
+    const axis: 'left' | 'center' | 'right' | 'x' | 'top' | 'middle' | 'bottom' | 'y' =
+      axisRaw === 'left' ||
+      axisRaw === 'center' ||
+      axisRaw === 'right' ||
+      axisRaw === 'x' ||
+      axisRaw === 'top' ||
+      axisRaw === 'middle' ||
+      axisRaw === 'bottom' ||
+      axisRaw === 'y'
+        ? (axisRaw as 'left' | 'center' | 'right' | 'x' | 'top' | 'middle' | 'bottom' | 'y')
+        : 'center';
+    if (ids.length < 2) {
+      return null;
+    }
+    return {
+      type: 'alignElements',
+      ids,
+      axis,
+    };
+  }
+  if (type === 'distributeelements' || type === 'distribute') {
+    const idsSource =
+      Array.isArray(item.ids) ? item.ids :
+      Array.isArray(item.elementIds) ? item.elementIds :
+      Array.isArray(item.items) ? item.items :
+      [];
+    const ids = idsSource
+      .map((candidate) => (typeof candidate === 'string' ? candidate.trim() : ''))
+      .filter((candidate) => candidate.length > 0)
+      .slice(0, 240);
+    const axisRaw = typeof item.axis === 'string' ? item.axis.trim().toLowerCase() : '';
+    const axis: 'horizontal' | 'vertical' | 'x' | 'y' =
+      axisRaw === 'horizontal' || axisRaw === 'vertical' || axisRaw === 'x' || axisRaw === 'y'
+        ? (axisRaw as 'horizontal' | 'vertical' | 'x' | 'y')
+        : 'horizontal';
+    if (ids.length < 3) {
+      return null;
+    }
+    const gap = toNumber(item.gap);
+    return {
+      type: 'distributeElements',
+      ids,
+      axis,
+      ...(gap !== undefined ? { gap } : {}),
     };
   }
   if (
@@ -1943,10 +2030,13 @@ const BOARD_OP_TYPE_HINTS = [
   'deleteelement',
   'clearboard',
   'offsetelement',
+  'setelementgeometry',
   'setelementstyle',
   'setelementtext',
   'duplicateelement',
   'setelementzindex',
+  'alignelements',
+  'distributeelements',
   'setviewport',
   'batch',
 ];

@@ -23,7 +23,7 @@ describe('board-state reducer', () => {
     const op = { type: 'upsertElement' as const, element: rect('a') };
     const one = applyBoardOp(base, op);
     const two = applyBoardOp(base, op);
-    expect(one).toEqual(two);
+    expect({ ...one, lastUpdatedAt: 0 }).toEqual({ ...two, lastUpdatedAt: 0 });
     expect(one.order).toEqual(['a']);
   });
 

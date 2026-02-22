@@ -373,7 +373,14 @@ const shiftElementDown = (element: BoardElement, deltaY: number): BoardElement =
       y: element.y + deltaY,
     };
   }
-  if (element.kind === 'rect' || element.kind === 'ellipse' || element.kind === 'diamond') {
+  if (
+    element.kind === 'rect' ||
+    element.kind === 'ellipse' ||
+    element.kind === 'diamond' ||
+    element.kind === 'triangle' ||
+    element.kind === 'sticky' ||
+    element.kind === 'frame'
+  ) {
     return {
       ...element,
       y: element.y + deltaY,
@@ -392,7 +399,14 @@ const isElementPastBoundary = (element: BoardElement, boundaryY: number): boolea
   if (element.kind === 'text') {
     return element.y > boundaryY;
   }
-  if (element.kind === 'rect' || element.kind === 'ellipse' || element.kind === 'diamond') {
+  if (
+    element.kind === 'rect' ||
+    element.kind === 'ellipse' ||
+    element.kind === 'diamond' ||
+    element.kind === 'triangle' ||
+    element.kind === 'sticky' ||
+    element.kind === 'frame'
+  ) {
     return element.y > boundaryY;
   }
   if (element.kind === 'line' || element.kind === 'stroke' || element.kind === 'arrow') {
@@ -506,6 +520,14 @@ const namespaceBoardOpsForLayer = (ops: BoardOp[], layerId: string): BoardOp[] =
         },
       ];
     }
+    if (op.type === 'setElementGeometry') {
+      return [
+        {
+          ...op,
+          id: toLayerId(op.id),
+        },
+      ];
+    }
     if (op.type === 'setElementText') {
       return [
         {
@@ -528,6 +550,22 @@ const namespaceBoardOpsForLayer = (ops: BoardOp[], layerId: string): BoardOp[] =
         {
           ...op,
           id: toLayerId(op.id),
+        },
+      ];
+    }
+    if (op.type === 'alignElements') {
+      return [
+        {
+          ...op,
+          ids: op.ids.map((id) => toLayerId(id)),
+        },
+      ];
+    }
+    if (op.type === 'distributeElements') {
+      return [
+        {
+          ...op,
+          ids: op.ids.map((id) => toLayerId(id)),
         },
       ];
     }

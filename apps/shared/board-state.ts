@@ -129,6 +129,132 @@ const sanitizePoint = (point: [number, number]): [number, number] => {
   return [clamp(point[0], -MAX_COORD, MAX_COORD), clamp(point[1], -MAX_COORD, MAX_COORD)];
 };
 
+const isSizedElement = (
+  element: BoardElement,
+): element is Extract<BoardElement, { kind: 'rect' | 'ellipse' | 'diamond' | 'triangle' | 'sticky' | 'frame' }> => {
+  return (
+    element.kind === 'rect' ||
+    element.kind === 'ellipse' ||
+    element.kind === 'diamond' ||
+    element.kind === 'triangle' ||
+    element.kind === 'sticky' ||
+    element.kind === 'frame'
+  );
+};
+
+const getElementBounds = (element: BoardElement): {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  centerX: number;
+  centerY: number;
+} | null => {
+  if (element.kind === 'text') {
+    return {
+      minX: element.x,
+      maxX: element.x,
+      minY: element.y,
+      maxY: element.y,
+      centerX: element.x,
+      centerY: element.y,
+    };
+  }
+  if (isSizedElement(element)) {
+    const minX = element.x;
+    const maxX = element.x + element.w;
+    const minY = element.y;
+    const maxY = element.y + element.h;
+    return {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      centerX: minX + element.w / 2,
+      centerY: minY + element.h / 2,
+    };
+  }
+  if (element.kind === 'stroke' || element.kind === 'line' || element.kind === 'arrow') {
+    if (element.points.length === 0) {
+      return null;
+    }
+    let minX = element.points[0]![0];
+    let maxX = element.points[0]![0];
+    let minY = element.points[0]![1];
+    let maxY = element.points[0]![1];
+    for (const [x, y] of element.points) {
+      if (x < minX) {
+        minX = x;
+      }
+      if (x > maxX) {
+        maxX = x;
+      }
+      if (y < minY) {
+        minY = y;
+      }
+      if (y > maxY) {
+        maxY = y;
+      }
+    }
+    return {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      centerX: (minX + maxX) / 2,
+      centerY: (minY + maxY) / 2,
+    };
+  }
+  return null;
+};
+
+const setElementGeometry = (
+  element: BoardElement,
+  patch: {
+    x?: number;
+    y?: number;
+    w?: number;
+    h?: number;
+    points?: BoardPoint[];
+  },
+): BoardElement => {
+  if (element.kind === 'text') {
+    const nextX = typeof patch.x === 'number' && Number.isFinite(patch.x) ? clamp(patch.x, -MAX_COORD, MAX_COORD) : element.x;
+    const nextY = typeof patch.y === 'number' && Number.isFinite(patch.y) ? clamp(patch.y, -MAX_COORD, MAX_COORD) : element.y;
+    return {
+      ...element,
+      x: nextX,
+      y: nextY,
+    };
+  }
+
+  if (isSizedElement(element)) {
+    const nextX = typeof patch.x === 'number' && Number.isFinite(patch.x) ? clamp(patch.x, -MAX_COORD, MAX_COORD) : element.x;
+    const nextY = typeof patch.y === 'number' && Number.isFinite(patch.y) ? clamp(patch.y, -MAX_COORD, MAX_COORD) : element.y;
+    const nextW = typeof patch.w === 'number' && Number.isFinite(patch.w) ? clamp(patch.w, 1, MAX_COORD) : element.w;
+    const nextH = typeof patch.h === 'number' && Number.isFinite(patch.h) ? clamp(patch.h, 1, MAX_COORD) : element.h;
+    return {
+      ...element,
+      x: nextX,
+      y: nextY,
+      w: nextW,
+      h: nextH,
+    };
+  }
+
+  if (element.kind === 'stroke' || element.kind === 'line' || element.kind === 'arrow') {
+    if (Array.isArray(patch.points) && patch.points.length > 0) {
+      return {
+        ...element,
+        points: patch.points.map(sanitizePoint).slice(0, 2400),
+      };
+    }
+    return element;
+  }
+
+  return element;
+};
+
 const applyElementOffset = (element: BoardElement, dx: number, dy: number): BoardElement => {
   if (element.kind === 'text') {
     return {
@@ -137,7 +263,7 @@ const applyElementOffset = (element: BoardElement, dx: number, dy: number): Boar
       y: clamp(element.y + dy, -MAX_COORD, MAX_COORD),
     };
   }
-  if (element.kind === 'rect' || element.kind === 'ellipse' || element.kind === 'diamond') {
+  if (isSizedElement(element)) {
     return {
       ...element,
       x: clamp(element.x + dx, -MAX_COORD, MAX_COORD),
@@ -183,14 +309,23 @@ const sanitizeElement = (element: BoardElement): BoardElement | null => {
   const kind =
     kindValue === 'rectangle' || kindValue === 'box'
       ? 'rect'
-      : kindValue === 'polyline'
-        ? 'line'
-        : kindValue;
+      : kindValue === 'container'
+        ? 'frame'
+        : kindValue === 'note' || kindValue === 'postit'
+          ? 'sticky'
+          : kindValue === 'triangleup' || kindValue === 'triangle-down'
+            ? 'triangle'
+        : kindValue === 'polyline'
+          ? 'line'
+          : kindValue;
   if (
     kind !== 'text' &&
     kind !== 'rect' &&
     kind !== 'ellipse' &&
     kind !== 'diamond' &&
+    kind !== 'triangle' &&
+    kind !== 'sticky' &&
+    kind !== 'frame' &&
     kind !== 'stroke' &&
     kind !== 'arrow' &&
     kind !== 'line'
@@ -219,13 +354,37 @@ const sanitizeElement = (element: BoardElement): BoardElement | null => {
       text,
     };
   }
-  if (base.kind === 'rect' || base.kind === 'ellipse' || base.kind === 'diamond') {
-    return {
+  if (
+    base.kind === 'rect' ||
+    base.kind === 'ellipse' ||
+    base.kind === 'diamond' ||
+    base.kind === 'triangle' ||
+    base.kind === 'sticky' ||
+    base.kind === 'frame'
+  ) {
+    const sanitizedBase = {
       ...base,
       x: clamp(pickNumber(raw.x, raw.left) ?? 0, -MAX_COORD, MAX_COORD),
       y: clamp(pickNumber(raw.y, raw.top) ?? 0, -MAX_COORD, MAX_COORD),
       w: clamp(pickNumber(raw.w, raw.width) ?? 1, 1, MAX_COORD),
       h: clamp(pickNumber(raw.h, raw.height) ?? 1, 1, MAX_COORD),
+    };
+    if (sanitizedBase.kind === 'sticky') {
+      const text = sanitizeText(pickString(raw.text, raw.label, raw.title, raw.content) ?? 'Sticky');
+      return {
+        ...sanitizedBase,
+        text,
+      };
+    }
+    if (sanitizedBase.kind === 'frame') {
+      const title = sanitizeText(pickString(raw.title, raw.text, raw.label) ?? '');
+      return {
+        ...sanitizedBase,
+        ...(title ? { title } : {}),
+      };
+    }
+    return {
+      ...sanitizedBase,
     };
   }
   if (base.kind === 'stroke' || base.kind === 'arrow' || base.kind === 'line') {
@@ -319,6 +478,122 @@ const applySingleBoardOp = (state: BoardState, op: BoardOp): BoardState => {
     return state;
   }
 
+  if (op.type === 'setElementGeometry') {
+    const existing = state.elements[op.id];
+    if (!existing) {
+      return state;
+    }
+    const next = setElementGeometry(existing, {
+      x: typeof op.x === 'number' && Number.isFinite(op.x) ? op.x : undefined,
+      y: typeof op.y === 'number' && Number.isFinite(op.y) ? op.y : undefined,
+      w: typeof op.w === 'number' && Number.isFinite(op.w) ? op.w : undefined,
+      h: typeof op.h === 'number' && Number.isFinite(op.h) ? op.h : undefined,
+      points: Array.isArray(op.points) ? op.points : undefined,
+    });
+    state.elements[op.id] = next;
+    touch(state);
+    return state;
+  }
+
+  if (op.type === 'alignElements') {
+    const ids = Array.from(new Set(op.ids)).filter((id) => Boolean(state.elements[id]));
+    if (ids.length < 2) {
+      return state;
+    }
+    const boundsList = ids
+      .map((id) => ({ id, bounds: getElementBounds(state.elements[id]!) }))
+      .filter((item): item is { id: string; bounds: NonNullable<ReturnType<typeof getElementBounds>> } => Boolean(item.bounds));
+    if (boundsList.length < 2) {
+      return state;
+    }
+
+    const anchorOf = (bounds: NonNullable<ReturnType<typeof getElementBounds>>): number => {
+      if (op.axis === 'left') {
+        return bounds.minX;
+      }
+      if (op.axis === 'right') {
+        return bounds.maxX;
+      }
+      if (op.axis === 'center' || op.axis === 'x') {
+        return bounds.centerX;
+      }
+      if (op.axis === 'top') {
+        return bounds.minY;
+      }
+      if (op.axis === 'bottom') {
+        return bounds.maxY;
+      }
+      return bounds.centerY;
+    };
+
+    const target = anchorOf(boundsList[0]!.bounds);
+    let changed = false;
+
+    for (const item of boundsList) {
+      const current = anchorOf(item.bounds);
+      const delta = target - current;
+      let dx = 0;
+      let dy = 0;
+      if (op.axis === 'left' || op.axis === 'right' || op.axis === 'center' || op.axis === 'x') {
+        dx = delta;
+      } else {
+        dy = delta;
+      }
+      if (dx === 0 && dy === 0) {
+        continue;
+      }
+      state.elements[item.id] = applyElementOffset(state.elements[item.id]!, dx, dy);
+      changed = true;
+    }
+    if (changed) {
+      touch(state);
+    }
+    return state;
+  }
+
+  if (op.type === 'distributeElements') {
+    const ids = Array.from(new Set(op.ids)).filter((id) => Boolean(state.elements[id]));
+    if (ids.length < 3) {
+      return state;
+    }
+    const horizontal = op.axis === 'horizontal' || op.axis === 'x';
+    const boundItems = ids
+      .map((id) => ({ id, bounds: getElementBounds(state.elements[id]!) }))
+      .filter((item): item is { id: string; bounds: NonNullable<ReturnType<typeof getElementBounds>> } => Boolean(item.bounds))
+      .sort((left, right) => (horizontal ? left.bounds.centerX - right.bounds.centerX : left.bounds.centerY - right.bounds.centerY));
+    if (boundItems.length < 3) {
+      return state;
+    }
+
+    const first = boundItems[0]!;
+    const last = boundItems[boundItems.length - 1]!;
+    const firstAnchor = horizontal ? first.bounds.centerX : first.bounds.centerY;
+    const lastAnchor = horizontal ? last.bounds.centerX : last.bounds.centerY;
+    const span = lastAnchor - firstAnchor;
+    const computedStep = span / Math.max(1, boundItems.length - 1);
+    const step =
+      typeof op.gap === 'number' && Number.isFinite(op.gap) ? clamp(op.gap, -MAX_COORD, MAX_COORD) : computedStep;
+
+    let changed = false;
+    for (let index = 1; index < boundItems.length - 1; index += 1) {
+      const item = boundItems[index]!;
+      const target = firstAnchor + step * index;
+      const current = horizontal ? item.bounds.centerX : item.bounds.centerY;
+      const delta = target - current;
+      const dx = horizontal ? delta : 0;
+      const dy = horizontal ? 0 : delta;
+      if (dx === 0 && dy === 0) {
+        continue;
+      }
+      state.elements[item.id] = applyElementOffset(state.elements[item.id]!, dx, dy);
+      changed = true;
+    }
+    if (changed) {
+      touch(state);
+    }
+    return state;
+  }
+
   if (op.type === 'setElementStyle') {
     const existing = state.elements[op.id];
     if (!existing) {
@@ -338,15 +613,40 @@ const applySingleBoardOp = (state: BoardState, op: BoardOp): BoardState => {
 
   if (op.type === 'setElementText') {
     const existing = state.elements[op.id];
-    if (!existing || existing.kind !== 'text') {
+    if (!existing) {
       return state;
     }
     const nextText = sanitizeText(op.text);
-    if (!nextText || existing.text === nextText) {
+    if (!nextText) {
       return state;
     }
-    existing.text = nextText;
-    touch(state);
+    if (existing.kind === 'text') {
+      if (existing.text === nextText) {
+        return state;
+      }
+      existing.text = nextText;
+      touch(state);
+      return state;
+    }
+    if (existing.kind === 'sticky') {
+      if (existing.text === nextText) {
+        return state;
+      }
+      existing.text = nextText;
+      touch(state);
+      return state;
+    }
+    if (existing.kind === 'frame') {
+      if ((existing.title ?? '') === nextText) {
+        return state;
+      }
+      existing.title = nextText;
+      touch(state);
+      return state;
+    }
+    if (existing.kind !== 'text' && existing.kind !== 'sticky' && existing.kind !== 'frame') {
+      return state;
+    }
     return state;
   }
 

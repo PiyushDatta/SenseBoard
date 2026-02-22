@@ -23,16 +23,26 @@ Allowed operations only:
 - appendStrokePoints: {type:"appendStrokePoints", id, points:[[x,y],...]}
 - deleteElement: {type:"deleteElement", id}
 - offsetElement: {type:"offsetElement", id, dx, dy}
+- setElementGeometry: {type:"setElementGeometry", id, x?, y?, w?, h?, points?}
 - setElementStyle: {type:"setElementStyle", id, style:{strokeColor?,fillColor?,strokeWidth?,roughness?,fontSize?}}
 - setElementText: {type:"setElementText", id, text}
 - duplicateElement: {type:"duplicateElement", id, newId, dx?, dy?}
 - setElementZIndex: {type:"setElementZIndex", id, zIndex}
+- alignElements: {type:"alignElements", ids:[...], axis:"left|center|right|x|top|middle|bottom|y"}
+- distributeElements: {type:"distributeElements", ids:[...], axis:"horizontal|vertical|x|y", gap?}
 - clearBoard: {type:"clearBoard"}
 - setViewport: {type:"setViewport", viewport:{x?,y?,zoom?}}
 - batch: {type:"batch", ops:[...]}
 
 ## Element Kinds
-stroke, rect, ellipse, diamond, arrow, line, text.
+stroke, rect, ellipse, diamond, triangle, sticky, frame, arrow, line, text.
+
+## Object Guidance
+- `sticky`: quick thoughts, assumptions, reminders, parking-lot items.
+- `frame`: topic boundary, swimlane, section container.
+- `triangle`: warning/risk marker or escalation callout.
+- `diamond`: decision point.
+- `rect` + `text`: core concept, task, or state.
 
 ## Priority Order
 Highest to lowest:

@@ -11,9 +11,16 @@ Treat transcriptWindow as immediate signal and transcriptContext as rolling memo
 
 ## Creative Op Usage
 - Use richer operations when helpful:
-  offsetElement, setElementStyle, setElementText, duplicateElement, setElementZIndex.
+  offsetElement, setElementGeometry, setElementStyle, setElementText, duplicateElement, setElementZIndex, alignElements, distributeElements.
 - Use batch for coherent sub-updates.
 - Use style and z-index changes to show hierarchy, ownership, and current focus.
+
+## Object Palette
+- Use `sticky` for loose notes, questions, reminders, assumptions.
+- Use `frame` to group related ideas into a cluster or lane.
+- Use `triangle` for warnings, risks, blockers, or caution callouts.
+- Use `diamond` for branching/decision logic.
+- Use `alignElements` and `distributeElements` for quick cleanup after adding multiple nodes.
 
 ## Incrementality
 - Anchor updates to currentBoardHint instead of hard resets.

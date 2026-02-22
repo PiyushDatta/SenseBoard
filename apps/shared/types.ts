@@ -6,7 +6,17 @@ export type ContextScope = 'global' | 'topic';
 
 export type DiagramType = 'flowchart' | 'system_blocks' | 'tree';
 
-export type BoardElementKind = 'stroke' | 'rect' | 'ellipse' | 'diamond' | 'arrow' | 'line' | 'text';
+export type BoardElementKind =
+  | 'stroke'
+  | 'rect'
+  | 'ellipse'
+  | 'diamond'
+  | 'triangle'
+  | 'sticky'
+  | 'frame'
+  | 'arrow'
+  | 'line'
+  | 'text';
 
 export interface BoardElementStyle {
   strokeColor?: string;
@@ -56,6 +66,32 @@ export interface BoardDiamondElement extends BoardElementBase {
   h: number;
 }
 
+export interface BoardTriangleElement extends BoardElementBase {
+  kind: 'triangle';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface BoardStickyElement extends BoardElementBase {
+  kind: 'sticky';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text: string;
+}
+
+export interface BoardFrameElement extends BoardElementBase {
+  kind: 'frame';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  title?: string;
+}
+
 export interface BoardArrowElement extends BoardElementBase {
   kind: 'arrow';
   points: BoardPoint[];
@@ -78,6 +114,9 @@ export type BoardElement =
   | BoardRectElement
   | BoardEllipseElement
   | BoardDiamondElement
+  | BoardTriangleElement
+  | BoardStickyElement
+  | BoardFrameElement
   | BoardArrowElement
   | BoardLineElement
   | BoardTextElement;
@@ -101,10 +140,22 @@ export type BoardOp =
   | { type: 'appendStrokePoints'; id: string; points: BoardPoint[] }
   | { type: 'deleteElement'; id: string }
   | { type: 'offsetElement'; id: string; dx: number; dy: number }
+  | { type: 'setElementGeometry'; id: string; x?: number; y?: number; w?: number; h?: number; points?: BoardPoint[] }
   | { type: 'setElementStyle'; id: string; style: Partial<BoardElementStyle> }
   | { type: 'setElementText'; id: string; text: string }
   | { type: 'duplicateElement'; id: string; newId: string; dx?: number; dy?: number }
   | { type: 'setElementZIndex'; id: string; zIndex: number }
+  | {
+      type: 'alignElements';
+      ids: string[];
+      axis: 'left' | 'center' | 'right' | 'x' | 'top' | 'middle' | 'bottom' | 'y';
+    }
+  | {
+      type: 'distributeElements';
+      ids: string[];
+      axis: 'horizontal' | 'vertical' | 'x' | 'y';
+      gap?: number;
+    }
   | { type: 'clearBoard' }
   | { type: 'setViewport'; viewport: Partial<BoardViewport> }
   | { type: 'batch'; ops: BoardOp[] };

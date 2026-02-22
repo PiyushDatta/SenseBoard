@@ -75,13 +75,23 @@ describe('canvas-surface.web', () => {
         createdBy: 'ai',
       },
       {
+        id: 'shape-triangle',
+        kind: 'triangle',
+        x: 540,
+        y: 60,
+        w: 110,
+        h: 90,
+        createdAt: base + 3,
+        createdBy: 'ai',
+      },
+      {
         id: 'shape-line',
         kind: 'line',
         points: [
           [80, 200],
           [180, 240],
         ],
-        createdAt: base + 3,
+        createdAt: base + 4,
         createdBy: 'ai',
       },
       {
@@ -92,7 +102,7 @@ describe('canvas-surface.web', () => {
           [240, 260],
           [280, 250],
         ],
-        createdAt: base + 4,
+        createdAt: base + 5,
         createdBy: 'ai',
       },
       {
@@ -102,7 +112,29 @@ describe('canvas-surface.web', () => {
           [350, 220],
           [460, 290],
         ],
-        createdAt: base + 5,
+        createdAt: base + 6,
+        createdBy: 'ai',
+      },
+      {
+        id: 'shape-sticky',
+        kind: 'sticky',
+        x: 520,
+        y: 250,
+        w: 180,
+        h: 120,
+        text: 'Sticky idea',
+        createdAt: base + 7,
+        createdBy: 'ai',
+      },
+      {
+        id: 'shape-frame',
+        kind: 'frame',
+        x: 20,
+        y: 360,
+        w: 320,
+        h: 180,
+        title: 'Frame Group',
+        createdAt: base + 8,
         createdBy: 'ai',
       },
       {
@@ -111,7 +143,7 @@ describe('canvas-surface.web', () => {
         x: 520,
         y: 210,
         text: 'Visible Label',
-        createdAt: base + 6,
+        createdAt: base + 9,
         createdBy: 'ai',
       },
     ]);
@@ -119,6 +151,8 @@ describe('canvas-surface.web', () => {
     const html = render(room, true);
     expect(html).toContain('<ellipse');
     expect(html).toContain('Visible Label');
+    expect(html).toContain('Sticky idea');
+    expect(html).toContain('Frame Group');
     expect(html.match(/<path/g)?.length ?? 0).toBeGreaterThanOrEqual(5);
   });
 
