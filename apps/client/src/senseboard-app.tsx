@@ -204,6 +204,23 @@ export const SenseBoardApp = () => {
   }, [roomId, currentRoom?.aiConfig.frozen, runAiPatch]);
 
   useEffect(() => {
+    if (!roomId) {
+      return;
+    }
+    const timer = setInterval(() => {
+      if (connected) {
+        return;
+      }
+      void getRoom(roomId)
+        .then((snapshot) => {
+          setRoom(snapshot);
+        })
+        .catch(() => undefined);
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [connected, roomId]);
+
+  useEffect(() => {
     if (!roomId || boardMode !== 'personal' || !displayName.trim()) {
       return;
     }

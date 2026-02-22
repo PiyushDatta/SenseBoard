@@ -84,11 +84,13 @@ export const useRoomSocket = ({
       const endpoint = endpointCandidates[endpointIndex]!;
       const ws = new WebSocket(endpoint);
       let opened = false;
+      let handshakeAckedOnThisSocket = false;
       const connectWatchdog = setTimeout(() => {
         if (!opened && ws.readyState !== WebSocket.OPEN) {
           ws.close();
         }
       }, 1200);
+      let handshakeWatchdog: ReturnType<typeof setTimeout> | null = null;
 
       wsRef.current = ws;
 
@@ -106,14 +108,25 @@ export const useRoomSocket = ({
           },
         };
         ws.send(JSON.stringify(ack));
+        handshakeWatchdog = setTimeout(() => {
+          if (!handshakeAckedOnThisSocket && ws.readyState === WebSocket.OPEN) {
+            errorHandlerRef.current('Realtime handshake timed out; trying next server port...');
+            ws.close();
+          }
+        }, 1500);
       };
 
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(String(event.data)) as ServerMessage;
           if (message.type === 'server:ack') {
+            handshakeAckedOnThisSocket = true;
             handshakeAckedRef.current = true;
             setConnected(true);
+            if (handshakeWatchdog) {
+              clearTimeout(handshakeWatchdog);
+              handshakeWatchdog = null;
+            }
             flushPendingMessages();
             return;
           }
@@ -135,10 +148,14 @@ export const useRoomSocket = ({
 
       ws.onclose = () => {
         clearTimeout(connectWatchdog);
+        if (handshakeWatchdog) {
+          clearTimeout(handshakeWatchdog);
+          handshakeWatchdog = null;
+        }
         setConnected(false);
         handshakeAckedRef.current = false;
         if (!disposed) {
-          if (!opened) {
+          if (!opened || !handshakeAckedOnThisSocket) {
             failedAttempts += 1;
             endpointIndexRef.current = (endpointIndex + 1) % endpointCandidates.length;
             if (failedAttempts % endpointCandidates.length === 0) {
