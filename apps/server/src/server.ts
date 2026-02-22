@@ -31,7 +31,7 @@ import {
 } from './personalization-store';
 import { getRuntimeConfig } from './runtime-config';
 import { getTranscriptionProviderLabel, transcribeAudioBlob } from './transcription';
-import type { BoardOp, BoardState, ClientMessage, TriggerPatchRequest } from '../../shared/types';
+import type { BoardElement, BoardOp, BoardState, ClientMessage, TriggerPatchRequest } from '../../shared/types';
 
 const runtimeConfig = getRuntimeConfig();
 const PREFERRED_PORT = runtimeConfig.server.port;
@@ -162,6 +162,8 @@ const PERSONAL_AI_MAX_QUEUE_LENGTH = 120;
 const MAIN_QUEUE_WAIT_SLICE_MS = 80;
 const MAIN_QUEUE_WAIT_TIMEOUT_MS = 6000;
 const MIN_TRANSCRIBE_AUDIO_BYTES = 1024;
+const AI_LAYER_SHIFT_Y = 520;
+const AI_LAYER_BOUNDARY_Y = 5600;
 const aiQueueByRoom = new Map<string, AiQueueState>();
 const personalBoardStateByRoom = new Map<string, Map<string, PersonalBoardState>>();
 const personalAiQueueByKey = new Map<string, PersonalizedAiQueueState>();
@@ -248,6 +250,175 @@ const boardStateChanged = (before: BoardState, after: BoardState): boolean => {
   return after.revision !== before.revision;
 };
 
+const createLayerId = (): string => {
+  return `layer_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const shiftElementDown = (element: BoardElement, deltaY: number): BoardElement => {
+  if (element.kind === 'text') {
+    return {
+      ...element,
+      y: element.y + deltaY,
+    };
+  }
+  if (element.kind === 'rect' || element.kind === 'ellipse' || element.kind === 'diamond') {
+    return {
+      ...element,
+      y: element.y + deltaY,
+    };
+  }
+  if (element.kind === 'line' || element.kind === 'stroke' || element.kind === 'arrow') {
+    return {
+      ...element,
+      points: element.points.map(([x, y]) => [x, y + deltaY] as [number, number]),
+    };
+  }
+  return element;
+};
+
+const isElementPastBoundary = (element: BoardElement, boundaryY: number): boolean => {
+  if (element.kind === 'text') {
+    return element.y > boundaryY;
+  }
+  if (element.kind === 'rect' || element.kind === 'ellipse' || element.kind === 'diamond') {
+    return element.y > boundaryY;
+  }
+  if (element.kind === 'line' || element.kind === 'stroke' || element.kind === 'arrow') {
+    if (element.points.length === 0) {
+      return true;
+    }
+    return element.points.every(([, y]) => y > boundaryY);
+  }
+  return false;
+};
+
+const shiftAiElementsDown = (
+  board: BoardState,
+  deltaY: number,
+  boundaryY: number,
+): {
+  board: BoardState;
+  shiftedCount: number;
+  droppedCount: number;
+} => {
+  const next = structuredClone(board);
+  const elements: BoardState['elements'] = {};
+  const order: string[] = [];
+  let shiftedCount = 0;
+  let droppedCount = 0;
+
+  for (const id of next.order) {
+    const existing = next.elements[id];
+    if (!existing) {
+      continue;
+    }
+
+    if (existing.createdBy !== 'ai') {
+      elements[id] = existing;
+      order.push(id);
+      continue;
+    }
+
+    shiftedCount += 1;
+    const shifted = shiftElementDown(existing, deltaY);
+    if (isElementPastBoundary(shifted, boundaryY)) {
+      droppedCount += 1;
+      continue;
+    }
+
+    elements[id] = shifted;
+    order.push(id);
+  }
+
+  next.elements = elements;
+  next.order = order;
+  if (shiftedCount > 0 || droppedCount > 0) {
+    next.revision += 1;
+    next.lastUpdatedAt = Date.now();
+  }
+
+  return {
+    board: next,
+    shiftedCount,
+    droppedCount,
+  };
+};
+
+const namespaceBoardOpsForLayer = (ops: BoardOp[], layerId: string): BoardOp[] => {
+  const toLayerId = (id: string) => `${layerId}:${id}`;
+  const rewrite = (op: BoardOp): BoardOp[] => {
+    if (op.type === 'clearBoard') {
+      // Preserve older layers by ignoring AI clear requests.
+      return [];
+    }
+    if (op.type === 'upsertElement') {
+      return [
+        {
+          ...op,
+          element: {
+            ...op.element,
+            id: toLayerId(op.element.id),
+          },
+        },
+      ];
+    }
+    if (op.type === 'appendStrokePoints') {
+      return [
+        {
+          ...op,
+          id: toLayerId(op.id),
+        },
+      ];
+    }
+    if (op.type === 'deleteElement') {
+      return [
+        {
+          ...op,
+          id: toLayerId(op.id),
+        },
+      ];
+    }
+    if (op.type === 'batch') {
+      const nested = op.ops.flatMap((item) => rewrite(item));
+      if (nested.length === 0) {
+        return [];
+      }
+      return [
+        {
+          type: 'batch',
+          ops: nested,
+        },
+      ];
+    }
+    return [op];
+  };
+
+  return ops.flatMap((op) => rewrite(op));
+};
+
+const applyStackedBoardOps = (
+  board: BoardState,
+  ops: BoardOp[],
+): {
+  shiftedBoard: BoardState;
+  layeredOps: BoardOp[];
+  boardAfterOps: BoardState;
+  shiftedCount: number;
+  droppedCount: number;
+} => {
+  const shifted = shiftAiElementsDown(board, AI_LAYER_SHIFT_Y, AI_LAYER_BOUNDARY_Y);
+  const layeredOps = namespaceBoardOpsForLayer(ops, createLayerId());
+  const boardAfterOps = applyBoardOps(shifted.board, layeredOps);
+
+  return {
+    shiftedBoard: shifted.board,
+    layeredOps,
+    boardAfterOps,
+    shiftedCount: shifted.shiftedCount,
+    droppedCount: shifted.droppedCount,
+  };
+};
+
 const runAiPatchRequest = async (
   roomId: string,
   request: TriggerPatchRequest,
@@ -295,13 +466,18 @@ const runAiPatchRequest = async (
     windowSeconds,
     transcriptChunkCount: request.transcriptChunkCount,
   }).catch(() => null);
-  const boardAfterBoardOps = boardOpsResult ? applyBoardOps(room.board, boardOpsResult.ops) : null;
-  const boardOpsMutatedBoard = boardAfterBoardOps ? boardStateChanged(room.board, boardAfterBoardOps) : false;
+  const stackedBoardOps = boardOpsResult ? applyStackedBoardOps(room.board, boardOpsResult.ops) : null;
+  const boardAfterBoardOps = stackedBoardOps?.boardAfterOps ?? null;
+  const boardOpsMutatedBoard =
+    stackedBoardOps && boardAfterBoardOps
+      ? boardStateChanged(stackedBoardOps.shiftedBoard, boardAfterBoardOps)
+      : false;
+  const boardOpsRenderableOutput = stackedBoardOps ? boardOpsContainRenderableOutput(stackedBoardOps.layeredOps) : false;
 
   const shouldFallbackToDiagramPatch =
     !boardOpsResult ||
     boardOpsResult.ops.length === 0 ||
-    !boardOpsContainRenderableOutput(boardOpsResult.ops) ||
+    !boardOpsRenderableOutput ||
     !boardOpsMutatedBoard;
 
   if (shouldFallbackToDiagramPatch) {
@@ -313,7 +489,7 @@ const runAiPatchRequest = async (
       );
     } else {
       logDebug(
-        `Main AI board-ops result room=${room.id} reason=non_visual_ops_only ops=${boardOpsResult.ops.length} fallback=diagram_patch`,
+        `Main AI board-ops result room=${room.id} reason=non_visual_ops_only ops=${stackedBoardOps?.layeredOps.length ?? boardOpsResult.ops.length} fallback=diagram_patch`,
       );
     }
     const diagramPatchResult = await generateDiagramPatch(room, {
@@ -353,12 +529,17 @@ const runAiPatchRequest = async (
     return { applied: false, reason: 'no_change' };
   }
 
+  if (!boardAfterBoardOps) {
+    room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
+    return { applied: false, reason: 'ai_no_response' };
+  }
+
   room.board = boardAfterBoardOps;
   room.lastAiPatchAt = Date.now();
   room.lastAiFingerprint = boardOpsResult.fingerprint;
   room.aiConfig.status = room.aiConfig.frozen ? 'frozen' : 'idle';
   logDebug(
-    `Main AI applied room=${room.id} ops=${boardOpsResult.ops.length} elements=${room.board.order.length} fingerprint=${boardOpsResult.fingerprint}`,
+    `Main AI applied room=${room.id} ops=${stackedBoardOps?.layeredOps.length ?? boardOpsResult.ops.length} shifted=${stackedBoardOps?.shiftedCount ?? 0} dropped=${stackedBoardOps?.droppedCount ?? 0} elements=${room.board.order.length} fingerprint=${boardOpsResult.fingerprint}`,
   );
   broadcastSnapshot(room.id);
   return { applied: true, patch: { kind: 'board_ops', ops: boardOpsResult.ops } };
@@ -405,17 +586,27 @@ const runPersonalizedPatchRequest = async (
     return { applied: false, reason: 'ai_no_response' };
   }
 
+  const stackedResult = applyStackedBoardOps(personalBoardState.board, result.ops);
+  const hasRenderableLayeredOps = boardOpsContainRenderableOutput(stackedResult.layeredOps);
+  const personalBoardMutated = boardStateChanged(stackedResult.shiftedBoard, stackedResult.boardAfterOps);
+  if (!hasRenderableLayeredOps || !personalBoardMutated) {
+    logDebug(
+      `Personal AI result room=${room.id} member=${normalizedMemberName} reason=no_effect layeredOps=${stackedResult.layeredOps.length}`,
+    );
+    return { applied: false, reason: 'ai_no_response' };
+  }
+
   if (!regenerate && reason === 'tick' && result.fingerprint === personalBoardState.lastAiFingerprint) {
     logDebug(`Personal AI result room=${room.id} member=${normalizedMemberName} reason=no_change`);
     return { applied: false, reason: 'no_change' };
   }
 
-  personalBoardState.board = applyBoardOps(personalBoardState.board, result.ops);
+  personalBoardState.board = stackedResult.boardAfterOps;
   personalBoardState.lastAiFingerprint = result.fingerprint;
   personalBoardState.lastAiPatchAt = Date.now();
   personalBoardState.updatedAt = Date.now();
   logDebug(
-    `Personal AI applied room=${room.id} member=${normalizedMemberName} ops=${result.ops.length} fingerprint=${result.fingerprint}`,
+    `Personal AI applied room=${room.id} member=${normalizedMemberName} ops=${stackedResult.layeredOps.length} shifted=${stackedResult.shiftedCount} dropped=${stackedResult.droppedCount} fingerprint=${result.fingerprint}`,
   );
   return { applied: true };
 };

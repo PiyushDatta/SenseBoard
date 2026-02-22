@@ -364,6 +364,146 @@ describe('server fetchHandler', () => {
     });
   });
 
+  it('stacks prior AI board layers by pushing old generations downward', async () => {
+    let generation = 0;
+    const server = await loadServerModule({
+      generateBoardOps: async () => {
+        generation += 1;
+        return {
+          ops: [
+            {
+              type: 'upsertElement',
+              element: {
+                id: 'shape-stack',
+                kind: 'rect',
+                x: 100,
+                y: 120,
+                w: 220,
+                h: 120,
+                createdAt: Date.now(),
+                createdBy: 'ai',
+              },
+            },
+          ],
+          fingerprint: `fp-stack-${generation}`,
+        };
+      },
+    });
+
+    await server.fetchHandler(
+      new Request('http://localhost/rooms/room-ai-stack/ai-patch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: 'manual', regenerate: true }),
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+    await server.fetchHandler(
+      new Request('http://localhost/rooms/room-ai-stack/ai-patch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: 'manual', regenerate: true }),
+      }),
+      {
+        upgrade: () => false,
+      },
+    );
+
+    const roomResponse = await server.fetchHandler(new Request('http://localhost/rooms/ROOM-AI-STACK', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(roomResponse?.status).toBe(200);
+    const roomPayload = (await roomResponse?.json()) as {
+      room: {
+        board: {
+          order: string[];
+          elements: Record<string, { kind: string; y?: number }>;
+        };
+      };
+    };
+
+    const ids = roomPayload.room.board.order.filter((id) => id.includes(':shape-stack'));
+    expect(ids.length).toBe(2);
+    const ys = ids
+      .map((id) => roomPayload.room.board.elements[id]?.y)
+      .filter((value): value is number => typeof value === 'number')
+      .sort((left, right) => left - right);
+
+    expect(ys).toEqual([120, 640]);
+  });
+
+  it('drops oldest stacked AI layers when they cross the board boundary', async () => {
+    let generation = 0;
+    const server = await loadServerModule({
+      generateBoardOps: async () => {
+        generation += 1;
+        return {
+          ops: [
+            {
+              type: 'upsertElement',
+              element: {
+                id: 'shape-ring',
+                kind: 'rect',
+                x: 140,
+                y: 120,
+                w: 180,
+                h: 100,
+                createdAt: Date.now(),
+                createdBy: 'ai',
+              },
+            },
+          ],
+          fingerprint: `fp-ring-${generation}`,
+        };
+      },
+    });
+
+    for (let index = 0; index < 14; index += 1) {
+      const response = await server.fetchHandler(
+        new Request('http://localhost/rooms/room-ai-ring/ai-patch', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ reason: 'manual', regenerate: true }),
+        }),
+        {
+          upgrade: () => false,
+        },
+      );
+      expect(response?.status).toBe(200);
+    }
+
+    const roomResponse = await server.fetchHandler(new Request('http://localhost/rooms/ROOM-AI-RING', { method: 'GET' }), {
+      upgrade: () => false,
+    });
+    expect(roomResponse?.status).toBe(200);
+    const roomPayload = (await roomResponse?.json()) as {
+      room: {
+        board: {
+          order: string[];
+          elements: Record<string, { kind: string; y?: number }>;
+        };
+      };
+    };
+
+    const ids = roomPayload.room.board.order.filter((id) => id.includes(':shape-ring'));
+    expect(ids.length).toBeLessThan(14);
+    expect(ids.length).toBeGreaterThan(0);
+
+    const ys = ids
+      .map((id) => roomPayload.room.board.elements[id]?.y)
+      .filter((value): value is number => typeof value === 'number');
+    expect(Math.min(...ys)).toBe(120);
+    expect(Math.max(...ys)).toBeLessThanOrEqual(5600);
+  });
+
   it('returns no_signal for tick patch when mocked AI signal is absent', async () => {
     const server = await loadServerModule({
       hasAiSignal: () => false,
