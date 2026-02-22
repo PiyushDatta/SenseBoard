@@ -19,6 +19,9 @@ interface StoredProfileRow {
 
 const FALLBACK_SQLITE_PATH = 'data/senseboard-personalization.sqlite';
 const FALLBACK_MAX_CONTEXT_LINES = 64;
+const PERSONALIZATION_FLUSH_INTERVAL_MS = 1500;
+const PERSONALIZATION_FLUSH_BATCH_SIZE = 120;
+const PERSONALIZATION_YIELD_EVERY = 24;
 
 const resolvePersonalizationConfig = () => {
   const runtimeConfig = getRuntimeConfig() as {
@@ -64,30 +67,20 @@ const parseContextLines = (value: string): string[] =>
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 
-const toStoredRow = (name: string): StoredProfileRow | null => {
-  const key = normalizeNameKey(name);
-  if (!key) {
-    return null;
-  }
-  const query = db.query<StoredProfileRow, [string]>(
-    'SELECT name_key, display_name, context_text, updated_at FROM personalization_profiles WHERE name_key = ?1',
-  );
-  return query.get(key) ?? null;
-};
+const selectAllProfiles = db.query<StoredProfileRow, []>(
+  'SELECT name_key, display_name, context_text, updated_at FROM personalization_profiles',
+);
 
-const upsertProfileRow = (row: StoredProfileRow) => {
-  const statement = db.query(
-    `
-      INSERT INTO personalization_profiles (name_key, display_name, context_text, updated_at)
-      VALUES (?1, ?2, ?3, ?4)
-      ON CONFLICT(name_key) DO UPDATE SET
-        display_name = excluded.display_name,
-        context_text = excluded.context_text,
-        updated_at = excluded.updated_at
-    `,
-  );
-  statement.run(row.name_key, row.display_name, row.context_text, row.updated_at);
-};
+const upsertProfileStatement = db.query(
+  `
+    INSERT INTO personalization_profiles (name_key, display_name, context_text, updated_at)
+    VALUES (?1, ?2, ?3, ?4)
+    ON CONFLICT(name_key) DO UPDATE SET
+      display_name = excluded.display_name,
+      context_text = excluded.context_text,
+      updated_at = excluded.updated_at
+  `,
+);
 
 const toProfile = (row: StoredProfileRow): PersonalizationProfile => ({
   nameKey: row.name_key,
@@ -96,9 +89,135 @@ const toProfile = (row: StoredProfileRow): PersonalizationProfile => ({
   updatedAt: row.updated_at,
 });
 
+const profileCache = new Map<string, PersonalizationProfile>();
+const dirtyKeys = new Set<string>();
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushInProgress = false;
+let hydrationStarted = false;
+
+const wait = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+const cloneProfile = (profile: PersonalizationProfile): PersonalizationProfile => ({
+  nameKey: profile.nameKey,
+  displayName: profile.displayName,
+  contextLines: [...profile.contextLines],
+  updatedAt: profile.updatedAt,
+});
+
+const upsertStoredRowSync = (row: StoredProfileRow) => {
+  upsertProfileStatement.run(row.name_key, row.display_name, row.context_text, row.updated_at);
+};
+
+const markDirty = (nameKey: string) => {
+  if (!nameKey) {
+    return;
+  }
+  dirtyKeys.add(nameKey);
+  if (!flushTimer && !flushInProgress) {
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      void flushDirtyProfilesInBackground();
+    }, PERSONALIZATION_FLUSH_INTERVAL_MS);
+  }
+};
+
+const flushDirtyProfilesSync = (limit = Number.POSITIVE_INFINITY) => {
+  if (dirtyKeys.size === 0) {
+    return;
+  }
+  let processed = 0;
+  while (dirtyKeys.size > 0 && processed < limit) {
+    const iterator = dirtyKeys.values().next();
+    const key = iterator.value as string | undefined;
+    if (!key) {
+      break;
+    }
+    dirtyKeys.delete(key);
+    const profile = profileCache.get(key);
+    if (!profile) {
+      continue;
+    }
+    upsertStoredRowSync({
+      name_key: profile.nameKey,
+      display_name: profile.displayName,
+      context_text: profile.contextLines.join('\n'),
+      updated_at: profile.updatedAt,
+    });
+    processed += 1;
+  }
+};
+
+const flushDirtyProfilesInBackground = async () => {
+  if (flushInProgress || dirtyKeys.size === 0) {
+    return;
+  }
+  flushInProgress = true;
+  try {
+    flushDirtyProfilesSync(PERSONALIZATION_FLUSH_BATCH_SIZE);
+    if (dirtyKeys.size > 0) {
+      await wait(0);
+    }
+  } catch {
+    // Best-effort persistence only for demo speed.
+  } finally {
+    flushInProgress = false;
+    if (dirtyKeys.size > 0 && !flushTimer) {
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        void flushDirtyProfilesInBackground();
+      }, PERSONALIZATION_FLUSH_INTERVAL_MS);
+    }
+  }
+};
+
+const startBackgroundHydration = () => {
+  if (hydrationStarted) {
+    return;
+  }
+  hydrationStarted = true;
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const rows = selectAllProfiles.all();
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = rows[index];
+          const cached = profileCache.get(row.name_key);
+          if (!cached || cached.updatedAt < row.updated_at) {
+            profileCache.set(row.name_key, toProfile(row));
+          }
+          if ((index + 1) % PERSONALIZATION_YIELD_EVERY === 0) {
+            await wait(0);
+          }
+        }
+      } catch {
+        // Ignore hydration failures and keep running from memory.
+      }
+    })();
+  }, 0);
+};
+
+const flushOnExit = () => {
+  try {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    flushDirtyProfilesSync();
+  } catch {
+    // no-op
+  }
+};
+
+startBackgroundHydration();
+process.on('beforeExit', flushOnExit);
+process.on('exit', flushOnExit);
+
 export const getPersonalizationStorePath = (): string => config.sqlitePath;
 
-export const getPersonalizationProfile = (name: string): PersonalizationProfile => {
+const getOrCreateCachedProfile = (name: string): PersonalizationProfile => {
   const key = normalizeNameKey(name);
   if (!key) {
     return {
@@ -108,22 +227,26 @@ export const getPersonalizationProfile = (name: string): PersonalizationProfile 
       updatedAt: Date.now(),
     };
   }
-
-  const existing = toStoredRow(name);
+  const existing = profileCache.get(key);
   if (existing) {
-    return toProfile(existing);
+    return existing;
   }
 
   const now = Date.now();
   const displayName = normalizeDisplayName(name) || 'Guest';
-  const fresh: StoredProfileRow = {
-    name_key: key,
-    display_name: displayName,
-    context_text: '',
-    updated_at: now,
+  const fresh: PersonalizationProfile = {
+    nameKey: key,
+    displayName,
+    contextLines: [],
+    updatedAt: now,
   };
-  upsertProfileRow(fresh);
-  return toProfile(fresh);
+  profileCache.set(key, fresh);
+  markDirty(key);
+  return fresh;
+};
+
+export const getPersonalizationProfile = (name: string): PersonalizationProfile => {
+  return cloneProfile(getOrCreateCachedProfile(name));
 };
 
 export const appendPersonalizationContext = (name: string, text: string): PersonalizationProfile => {
@@ -133,20 +256,21 @@ export const appendPersonalizationContext = (name: string, text: string): Person
     return getPersonalizationProfile(name);
   }
 
-  const existing = getPersonalizationProfile(name);
+  const existing = getOrCreateCachedProfile(name);
   const merged = [...existing.contextLines, normalizedText].slice(-config.maxContextLines);
   const now = Date.now();
-  const row: StoredProfileRow = {
-    name_key: key,
-    display_name: normalizeDisplayName(name) || existing.displayName || 'Guest',
-    context_text: merged.join('\n'),
-    updated_at: now,
+  const nextProfile: PersonalizationProfile = {
+    nameKey: key,
+    displayName: normalizeDisplayName(name) || existing.displayName || 'Guest',
+    contextLines: merged,
+    updatedAt: now,
   };
-  upsertProfileRow(row);
-  return toProfile(row);
+  profileCache.set(key, nextProfile);
+  markDirty(key);
+  return cloneProfile(nextProfile);
 };
 
 export const getPersonalizationPromptLines = (name: string, maxLines = 12): string[] => {
-  const profile = getPersonalizationProfile(name);
+  const profile = getOrCreateCachedProfile(name);
   return profile.contextLines.slice(-Math.max(1, maxLines));
 };

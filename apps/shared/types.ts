@@ -100,6 +100,11 @@ export type BoardOp =
   | { type: 'upsertElement'; element: BoardElement }
   | { type: 'appendStrokePoints'; id: string; points: BoardPoint[] }
   | { type: 'deleteElement'; id: string }
+  | { type: 'offsetElement'; id: string; dx: number; dy: number }
+  | { type: 'setElementStyle'; id: string; style: Partial<BoardElementStyle> }
+  | { type: 'setElementText'; id: string; text: string }
+  | { type: 'duplicateElement'; id: string; newId: string; dx?: number; dy?: number }
+  | { type: 'setElementZIndex'; id: string; zIndex: number }
   | { type: 'clearBoard' }
   | { type: 'setViewport'; viewport: Partial<BoardViewport> }
   | { type: 'batch'; ops: BoardOp[] };

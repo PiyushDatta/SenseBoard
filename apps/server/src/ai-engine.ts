@@ -24,6 +24,7 @@ interface AIInput {
     windowSeconds: number;
   };
   transcriptWindow: string[];
+  transcriptContext: string[];
   recentChat: Array<{ kind: string; text: string; author: string }>;
   corrections: string[];
   correctionDirectives: Array<{ author: string; text: string }>;
@@ -163,6 +164,28 @@ const buildTranscriptWindow = (
   return lines.slice(-24).map((line) => `${line.speaker}: ${line.text}`);
 };
 
+const buildTranscriptContext = (chunks: TranscriptChunk[], transcriptChunkCount?: number): string[] => {
+  const cappedChunks =
+    typeof transcriptChunkCount === 'number' && Number.isFinite(transcriptChunkCount) && transcriptChunkCount >= 0
+      ? chunks.slice(0, Math.max(0, Math.floor(transcriptChunkCount)))
+      : chunks;
+
+  const lines = cappedChunks
+    .slice()
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .map((chunk) => {
+      const cleaned = normalizeTranscriptText(chunk.text);
+      if (!cleaned || !hasUsefulTranscriptSignal(cleaned)) {
+        return '';
+      }
+      const speaker = chunk.speaker.trim() || 'Speaker';
+      return `${speaker}: ${cleaned}`;
+    })
+    .filter((line) => line.length > 0);
+
+  return lines.slice(-72);
+};
+
 const normalizeToken = (value: string) => value.trim().replace(/[^\w-]/g, '');
 
 const safeJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -171,38 +194,119 @@ let codexCliStatus: 'unknown' | 'ready' | 'unavailable' = 'unknown';
 const CODEX_REASONING_EFFORT = 'high';
 const ANTHROPIC_API_VERSION = '2023-06-01';
 const PROMPTS_DIR = join(process.cwd(), 'prompts');
-const BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_system_prompt.txt');
-const BOARD_OPS_DELTA_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_delta_prompt.txt');
+const BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_system_prompt.md');
+const LEGACY_BOARD_OPS_SYSTEM_PROMPT_PATH = join(PROMPTS_DIR, 'DEFAULT_BOARD_OPS_SYSTEM_PROMPT.md');
+const BOARD_OPS_DELTA_PROMPT_PATH = join(PROMPTS_DIR, 'main_ai_board_delta_prompt.md');
+const BOARD_OPS_VISUAL_SKILL_PROMPT_PATH = join(PROMPTS_DIR, 'senseboard-live-visual-notetaker', 'SKILL.md');
 
 const DEFAULT_BOARD_OPS_SYSTEM_PROMPT = [
-  'You are an AI whiteboard sketch engine.',
-  'Return JSON only. No markdown.',
-  'Output exactly one object: {"kind":"board_ops","summary":"...","ops":[...]}',
-  'Ops must use this API only:',
+  'ROLE',
+  'You are the SenseBoard board-construction engine for live conversations.',
+  'Convert spoken context into a clear, visual-plus-text board update.',
+  '',
+  'OUTPUT CONTRACT',
+  'Return JSON only. No markdown, no prose outside JSON, no code fences.',
+  'Output exactly one object:',
+  '{"kind":"board_ops","summary":"...","ops":[...],"text":"..."}',
+  '',
+  'BOARD OP API (allowed ops only)',
   '- upsertElement: {type:"upsertElement", element:{id,kind,...}}',
   '- appendStrokePoints: {type:"appendStrokePoints", id, points:[[x,y],...]}',
   '- deleteElement: {type:"deleteElement", id}',
+  '- offsetElement: {type:"offsetElement", id, dx, dy}',
+  '- setElementStyle: {type:"setElementStyle", id, style:{strokeColor?,fillColor?,strokeWidth?,roughness?,fontSize?}}',
+  '- setElementText: {type:"setElementText", id, text}',
+  '- duplicateElement: {type:"duplicateElement", id, newId, dx?, dy?}',
+  '- setElementZIndex: {type:"setElementZIndex", id, zIndex}',
   '- clearBoard: {type:"clearBoard"}',
   '- setViewport: {type:"setViewport", viewport:{x?,y?,zoom?}}',
   '- batch: {type:"batch", ops:[...]}',
-  'Element kinds: stroke, rect, ellipse, diamond, arrow, line, text.',
-  'Prefer sketches over prose. Use arrows/lines to connect ideas.',
-  'Modality priority: corrections > pinned high context > pinned normal context > transcript.',
-  'Avoid excessive text. Keep labels short. Keep coordinates in a readable range.',
-  'Hard requirement: always return board_ops JSON.',
-  'When transcriptWindow has text, never return empty ops.',
-  'When uncertain, still produce simple drawable placeholders from transcript lines.',
-  'Do not return metadata-only responses when transcriptWindow is non-empty.',
+  '',
+  'ELEMENT KINDS',
+  'stroke, rect, ellipse, diamond, arrow, line, text.',
+  '',
+  'PRIORITY AND TRUTH ORDER',
+  '1) correctionDirectives',
+  '2) pinned high context',
+  '3) pinned normal context',
+  '4) transcriptWindow',
+  '5) visualHint',
+  '',
+  'DESIGN REQUIREMENTS',
+  'Use mixed modality: include words and imagery together.',
+  'When transcriptWindow has text, include at least one text element and at least one non-text visual element.',
+  'Map each transcriptWindow line to at least one concrete drawable operation.',
+  'Prefer stable IDs for ongoing concepts; evolve board incrementally.',
+  'Use short, readable text labels (not long paragraphs) in ops.',
+  'Keep geometry organized and visible in a normal whiteboard area.',
+  'Use arrows/lines to show relationships, flow, sequence, and causality.',
+  '',
+  'STRICT FAILURE AVOIDANCE',
+  'Never return empty ops when transcriptWindow has text.',
+  'Never return metadata-only output when transcriptWindow has text.',
+  'If unsure, still output simple rect + text blocks for each idea.',
+  '',
+  'TEXT OVERFLOW RULE',
+  'If any information cannot be cleanly represented in ops, place it in top-level "text".',
+  'The "text" field should be concise bullet-ready content, not essay prose.',
+  '',
+  'CREATIVE GUIDANCE',
+  'Be visually expressive while staying legible: clusters, lanes, frames, callouts, and sequence markers are encouraged.',
+  'Use setElementStyle and zIndex intentionally to clarify hierarchy.',
 ].join('\n');
 
 const DEFAULT_BOARD_OPS_DELTA_PROMPT = [
-  'You are receiving the latest transcript/context window for a live whiteboard.',
-  'For each line in transcriptWindow, choose a concrete visual representation.',
-  'When transcriptWindow has text, return drawable ops (upsertElement/appendStrokePoints), not only metadata ops.',
-  'If uncertain, draw simple labeled rectangles/text for each transcript idea rather than returning empty output.',
-  'Keep updates incremental and anchored to currentBoardHint.',
-  'Use transcriptTaskChain to process cumulative tasks task1, task2, task3, ...',
-  'Each new task must build on prior board context instead of resetting the board.',
+  'TASK',
+  'Generate the next incremental board update from the current meeting state.',
+  'Read transcriptWindow as immediate signal and transcriptContext as rolling memory.',
+  '',
+  'MAPPING RULES',
+  'For every transcriptWindow line, emit at least one concrete visual mapping.',
+  'Use words + visuals together for each meaningful idea.',
+  'Prefer grouped structures (frames/lanes/clusters) when ideas are related.',
+  'Use arrows/lines for dependencies, chronology, and transformations.',
+  '',
+  'CREATIVE OPS',
+  'Use richer operations when helpful: offsetElement, setElementStyle, setElementText, duplicateElement, setElementZIndex.',
+  'Use batch to package coherent sub-updates.',
+  '',
+  'SAFETY RULES',
+  'If transcriptWindow has content, do not return empty ops.',
+  'If transcriptWindow has content, do not return metadata-only operations.',
+  'If uncertain, create robust placeholder visuals (rectangles + short text labels + connectors).',
+  '',
+  'OVERFLOW RULE',
+  'If details do not fit cleanly in ops, place them in top-level "text".',
+  '',
+  'INCREMENTALITY',
+  'Anchor updates to currentBoardHint and preserve continuity with existing concepts/IDs.',
+  'Use transcriptTaskChain (task1..taskN) to keep cumulative structure, not single-line reset behavior.',
+].join('\n');
+
+const DEFAULT_BOARD_OPS_VISUAL_SKILL_PROMPT = [
+  'LIVE VISUAL NOTE-TAKER SKILL',
+  'Use this visual grammar while producing board_ops output.',
+  '',
+  'Always map each transcriptWindow line to at least one drawable op.',
+  'When transcriptWindow has text, include at least one text element and one non-text element.',
+  'Prefer incremental edits anchored to currentBoardHint over full redraws.',
+  '',
+  'Shape recommendations:',
+  '- Concepts/topics: rect + short label.',
+  '- Decisions: diamond + connectors to evidence and next step.',
+  '- Action items: rect container + checklist-style short text lines.',
+  '- Questions/unknowns: text label prefixed with "Open Q" and a connector.',
+  '- Sequence/process: numbered rects connected by arrows.',
+  '- Risks/issues: warning text label + connector to mitigation/owner.',
+  '- Metrics: compact text badge with number linked to related concept.',
+  '',
+  'Connection recommendations:',
+  '- Use arrow for causality, ownership, and flow.',
+  '- Use line for weak association/grouping.',
+  '',
+  'Failsafe:',
+  '- If unsure, draw rect + 5-12 word summary + "TBD/Open Q".',
+  '- If details do not fit in ops, still draw placeholder and put overflow in top-level "text".',
 ].join('\n');
 
 const BOARD_OPS_FALLBACK_MAX_LINES = 6;
@@ -210,6 +314,7 @@ const BOARD_OPS_FALLBACK_MAX_LINES = 6;
 let cachedBoardOpsPrompts: {
   system: string;
   delta: string;
+  visualSkill: string;
 } | null = null;
 let boardOpsPromptSessionPrimed = false;
 let boardOpsPromptSessionPriming: Promise<void> | null = null;
@@ -243,16 +348,52 @@ const readPromptTemplate = (filePath: string, fallback: string, label: string): 
   }
 };
 
-const getBoardOpsPromptTemplates = (): { system: string; delta: string } => {
+const readPromptTemplateWithLegacy = (
+  preferredPath: string,
+  legacyPath: string,
+  fallback: string,
+  label: string,
+): { text: string; sourcePath: string } => {
+  const preferred = readPromptTemplate(preferredPath, '', `${label}.preferred`);
+  if (preferred.length > 0) {
+    return { text: preferred, sourcePath: preferredPath };
+  }
+  const legacy = readPromptTemplate(legacyPath, '', `${label}.legacy`);
+  if (legacy.length > 0) {
+    return { text: legacy, sourcePath: legacyPath };
+  }
+  return { text: fallback, sourcePath: '<default>' };
+};
+
+const readRequiredPromptTemplate = (filePath: string, label: string): { text: string; sourcePath: string } => {
+  if (!existsSync(filePath)) {
+    throw new Error(`Required prompt file missing for ${label}. path=${filePath}`);
+  }
+  const text = readFileSync(filePath, 'utf8').trim();
+  if (!text) {
+    throw new Error(`Required prompt file empty for ${label}. path=${filePath}`);
+  }
+  return { text, sourcePath: filePath };
+};
+
+const getBoardOpsPromptTemplates = (): { system: string; delta: string; visualSkill: string } => {
   if (cachedBoardOpsPrompts) {
     return cachedBoardOpsPrompts;
   }
+  const systemPrompt = readPromptTemplateWithLegacy(
+    BOARD_OPS_SYSTEM_PROMPT_PATH,
+    LEGACY_BOARD_OPS_SYSTEM_PROMPT_PATH,
+    DEFAULT_BOARD_OPS_SYSTEM_PROMPT,
+    'board_ops.system',
+  );
+  const visualSkillPrompt = readRequiredPromptTemplate(BOARD_OPS_VISUAL_SKILL_PROMPT_PATH, 'board_ops.visual_skill');
   cachedBoardOpsPrompts = {
-    system: readPromptTemplate(BOARD_OPS_SYSTEM_PROMPT_PATH, DEFAULT_BOARD_OPS_SYSTEM_PROMPT, 'board_ops.system'),
+    system: systemPrompt.text,
     delta: readPromptTemplate(BOARD_OPS_DELTA_PROMPT_PATH, DEFAULT_BOARD_OPS_DELTA_PROMPT, 'board_ops.delta'),
+    visualSkill: visualSkillPrompt.text,
   };
   logAiRouter(
-    `Loaded board prompts system=${BOARD_OPS_SYSTEM_PROMPT_PATH} delta=${BOARD_OPS_DELTA_PROMPT_PATH}`,
+    `Loaded board prompts system=${systemPrompt.sourcePath} delta=${BOARD_OPS_DELTA_PROMPT_PATH} visualSkill=${visualSkillPrompt.sourcePath}`,
     'debug',
   );
   return cachedBoardOpsPrompts;
@@ -404,12 +545,14 @@ const buildPersonalizedBoardOpsSystemPrompt = (options: PersonalizedBoardOptions
   return [
     templates.system,
     '',
+    templates.visualSkill,
+    '',
     'You are generating a personalized board for one participant.',
     `Participant: ${member}`,
-    'This participant prefers concise bullet-point notes over visual diagrams.',
-    'Use text-forward output: short bullet statements, compact grouping, and minimal decorative shapes.',
+    'Use mixed modality with text-forward output: short bullets plus supporting simple visuals.',
     'When transcriptWindow has content, always produce drawable operations.',
     'Clear stale personalized items if needed to keep the board focused on current discussion.',
+    'If details do not fit cleanly in ops, include them in top-level "text".',
   ].join('\n');
 };
 
@@ -432,6 +575,7 @@ const buildPersonalizedBoardOpsUserPrompt = (payload: AIInput, options: Personal
       contextPinnedHigh: payload.contextPinnedHigh,
       contextPinnedNormal: payload.contextPinnedNormal,
       transcriptWindow: payload.transcriptWindow,
+      transcriptContext: payload.transcriptContext,
       recentChat: payload.recentChat,
     },
     visualHint: payload.visualHint,
@@ -445,8 +589,10 @@ const buildPersonalizedBoardOpsUserPrompt = (payload: AIInput, options: Personal
   return [
     templates.delta,
     'Personalization directive: summarize ideas as concise bullet points for this user.',
-    'Prefer text elements and simple containers; avoid dense diagram geometry unless absolutely necessary.',
+    'Prefer text elements with simple supporting containers/links; avoid dense geometry unless necessary.',
     'Every transcript line should map to at least one bullet-style drawable operation.',
+    'Include non-text visual support (rect/line/arrow) when possible, not only text.',
+    'If something cannot be represented in ops, put it in top-level "text".',
     'Return board_ops JSON only.',
     JSON.stringify(input, null, 2),
   ].join('\n\n');
@@ -568,6 +714,7 @@ const buildBoardOpsPrimeInput = (): AIInput => ({
     windowSeconds: 30,
   },
   transcriptWindow: ['Host: Prime board drawing cache for live transcript updates.'],
+  transcriptContext: ['Host: Prime board drawing cache for live transcript updates.'],
   recentChat: [],
   corrections: [],
   correctionDirectives: [],
@@ -1274,23 +1421,138 @@ const coercePatch = (value: unknown): DiagramPatch | null => {
   };
 };
 
-const parseJsonObject = (text: string): unknown | null => {
-  const trimmed = text.trim();
+const tryParseJson = (text: string): unknown | null => {
   try {
-    return JSON.parse(trimmed);
+    return JSON.parse(text);
   } catch {
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      const slice = trimmed.slice(start, end + 1);
-      try {
-        return JSON.parse(slice);
-      } catch {
-        return null;
-      }
-    }
     return null;
   }
+};
+
+const stripMarkdownJsonFence = (text: string): string => {
+  const trimmed = text.trim();
+  const fullyWrapped = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fullyWrapped && typeof fullyWrapped[1] === 'string') {
+    return fullyWrapped[1].trim();
+  }
+  return trimmed.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+};
+
+const extractBalancedJsonSlices = (
+  text: string,
+  options?: {
+    maxSlices?: number;
+    maxChars?: number;
+    minLength?: number;
+  },
+): Array<{ start: number; slice: string }> => {
+  const maxSlices = options?.maxSlices ?? 180;
+  const maxChars = options?.maxChars ?? 220000;
+  const minLength = options?.minLength ?? 2;
+  const source = text.slice(0, maxChars);
+  const stack: Array<{ kind: '{' | '['; index: number }> = [];
+  const slices: Array<{ start: number; slice: string }> = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{' || char === '[') {
+      stack.push({ kind: char, index });
+      continue;
+    }
+    if ((char === '}' || char === ']') && stack.length > 0) {
+      const expected = char === '}' ? '{' : '[';
+      let startIndex = -1;
+      while (stack.length > 0) {
+        const top = stack.pop()!;
+        if (top.kind === expected) {
+          startIndex = top.index;
+          break;
+        }
+      }
+      if (startIndex >= 0) {
+        const slice = source.slice(startIndex, index + 1).trim();
+        if (slice.length >= minLength) {
+          slices.push({ start: startIndex, slice });
+          if (slices.length >= maxSlices) {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return slices;
+};
+
+const parseJsonObject = (text: string): unknown | null => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (value: string) => {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+
+  const fenceStripped = stripMarkdownJsonFence(trimmed);
+  pushCandidate(trimmed);
+  pushCandidate(fenceStripped);
+  pushCandidate(fenceStripped.replace(/^\s*json\s*/i, ''));
+
+  for (const candidate of candidates) {
+    const direct = tryParseJson(candidate);
+    if (direct !== null) {
+      return direct;
+    }
+
+    const slices = extractBalancedJsonSlices(candidate, {
+      maxSlices: 96,
+      maxChars: 220000,
+      minLength: 2,
+    })
+      .map((entry) => entry.slice)
+      .sort((left, right) => right.length - left.length);
+
+    for (const slice of slices) {
+      const parsed = tryParseJson(slice);
+      if (parsed !== null) {
+        return parsed;
+      }
+    }
+
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      const parsed = tryParseJson(candidate.slice(start, end + 1));
+      if (parsed !== null) {
+        return parsed;
+      }
+    }
+  }
+
+  return null;
 };
 
 const compactForLog = (value: string, maxLength = 1400): string => {
@@ -1309,66 +1571,332 @@ const stringifyForLog = (value: unknown, maxLength = 1400): string => {
   }
 };
 
-const parseJsonWithDebugLog = (providerLabel: string, rawContent: string): unknown | null => {
-  logAiRouter(`${providerLabel} JSON raw="${compactForLog(rawContent)}"`, 'debug');
-  const parsed = parseJsonObject(rawContent);
-  if (parsed === null) {
-    logAiRouter(`${providerLabel} JSON parse failed`, 'debug');
-    return null;
-  }
-  logAiRouter(`${providerLabel} JSON parsed="${stringifyForLog(parsed, 900)}"`, 'debug');
-  return parsed;
-};
-
 interface BoardOpsEnvelope {
   kind: 'board_ops';
   summary?: string;
+  text?: string;
   ops: BoardOp[];
 }
+
+const parseJsonWithDebugLog = (providerLabel: string, rawContent: string): unknown | null => {
+  logAiRouter(`${providerLabel} JSON raw="${compactForLog(rawContent)}"`, 'debug');
+  const parsed = parseJsonObject(rawContent);
+  if (parsed !== null) {
+    logAiRouter(`${providerLabel} JSON parsed="${stringifyForLog(parsed, 900)}"`, 'debug');
+    return parsed;
+  }
+
+  const salvaged = salvageBoardOpsEnvelopeFromRawText(rawContent);
+  if (salvaged) {
+    logAiRouter(`${providerLabel} JSON parse failed; salvaged board_ops envelope.`, 'debug');
+    logAiRouter(`${providerLabel} JSON salvaged="${stringifyForLog(salvaged, 900)}"`, 'debug');
+    return salvaged;
+  }
+
+  logAiRouter(`${providerLabel} JSON parse failed`, 'debug');
+  return null;
+};
 
 const coerceBoardOp = (value: unknown): BoardOp | null => {
   if (!value || typeof value !== 'object') {
     return null;
   }
   const item = value as Record<string, unknown>;
-  const type = typeof item.type === 'string' ? item.type : '';
-  if (type === 'clearBoard') {
+  const rawType =
+    (typeof item.type === 'string' ? item.type : null) ??
+    (typeof item.op === 'string' ? item.op : null) ??
+    (typeof item.action === 'string' ? item.action : null) ??
+    '';
+  const type = rawType.trim().toLowerCase();
+  const id =
+    (typeof item.id === 'string' ? item.id : null) ??
+    (typeof item.elementId === 'string' ? item.elementId : null) ??
+    (typeof item.targetId === 'string' ? item.targetId : null);
+  const toNumber = (candidate: unknown): number | undefined => {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+      return candidate;
+    }
+    if (typeof candidate === 'string') {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return undefined;
+  };
+  const toStylePatch = (candidate: unknown): Partial<NonNullable<BoardOp extends { type: 'setElementStyle'; style: infer S } ? S : never>> | null => {
+    if (!candidate || typeof candidate !== 'object') {
+      return null;
+    }
+    const styleInput = candidate as Record<string, unknown>;
+    const style: Record<string, unknown> = {};
+    if (typeof styleInput.strokeColor === 'string') {
+      style.strokeColor = styleInput.strokeColor;
+    }
+    if (typeof styleInput.fillColor === 'string') {
+      style.fillColor = styleInput.fillColor;
+    }
+    const strokeWidth = toNumber(styleInput.strokeWidth);
+    const roughness = toNumber(styleInput.roughness);
+    const fontSize = toNumber(styleInput.fontSize);
+    if (strokeWidth !== undefined) {
+      style.strokeWidth = strokeWidth;
+    }
+    if (roughness !== undefined) {
+      style.roughness = roughness;
+    }
+    if (fontSize !== undefined) {
+      style.fontSize = fontSize;
+    }
+    return Object.keys(style).length > 0 ? (style as Partial<NonNullable<BoardOp extends { type: 'setElementStyle'; style: infer S } ? S : never>>) : null;
+  };
+
+  if (type === 'clearboard' || type === 'clear' || type === 'resetboard' || type === 'reset') {
     return { type: 'clearBoard' };
   }
-  if (type === 'deleteElement' && typeof item.id === 'string') {
-    return { type: 'deleteElement', id: item.id };
+  if ((type === 'deleteelement' || type === 'delete' || type === 'removeelement' || type === 'remove') && id) {
+    return { type: 'deleteElement', id };
   }
-  if (type === 'appendStrokePoints' && typeof item.id === 'string' && Array.isArray(item.points)) {
+  if ((type === 'offsetelement' || type === 'translateelement' || type === 'moveelement' || type === 'move') && id) {
+    const dx = toNumber(item.dx) ?? toNumber(item.offsetX) ?? toNumber(item.x) ?? 0;
+    const dy = toNumber(item.dy) ?? toNumber(item.offsetY) ?? toNumber(item.y) ?? 0;
     return {
-      type: 'appendStrokePoints',
-      id: item.id,
-      points: item.points.filter((point) => Array.isArray(point) && point.length === 2) as Array<[number, number]>,
+      type: 'offsetElement',
+      id,
+      dx,
+      dy,
     };
   }
-  if (type === 'setViewport' && item.viewport && typeof item.viewport === 'object') {
-    const viewport = item.viewport as Record<string, unknown>;
+  if ((type === 'setelementstyle' || type === 'styleelement' || type === 'updatestyle') && id) {
+    const style = toStylePatch(item.style ?? item.patch ?? item);
+    if (!style) {
+      return null;
+    }
+    return {
+      type: 'setElementStyle',
+      id,
+      style,
+    };
+  }
+  if ((type === 'setelementtext' || type === 'settext' || type === 'updatetext' || type === 'label') && id) {
+    const text =
+      (typeof item.text === 'string' ? item.text : null) ??
+      (typeof item.value === 'string' ? item.value : null) ??
+      (typeof item.label === 'string' ? item.label : null);
+    if (!text) {
+      return null;
+    }
+    return {
+      type: 'setElementText',
+      id,
+      text,
+    };
+  }
+  if ((type === 'duplicateelement' || type === 'cloneelement' || type === 'duplicate' || type === 'clone') && id) {
+    const newId =
+      (typeof item.newId === 'string' ? item.newId : null) ??
+      (typeof item.cloneId === 'string' ? item.cloneId : null) ??
+      (typeof item.id2 === 'string' ? item.id2 : null);
+    if (!newId) {
+      return null;
+    }
+    const dx = toNumber(item.dx) ?? toNumber(item.offsetX) ?? 24;
+    const dy = toNumber(item.dy) ?? toNumber(item.offsetY) ?? 24;
+    return {
+      type: 'duplicateElement',
+      id,
+      newId,
+      dx,
+      dy,
+    };
+  }
+  if ((type === 'setelementzindex' || type === 'setzindex' || type === 'zindex' || type === 'layer') && id) {
+    const zIndex = toNumber(item.zIndex) ?? toNumber(item.value) ?? toNumber(item.layer);
+    if (zIndex === undefined) {
+      return null;
+    }
+    return {
+      type: 'setElementZIndex',
+      id,
+      zIndex,
+    };
+  }
+  if (
+    (type === 'appendstrokepoints' || type === 'appendpoints' || type === 'extendstroke') &&
+    id &&
+    Array.isArray(item.points)
+  ) {
+    return {
+      type: 'appendStrokePoints',
+      id,
+      points: item.points
+        .filter((point) => Array.isArray(point) && point.length >= 2)
+        .map((point) => [Number((point as unknown[])[0]), Number((point as unknown[])[1])] as [number, number])
+        .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1])),
+    };
+  }
+  if (type === 'setviewport' || type === 'viewport' || type === 'camera') {
+    const viewport =
+      item.viewport && typeof item.viewport === 'object'
+        ? (item.viewport as Record<string, unknown>)
+        : (item as Record<string, unknown>);
     return {
       type: 'setViewport',
       viewport: {
-        x: typeof viewport.x === 'number' ? viewport.x : undefined,
-        y: typeof viewport.y === 'number' ? viewport.y : undefined,
-        zoom: typeof viewport.zoom === 'number' ? viewport.zoom : undefined,
+        x: toNumber(viewport.x),
+        y: toNumber(viewport.y),
+        zoom: toNumber(viewport.zoom),
       },
     };
   }
-  if (type === 'upsertElement' && item.element && typeof item.element === 'object') {
+  if (
+    type === 'upsertelement' ||
+    type === 'upsert' ||
+    type === 'add' ||
+    type === 'addelement' ||
+    type === 'setelement'
+  ) {
+    const elementSource =
+      item.element && typeof item.element === 'object'
+        ? (item.element as Record<string, unknown>)
+        : item.shape && typeof item.shape === 'object'
+          ? (item.shape as Record<string, unknown>)
+          : item.node && typeof item.node === 'object'
+            ? (item.node as Record<string, unknown>)
+            : item;
+    const element = { ...elementSource } as Record<string, unknown>;
+    if (typeof element.id !== 'string' && id) {
+      element.id = id;
+    }
+    if (typeof element.kind !== 'string') {
+      const hintKind = typeof item.kind === 'string' ? item.kind : typeof item.elementKind === 'string' ? item.elementKind : '';
+      if (hintKind) {
+        element.kind = hintKind;
+      }
+    }
     return {
       type: 'upsertElement',
-      element: item.element as BoardOp extends { type: 'upsertElement'; element: infer E } ? E : never,
+      element: element as BoardOp extends { type: 'upsertElement'; element: infer E } ? E : never,
     };
   }
-  if (type === 'batch' && Array.isArray(item.ops)) {
+  if (type === 'batch' || type === 'group') {
+    const nestedOpsSource =
+      Array.isArray(item.ops) ? item.ops : Array.isArray(item.operations) ? item.operations : Array.isArray(item.items) ? item.items : [];
     return {
       type: 'batch',
-      ops: item.ops.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 600),
+      ops: nestedOpsSource.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 600),
     };
   }
   return null;
+};
+
+const coerceBoardText = (value: unknown): string | undefined => {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized.slice(0, 2000) : undefined;
+  }
+  if (Array.isArray(value)) {
+    const lines = value
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+      .filter((line) => line.length > 0);
+    if (lines.length > 0) {
+      return lines.join('\n').slice(0, 2000);
+    }
+  }
+  return undefined;
+};
+
+const buildBoardTextOps = (text: string): BoardOp[] => {
+  const normalized = text.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) {
+    return [];
+  }
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 10);
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const now = Date.now();
+  const x = 280;
+  const y = 220;
+  const lineHeight = 34;
+  const width = 980;
+  const height = Math.max(120, 50 + lineHeight * lines.length);
+  const ops: BoardOp[] = [
+    {
+      type: 'upsertElement',
+      element: {
+        id: 'ai:text:panel',
+        kind: 'rect',
+        x: x - 20,
+        y: y - 40,
+        w: width,
+        h: height,
+        createdAt: now,
+        createdBy: 'ai',
+        style: {
+          strokeColor: '#2f4f6b',
+          fillColor: '#eef5ff',
+          strokeWidth: 2,
+          roughness: 1.2,
+        },
+      },
+    },
+    {
+      type: 'upsertElement',
+      element: {
+        id: 'ai:text:title',
+        kind: 'text',
+        x,
+        y: y - 8,
+        text: 'AI text notes',
+        createdAt: now + 1,
+        createdBy: 'ai',
+        style: {
+          fontSize: 22,
+          strokeColor: '#1a3d59',
+        },
+      },
+    },
+  ];
+
+  lines.forEach((line, index) => {
+    ops.push({
+      type: 'upsertElement',
+      element: {
+        id: `ai:text:line:${index}`,
+        kind: 'text',
+        x,
+        y: y + 28 + index * lineHeight,
+        text: `- ${line}`.slice(0, 220),
+        createdAt: now + 2 + index,
+        createdBy: 'ai',
+        style: {
+          fontSize: 18,
+          strokeColor: '#173650',
+        },
+      },
+    });
+  });
+
+  return ops;
+};
+
+const hasTextElementOps = (ops: BoardOp[]): boolean => {
+  const visit = (op: BoardOp): boolean => {
+    if (op.type === 'upsertElement') {
+      return op.element.kind === 'text';
+    }
+    if (op.type === 'batch') {
+      return op.ops.some((nested) => visit(nested));
+    }
+    return false;
+  };
+  return ops.some((op) => visit(op));
 };
 
 const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
@@ -1376,19 +1904,217 @@ const coerceBoardOpsEnvelope = (value: unknown): BoardOpsEnvelope | null => {
     return null;
   }
   const candidate = value as Record<string, unknown>;
-  if (candidate.kind !== 'board_ops' || !Array.isArray(candidate.ops)) {
+  const kindRaw = typeof candidate.kind === 'string' ? candidate.kind.trim().toLowerCase() : 'board_ops';
+  const acceptedKind =
+    kindRaw === 'board_ops' ||
+    kindRaw === 'board-ops' ||
+    kindRaw === 'boardops' ||
+    kindRaw === 'ops' ||
+    kindRaw.length === 0;
+  if (!acceptedKind) {
     return null;
   }
-  const ops = candidate.ops.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 800);
-  if (ops.length === 0) {
+  const opsSource =
+    Array.isArray(candidate.ops) ? candidate.ops :
+    Array.isArray(candidate.operations) ? candidate.operations :
+    Array.isArray(candidate.boardOps) ? candidate.boardOps :
+    Array.isArray(candidate.build_ops) ? candidate.build_ops :
+    Array.isArray(candidate.buildOps) ? candidate.buildOps :
+    Array.isArray(candidate.items) ? candidate.items :
+    [];
+  const ops = opsSource.map(coerceBoardOp).filter((op): op is BoardOp => Boolean(op)).slice(0, 800);
+  const text = coerceBoardText(candidate.text) ?? coerceBoardText(candidate.notes);
+  const textOps = text && !hasTextElementOps(ops) ? buildBoardTextOps(text) : [];
+  const mergedOps = [...ops, ...textOps].slice(0, 900);
+  if (mergedOps.length === 0) {
     return null;
   }
   return {
     kind: 'board_ops',
     summary: typeof candidate.summary === 'string' ? candidate.summary.slice(0, 240) : undefined,
-    ops,
+    text,
+    ops: mergedOps,
   };
 };
+
+const BOARD_OP_TYPE_HINTS = [
+  'upsertelement',
+  'appendstrokepoints',
+  'deleteelement',
+  'clearboard',
+  'offsetelement',
+  'setelementstyle',
+  'setelementtext',
+  'duplicateelement',
+  'setelementzindex',
+  'setviewport',
+  'batch',
+];
+
+const decodeJsonStringFragment = (value: string): string => {
+  const decoded = tryParseJson(`"${value}"`);
+  if (typeof decoded === 'string') {
+    return decoded;
+  }
+  return value
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\\/g, '\\')
+    .trim();
+};
+
+const extractJsonStringField = (text: string, fields: string[]): string | undefined => {
+  for (const field of fields) {
+    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const strict = new RegExp(`"${escapedField}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, 'i');
+    const strictMatch = text.match(strict);
+    if (strictMatch?.[1]) {
+      const decoded = decodeJsonStringFragment(strictMatch[1]).trim();
+      if (decoded.length > 0) {
+        return decoded.slice(0, 2000);
+      }
+    }
+  }
+  return undefined;
+};
+
+const extractBoardTextSnippets = (text: string, maxSnippets = 8): string[] => {
+  const snippets: string[] = [];
+  const seen = new Set<string>();
+  const pattern = /"(summary|text|notes|title|topic|label)"\s*:\s*"((?:\\.|[^"\\])*)"/gi;
+  let match: RegExpExecArray | null = pattern.exec(text);
+  while (match && snippets.length < maxSnippets) {
+    const candidate = decodeJsonStringFragment(match[2] ?? '').replace(/\s+/g, ' ').trim();
+    if (candidate.length > 0 && !seen.has(candidate)) {
+      seen.add(candidate);
+      snippets.push(candidate.slice(0, 220));
+    }
+    match = pattern.exec(text);
+  }
+  return snippets;
+};
+
+const looksLikeBoardOpsPayload = (raw: string): boolean => {
+  const lower = raw.toLowerCase();
+  if (lower.includes('board_ops') || lower.includes('board-ops') || lower.includes('boardops')) {
+    return true;
+  }
+  return BOARD_OP_TYPE_HINTS.some(
+    (type) => lower.includes(`"${type}"`) || lower.includes(`"type":"${type}"`) || lower.includes(`"op":"${type}"`),
+  );
+};
+
+const collectCoercedBoardOps = (value: unknown, sink: BoardOp[]) => {
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectCoercedBoardOps(entry, sink));
+    return;
+  }
+  if (!value || typeof value !== 'object') {
+    return;
+  }
+  const op = coerceBoardOp(value);
+  if (op) {
+    sink.push(op);
+  }
+  const record = value as Record<string, unknown>;
+  const nestedSources: unknown[] = [
+    record.ops,
+    record.operations,
+    record.items,
+    record.build_ops,
+    record.buildOps,
+    record.boardOps,
+  ];
+  nestedSources.forEach((nested) => {
+    if (Array.isArray(nested)) {
+      nested.forEach((entry) => {
+        const nestedOp = coerceBoardOp(entry);
+        if (nestedOp) {
+          sink.push(nestedOp);
+        }
+      });
+    }
+  });
+};
+
+const dedupeBoardOps = (ops: BoardOp[]): BoardOp[] => {
+  const deduped: BoardOp[] = [];
+  const seen = new Set<string>();
+  for (const op of ops) {
+    const key = (() => {
+      try {
+        return JSON.stringify(op);
+      } catch {
+        return `${op.type}:${Date.now()}:${Math.random()}`;
+      }
+    })();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(op);
+  }
+  return deduped;
+};
+
+function salvageBoardOpsEnvelopeFromRawText(rawContent: string): BoardOpsEnvelope | null {
+  const stripped = stripMarkdownJsonFence(rawContent);
+  if (!looksLikeBoardOpsPayload(stripped)) {
+    return null;
+  }
+
+  const slices = extractBalancedJsonSlices(stripped, {
+    maxSlices: 2200,
+    maxChars: 260000,
+    minLength: 4,
+  });
+
+  const recoveredOps: BoardOp[] = [];
+  for (const entry of slices) {
+    const slice = entry.slice;
+    if (!slice.includes('"type"') && !slice.includes('"op"') && !slice.includes('"action"')) {
+      continue;
+    }
+    const parsed = tryParseJson(slice);
+    if (parsed === null) {
+      continue;
+    }
+    collectCoercedBoardOps(parsed, recoveredOps);
+  }
+
+  let summary =
+    extractJsonStringField(stripped, ['summary']) ??
+    extractJsonStringField(stripped, ['title']) ??
+    extractJsonStringField(stripped, ['topic']);
+  const snippets = extractBoardTextSnippets(stripped, 10);
+  let text =
+    extractJsonStringField(stripped, ['text']) ??
+    extractJsonStringField(stripped, ['notes']) ??
+    (snippets.length > 0 ? snippets.join('\n') : undefined);
+
+  if (!summary && snippets.length > 0) {
+    summary = snippets[0]!.slice(0, 240);
+  }
+  if (!text && summary) {
+    text = summary;
+  }
+
+  const dedupedOps = dedupeBoardOps(recoveredOps).slice(0, 800);
+  const textOps = text && !hasTextElementOps(dedupedOps) ? buildBoardTextOps(text) : [];
+  const mergedOps = [...dedupedOps, ...textOps].slice(0, 900);
+  if (mergedOps.length === 0) {
+    return null;
+  }
+
+  return {
+    kind: 'board_ops',
+    summary: summary?.slice(0, 240),
+    text: text?.slice(0, 2000),
+    ops: mergedOps,
+  };
+}
 
 const getConfiguredProvider = (): AIProvider => {
   return getRuntimeConfig().ai.provider;
@@ -1490,7 +2216,8 @@ const buildDiagramPatchUserPrompt = (payload: AIInput): string => {
 };
 
 const buildBoardOpsSystemPrompt = (): string => {
-  return getBoardOpsPromptTemplates().system;
+  const templates = getBoardOpsPromptTemplates();
+  return [templates.system, templates.visualSkill].join('\n\n');
 };
 
 const buildBoardOpsUserPrompt = (payload: AIInput): string => {
@@ -1507,6 +2234,7 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
       contextPinnedHigh: payload.contextPinnedHigh,
       contextPinnedNormal: payload.contextPinnedNormal,
       transcriptWindow: payload.transcriptWindow,
+      transcriptContext: payload.transcriptContext,
       transcriptTaskChain,
       recentChat: payload.recentChat,
     },
@@ -1523,8 +2251,11 @@ const buildBoardOpsUserPrompt = (payload: AIInput): string => {
     templates.delta,
     'Primary objective: generate visible board drawing operations quickly.',
     'If transcriptTaskChain has tasks, use the latest task while preserving cumulative context.',
+    'Use transcriptContext as rolling memory while building current transcriptWindow output.',
     'Transcript mapping rule: every transcriptWindow line must map to at least one drawable operation.',
     'If transcriptWindow is not empty, output upsertElement/appendStrokePoints and not only setViewport/deleteElement metadata.',
+    'Use both words and visuals: include at least one text element and at least one non-text visual element when transcriptWindow has content.',
+    'If any detail cannot fit in ops, put it in top-level "text".',
     'Never return empty ops when transcriptWindow has content.',
     'Generate the next sketch operations for this meeting moment.',
     'Return board_ops JSON only.',
@@ -1914,6 +2645,7 @@ export const collectAiInput = (
   const now = Date.now();
   const threshold = now - windowSeconds * 1000;
   const transcriptWindow = buildTranscriptWindow(room.transcriptChunks, threshold, trigger.transcriptChunkCount);
+  const transcriptContext = buildTranscriptContext(room.transcriptChunks, trigger.transcriptChunkCount);
 
   const recentChat = limitList(room.chatMessages, 12);
   const correctionDirectives = recentChat
@@ -1953,6 +2685,7 @@ export const collectAiInput = (
       windowSeconds,
     },
     transcriptWindow,
+    transcriptContext,
     recentChat: recentChat.map((item) => ({ kind: item.kind, text: item.text, author: item.authorName })),
     corrections,
     correctionDirectives,
@@ -2251,7 +2984,7 @@ const reviewAndRevisePatch = (
 export const generateBoardOps = async (
   room: RoomState,
   request: TriggerPatchRequest,
-): Promise<{ ops: BoardOp[]; fingerprint: string } | null> => {
+): Promise<{ ops: BoardOp[]; fingerprint: string; text?: string } | null> => {
   getBoardOpsPromptTemplates();
   await primeAiPromptSession();
 
@@ -2275,6 +3008,7 @@ export const generateBoardOps = async (
     return {
       ops: envelope.ops,
       fingerprint,
+      text: envelope.text,
     };
   }
   if (parsed !== null) {
@@ -2298,7 +3032,7 @@ export const generatePersonalizedBoardOps = async (
   room: RoomState,
   request: TriggerPatchRequest,
   options: PersonalizedBoardOptions,
-): Promise<{ ops: BoardOp[]; fingerprint: string } | null> => {
+): Promise<{ ops: BoardOp[]; fingerprint: string; text?: string } | null> => {
   getBoardOpsPromptTemplates();
   await primeAiPromptSession();
 
@@ -2340,6 +3074,7 @@ export const generatePersonalizedBoardOps = async (
     return {
       ops: envelope.ops,
       fingerprint,
+      text: envelope.text,
     };
   }
   if (parsed !== null) {

@@ -129,6 +129,50 @@ const sanitizePoint = (point: [number, number]): [number, number] => {
   return [clamp(point[0], -MAX_COORD, MAX_COORD), clamp(point[1], -MAX_COORD, MAX_COORD)];
 };
 
+const applyElementOffset = (element: BoardElement, dx: number, dy: number): BoardElement => {
+  if (element.kind === 'text') {
+    return {
+      ...element,
+      x: clamp(element.x + dx, -MAX_COORD, MAX_COORD),
+      y: clamp(element.y + dy, -MAX_COORD, MAX_COORD),
+    };
+  }
+  if (element.kind === 'rect' || element.kind === 'ellipse' || element.kind === 'diamond') {
+    return {
+      ...element,
+      x: clamp(element.x + dx, -MAX_COORD, MAX_COORD),
+      y: clamp(element.y + dy, -MAX_COORD, MAX_COORD),
+    };
+  }
+  if (element.kind === 'stroke' || element.kind === 'line' || element.kind === 'arrow') {
+    return {
+      ...element,
+      points: element.points.map(([x, y]) => sanitizePoint([x + dx, y + dy])),
+    };
+  }
+  return element;
+};
+
+const sanitizeStylePatch = (style: Partial<NonNullable<BoardElement['style']>>): NonNullable<BoardElement['style']> => {
+  const patch: NonNullable<BoardElement['style']> = {};
+  if (typeof style.strokeColor === 'string' && style.strokeColor.trim().length > 0) {
+    patch.strokeColor = style.strokeColor.trim();
+  }
+  if (typeof style.fillColor === 'string' && style.fillColor.trim().length > 0) {
+    patch.fillColor = style.fillColor.trim();
+  }
+  if (typeof style.strokeWidth === 'number' && Number.isFinite(style.strokeWidth)) {
+    patch.strokeWidth = clamp(style.strokeWidth, 0.5, 64);
+  }
+  if (typeof style.roughness === 'number' && Number.isFinite(style.roughness)) {
+    patch.roughness = clamp(style.roughness, 0, 12);
+  }
+  if (typeof style.fontSize === 'number' && Number.isFinite(style.fontSize)) {
+    patch.fontSize = clamp(style.fontSize, 8, 200);
+  }
+  return patch;
+};
+
 const sanitizeElement = (element: BoardElement): BoardElement | null => {
   if (!element || !element.id || typeof element.id !== 'string') {
     return null;
@@ -256,6 +300,95 @@ const applySingleBoardOp = (state: BoardState, op: BoardOp): BoardState => {
     }
     const points = op.points.map(sanitizePoint).slice(0, 600);
     existing.points = [...existing.points, ...points].slice(0, 2400);
+    touch(state);
+    return state;
+  }
+
+  if (op.type === 'offsetElement') {
+    const existing = state.elements[op.id];
+    if (!existing) {
+      return state;
+    }
+    const dx = Number.isFinite(op.dx) ? clamp(op.dx, -MAX_COORD, MAX_COORD) : 0;
+    const dy = Number.isFinite(op.dy) ? clamp(op.dy, -MAX_COORD, MAX_COORD) : 0;
+    if (dx === 0 && dy === 0) {
+      return state;
+    }
+    state.elements[op.id] = applyElementOffset(existing, dx, dy);
+    touch(state);
+    return state;
+  }
+
+  if (op.type === 'setElementStyle') {
+    const existing = state.elements[op.id];
+    if (!existing) {
+      return state;
+    }
+    const patch = sanitizeStylePatch(op.style);
+    if (Object.keys(patch).length === 0) {
+      return state;
+    }
+    existing.style = {
+      ...(existing.style ?? {}),
+      ...patch,
+    };
+    touch(state);
+    return state;
+  }
+
+  if (op.type === 'setElementText') {
+    const existing = state.elements[op.id];
+    if (!existing || existing.kind !== 'text') {
+      return state;
+    }
+    const nextText = sanitizeText(op.text);
+    if (!nextText || existing.text === nextText) {
+      return state;
+    }
+    existing.text = nextText;
+    touch(state);
+    return state;
+  }
+
+  if (op.type === 'duplicateElement') {
+    const source = state.elements[op.id];
+    if (!source || !op.newId || typeof op.newId !== 'string') {
+      return state;
+    }
+    if (state.elements[op.newId]) {
+      return state;
+    }
+    if (state.order.length >= MAX_ELEMENTS) {
+      return state;
+    }
+
+    const dx = Number.isFinite(op.dx) ? clamp(op.dx ?? 0, -MAX_COORD, MAX_COORD) : 24;
+    const dy = Number.isFinite(op.dy) ? clamp(op.dy ?? 0, -MAX_COORD, MAX_COORD) : 24;
+    const duplicated = applyElementOffset(
+      {
+        ...structuredClone(source),
+        id: op.newId,
+        createdAt: Date.now(),
+      },
+      dx,
+      dy,
+    );
+    state.elements[op.newId] = duplicated;
+    state.order.push(op.newId);
+    touch(state);
+    return state;
+  }
+
+  if (op.type === 'setElementZIndex') {
+    const existing = state.elements[op.id];
+    if (!existing) {
+      return state;
+    }
+    const zIndex = Math.floor(clamp(op.zIndex, -100000, 100000));
+    if (existing.zIndex === zIndex) {
+      return state;
+    }
+    existing.zIndex = zIndex;
     touch(state);
     return state;
   }

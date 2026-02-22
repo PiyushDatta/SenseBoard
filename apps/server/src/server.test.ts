@@ -6,6 +6,14 @@ import { join } from 'node:path';
 type ServerModule = typeof import('./server');
 
 interface AiMockOverrides {
+  collectAiInput?: (room: { transcriptChunks?: Array<{ speaker?: string; text?: string }> }) => {
+    transcriptWindow: string[];
+    recentChat: unknown[];
+    corrections: unknown[];
+    contextPinnedHigh: unknown[];
+    contextPinnedNormal: unknown[];
+    visualHint: string;
+  };
   generateBoardOps?: () => Promise<{ ops: unknown[]; fingerprint: string }>;
   generateDiagramPatch?: () => Promise<{
     patch: {
@@ -82,9 +90,25 @@ const loadServerModule = async (overrides: AiMockOverrides = {}): Promise<Server
   }));
 
   mock.module('./ai-engine', () => ({
-    collectAiInput: () => ({
-      transcriptWindow: [],
-    }),
+    collectAiInput:
+      overrides.collectAiInput ??
+      ((room: { transcriptChunks?: Array<{ speaker?: string; text?: string }> }) => {
+        const shouldEmitSignal = overrides.hasAiSignal ? overrides.hasAiSignal() : true;
+        const transcriptWindow = shouldEmitSignal
+          ? (room.transcriptChunks ?? [])
+              .map((chunk) => `${chunk.speaker?.trim() || 'Speaker'}: ${chunk.text?.trim() || ''}`.trim())
+              .filter((line) => line.length > 0)
+              .slice(-24)
+          : [];
+        return {
+          transcriptWindow,
+          recentChat: [],
+          corrections: [],
+          contextPinnedHigh: [],
+          contextPinnedNormal: [],
+          visualHint: '',
+        };
+      }),
     generateDiagramPatch:
       overrides.generateDiagramPatch ??
       (async () => ({

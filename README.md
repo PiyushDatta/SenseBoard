@@ -168,7 +168,7 @@ bun run integration_test
 
 ### AI Diagram Generation (Understand Text + Draw)
 1. AI patch job runs from server queue.
-2. Server loads prompt templates from `prompts/main_ai_board_system_prompt.txt` and `prompts/main_ai_board_delta_prompt.txt`.
+2. Server loads prompt templates from `prompts/main_ai_board_system_prompt.md` and `prompts/main_ai_board_delta_prompt.md`.
 3. On startup/first use, server primes a one-time AI prompt session for the board-ops route.
 4. Server builds prompt context from transcript/chat/context bank + current board state.
 5. Provider routing for diagram ops:
