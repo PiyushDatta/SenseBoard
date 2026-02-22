@@ -163,6 +163,7 @@ const AI_MIN_INTERVAL_MS = 120;
 const AI_MAX_QUEUE_LENGTH = 120;
 const PERSONAL_AI_MIN_INTERVAL_MS = 140;
 const PERSONAL_AI_MAX_QUEUE_LENGTH = 120;
+const PERSONAL_AI_DEFER_AFTER_MAIN_MS = 240;
 const MAIN_QUEUE_WAIT_SLICE_MS = 20;
 const MAIN_QUEUE_WAIT_TIMEOUT_MS = 1500;
 const MIN_TRANSCRIBE_AUDIO_BYTES = 1024;
@@ -172,6 +173,13 @@ const AI_IDLE_AFTER_INACTIVITY_MS = 10 * 60 * 1000;
 const aiQueueByRoom = new Map<string, AiQueueState>();
 const personalBoardStateByRoom = new Map<string, Map<string, PersonalBoardState>>();
 const personalAiQueueByKey = new Map<string, PersonalizedAiQueueState>();
+const deferredPersonalAiByRoom = new Map<
+  string,
+  {
+    timer: ReturnType<typeof setTimeout>;
+    request: TriggerPatchRequest;
+  }
+>();
 const lastStoredTranscriptBySpeaker = new Map<string, string>();
 const aiLastActivityByRoom = new Map<string, number>();
 const aiIdleTimerByRoom = new Map<string, ReturnType<typeof setTimeout>>();
@@ -908,6 +916,48 @@ const enqueuePersonalizedAiPatchForRoomMembers = (
   });
 };
 
+const mergeDeferredPersonalRequest = (
+  previous: TriggerPatchRequest,
+  incoming: TriggerPatchRequest,
+): TriggerPatchRequest => {
+  const merged: TriggerPatchRequest = {
+    reason: incoming.reason ?? previous.reason ?? 'tick',
+    regenerate: Boolean(previous.regenerate || incoming.regenerate),
+    windowSeconds: incoming.windowSeconds ?? previous.windowSeconds ?? 30,
+    transcriptChunkCount: previous.transcriptChunkCount,
+  };
+  const incomingCursor = incoming.transcriptChunkCount;
+  const existingCursor = previous.transcriptChunkCount;
+  if (typeof incomingCursor === 'number' && Number.isFinite(incomingCursor)) {
+    merged.transcriptChunkCount =
+      typeof existingCursor === 'number' && Number.isFinite(existingCursor)
+        ? Math.max(existingCursor, incomingCursor)
+        : incomingCursor;
+  }
+  return merged;
+};
+
+const scheduleDeferredPersonalizedAiPatch = (
+  roomId: string,
+  request: TriggerPatchRequest,
+  delayMs = PERSONAL_AI_DEFER_AFTER_MAIN_MS,
+) => {
+  const normalizedRoomId = roomId.trim().toUpperCase();
+  const previous = deferredPersonalAiByRoom.get(normalizedRoomId);
+  const mergedRequest = previous ? mergeDeferredPersonalRequest(previous.request, request) : request;
+  if (previous) {
+    clearTimeout(previous.timer);
+  }
+  const timer = setTimeout(() => {
+    deferredPersonalAiByRoom.delete(normalizedRoomId);
+    enqueuePersonalizedAiPatchForRoomMembers(normalizedRoomId, mergedRequest);
+  }, Math.max(0, delayMs));
+  deferredPersonalAiByRoom.set(normalizedRoomId, {
+    timer,
+    request: mergedRequest,
+  });
+};
+
 const scheduleTranscriptPatch = (roomId: string, transcriptChunkCount?: number) => {
   const room = getOrCreateRoom(roomId);
   if (room.aiConfig.frozen) {
@@ -925,8 +975,9 @@ const scheduleTranscriptPatch = (roomId: string, transcriptChunkCount?: number) 
     windowSeconds: 30,
     transcriptChunkCount: cursor,
   };
-  void enqueueAiPatch(room.id, request);
-  enqueuePersonalizedAiPatchForRoomMembers(room.id, request);
+  void enqueueAiPatch(room.id, request).finally(() => {
+    scheduleDeferredPersonalizedAiPatch(room.id, request);
+  });
 };
 
 export const fetchHandler = async (
@@ -1078,16 +1129,13 @@ export const fetchHandler = async (
         return json({ error: 'invalid room path' }, 400);
       }
       const payload = (await request.json().catch(() => ({}))) as Partial<TriggerPatchRequest>;
-      const result = await enqueueAiPatch(roomId, {
+      const sharedRequest: TriggerPatchRequest = {
         reason: payload.reason ?? 'manual',
         regenerate: Boolean(payload.regenerate),
         windowSeconds: payload.windowSeconds ?? 30,
-      });
-      enqueuePersonalizedAiPatchForRoomMembers(roomId, {
-        reason: payload.reason ?? 'manual',
-        regenerate: Boolean(payload.regenerate),
-        windowSeconds: payload.windowSeconds ?? 30,
-      });
+      };
+      const result = await enqueueAiPatch(roomId, sharedRequest);
+      scheduleDeferredPersonalizedAiPatch(roomId, sharedRequest, 0);
       return json(result);
     }
 
@@ -1319,6 +1367,10 @@ export const __resetAiQueueForTests = () => {
   aiQueueByRoom.clear();
   personalAiQueueByKey.clear();
   personalBoardStateByRoom.clear();
+  for (const deferred of deferredPersonalAiByRoom.values()) {
+    clearTimeout(deferred.timer);
+  }
+  deferredPersonalAiByRoom.clear();
   lastStoredTranscriptBySpeaker.clear();
   aiLastActivityByRoom.clear();
   for (const timer of aiIdleTimerByRoom.values()) {
