@@ -1,4 +1,7 @@
-import type { BoardElement, BoardPoint, BoardState } from '../../../shared/types';
+import { useEffect, useState } from 'react';
+
+import { BOARD_OPS_SCHEMA_VERSION } from '../../../shared/types';
+import type { BoardElement, BoardOp, BoardOpsEnvelope, BoardPoint, BoardState } from '../../../shared/types';
 
 export type TldrawColorName =
   | 'black'
@@ -117,6 +120,341 @@ interface TextContainerBounds {
   w: number;
   h: number;
 }
+
+const WATCHDOG_LATENCY_THRESHOLD_MS = 1800;
+const WATCHDOG_LOG_PREFIX = '[tldraw-adapter-watchdog]';
+
+export type AdapterFallbackReason = 'healthy' | 'latency' | 'empty_ops' | 'invalid_ops';
+
+export interface AdapterWatchdogState {
+  fallbackActive: boolean;
+  fallbackReason: AdapterFallbackReason;
+  lastAuthoritativeAt: number | null;
+  queueLatencyMs: number;
+}
+
+export interface WatchdogQueueSample {
+  queuedAt?: number;
+  receivedAt?: number;
+}
+
+export interface AdapterWatchdogGuardResult {
+  ops: BoardOp[];
+  fallbackApplied: boolean;
+  replayedFromTranscript: boolean;
+  reason: AdapterFallbackReason;
+}
+
+export interface AdapterWatchdogOptions {
+  maxQueueLatencyMs?: number;
+  now?: () => number;
+  logger?: (message: string, context?: Record<string, unknown>) => void;
+  onFallbackChange?: (state: AdapterWatchdogState) => void;
+}
+
+export interface TldrawAdapterWatchdog {
+  recordIncoming: (envelope: BoardOpsEnvelope | null | undefined, sample?: WatchdogQueueSample) => AdapterWatchdogGuardResult;
+  clampOutgoingOps: (ops: BoardOp[] | null | undefined) => BoardOp[];
+  getState: () => AdapterWatchdogState;
+  subscribe: (listener: (state: AdapterWatchdogState) => void) => () => void;
+  getLastReplayEnvelope: () => BoardOpsEnvelope | null;
+  reset: () => void;
+}
+
+const DEFAULT_WATCHDOG_STATE: AdapterWatchdogState = {
+  fallbackActive: false,
+  fallbackReason: 'healthy',
+  lastAuthoritativeAt: null,
+  queueLatencyMs: 0,
+};
+
+const FALLBACK_SKETCH_TEMPLATE = {
+  id: 'watchdog:fallback-line',
+  kind: 'line',
+  points: [
+    [8, 8],
+    [40, 14],
+    [72, 48],
+    [128, 24],
+  ] as BoardPoint[],
+  createdAt: 0,
+  createdBy: 'system' as const,
+  style: {
+    strokeColor: '#3d63de',
+    strokeWidth: 3,
+  },
+  zIndex: 1,
+} satisfies BoardElement;
+
+const BOARD_OP_KINDS: Array<BoardOp['type']> = [
+  'upsertElement',
+  'appendStrokePoints',
+  'deleteElement',
+  'offsetElement',
+  'setElementGeometry',
+  'setElementStyle',
+  'setElementText',
+  'duplicateElement',
+  'setElementZIndex',
+  'alignElements',
+  'distributeElements',
+  'clearBoard',
+  'setViewport',
+  'batch',
+];
+
+const BOARD_OP_KIND_SET = new Set(BOARD_OP_KINDS);
+
+const cloneValue = <T>(value: T): T => {
+  const structured = (globalThis as { structuredClone?: <TValue>(input: TValue) => TValue }).structuredClone;
+  if (typeof structured === 'function') {
+    return structured(value);
+  }
+  return JSON.parse(JSON.stringify(value)) as T;
+};
+
+const cloneEnvelope = (envelope: BoardOpsEnvelope): BoardOpsEnvelope => ({
+  ...envelope,
+  ops: cloneValue(envelope.ops),
+});
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
+
+const isBoardOpValue = (value: unknown): value is BoardOp => {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const type = value.type;
+  if (typeof type !== 'string' || !BOARD_OP_KIND_SET.has(type as BoardOp['type'])) {
+    return false;
+  }
+  if (type === 'batch') {
+    return Array.isArray(value.ops) && value.ops.every((child) => isBoardOpValue(child));
+  }
+  return true;
+};
+
+const toFiniteTimestamp = (value: unknown): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  return value;
+};
+
+type EnvelopeStatus = 'valid' | 'empty_ops' | 'invalid_ops' | 'missing';
+
+const evaluateBoardOpsEnvelope = (
+  envelope: BoardOpsEnvelope | null | undefined,
+): { status: EnvelopeStatus; envelope: BoardOpsEnvelope | null } => {
+  if (!envelope) {
+    return { status: 'missing', envelope: null };
+  }
+  if (envelope.kind !== 'board_ops' || typeof envelope.schemaVersion !== 'number' || !Array.isArray(envelope.ops)) {
+    return { status: 'invalid_ops', envelope: null };
+  }
+  if (envelope.schemaVersion !== BOARD_OPS_SCHEMA_VERSION) {
+    return { status: 'invalid_ops', envelope: null };
+  }
+  if (envelope.ops.length === 0) {
+    return { status: 'empty_ops', envelope: null };
+  }
+  if (!envelope.ops.every(isBoardOpValue)) {
+    return { status: 'invalid_ops', envelope: null };
+  }
+  return { status: 'valid', envelope };
+};
+
+const createDeterministicSketchFallbackOps = (): BoardOp[] => {
+  const fallbackElement: BoardElement = {
+    ...FALLBACK_SKETCH_TEMPLATE,
+    points: FALLBACK_SKETCH_TEMPLATE.points.map(([x, y]) => [x, y] as BoardPoint),
+  };
+  return [
+    { type: 'clearBoard' },
+    {
+      type: 'upsertElement',
+      element: fallbackElement,
+    },
+  ];
+};
+
+const defaultWatchdogLogger = (message: string, context?: Record<string, unknown>) => {
+  if (typeof console !== 'undefined' && typeof console.info === 'function') {
+    console.info(`${WATCHDOG_LOG_PREFIX} ${message}`, context);
+  }
+};
+
+const createDefaultWatchdogState = (): AdapterWatchdogState => ({ ...DEFAULT_WATCHDOG_STATE });
+
+export const createTldrawAdapterWatchdog = (options?: AdapterWatchdogOptions): TldrawAdapterWatchdog => {
+  const maxQueueLatencyMs = options?.maxQueueLatencyMs ?? WATCHDOG_LATENCY_THRESHOLD_MS;
+  const now = options?.now ?? (() => Date.now());
+  const logger = options?.logger ?? defaultWatchdogLogger;
+  const fallbackChangeCallback = options?.onFallbackChange;
+
+  let state = createDefaultWatchdogState();
+  let lastValidEnvelope: BoardOpsEnvelope | null = null;
+  let lastReplayEnvelope: BoardOpsEnvelope | null = null;
+  let lastQueueSampleAt: number | null = null;
+  const subscribers = new Set<(snapshot: AdapterWatchdogState) => void>();
+
+  const resolveQueueStartedAt = (receivedAt: number, sample?: WatchdogQueueSample): number => {
+    const queuedTimestamp = toFiniteTimestamp(sample?.queuedAt);
+    if (queuedTimestamp !== null) {
+      lastQueueSampleAt = queuedTimestamp;
+      return queuedTimestamp;
+    }
+    if (lastQueueSampleAt !== null) {
+      const fallbackStart = lastQueueSampleAt;
+      lastQueueSampleAt = receivedAt;
+      return fallbackStart;
+    }
+    const fallbackStart = state.lastAuthoritativeAt ?? receivedAt;
+    lastQueueSampleAt = receivedAt;
+    return fallbackStart;
+  };
+
+  const notifySubscribers = () => {
+    if (subscribers.size === 0) {
+      return;
+    }
+    const snapshot = { ...state };
+    subscribers.forEach((listener) => listener(snapshot));
+  };
+
+  const updateStateField = <K extends keyof AdapterWatchdogState>(key: K, value: AdapterWatchdogState[K]): boolean => {
+    if (state[key] === value) {
+      return false;
+    }
+    state = { ...state, [key]: value };
+    return true;
+  };
+
+  const buildFallbackOps = (): BoardOp[] => {
+    if (lastValidEnvelope) {
+      lastReplayEnvelope = cloneEnvelope(lastValidEnvelope);
+      return cloneValue(lastValidEnvelope.ops);
+    }
+    lastReplayEnvelope = null;
+    return createDeterministicSketchFallbackOps();
+  };
+
+  const setFallback = (active: boolean, reason: AdapterFallbackReason): boolean => {
+    const changed = state.fallbackActive !== active || state.fallbackReason !== reason;
+    if (!changed) {
+      return false;
+    }
+    state = { ...state, fallbackActive: active, fallbackReason: reason };
+    const snapshot = { ...state };
+    logger(active ? 'fallback enabled' : 'fallback cleared', {
+      reason,
+      lastAuthoritativeAt: snapshot.lastAuthoritativeAt,
+      queueLatencyMs: snapshot.queueLatencyMs,
+    });
+    fallbackChangeCallback?.(snapshot);
+    notifySubscribers();
+    return true;
+  };
+
+  const recordIncoming: TldrawAdapterWatchdog['recordIncoming'] = (envelope, sample) => {
+    const evaluation = evaluateBoardOpsEnvelope(envelope);
+    const receivedAt = toFiniteTimestamp(sample?.receivedAt) ?? now();
+    const queueStartedAt = resolveQueueStartedAt(receivedAt, sample);
+    const queueLatencyMs = Math.max(0, receivedAt - queueStartedAt);
+    let stateMutated = updateStateField('queueLatencyMs', queueLatencyMs);
+
+    let fallbackReason: AdapterFallbackReason =
+      evaluation.status === 'empty_ops' || evaluation.status === 'missing'
+        ? 'empty_ops'
+        : evaluation.status === 'invalid_ops'
+          ? 'invalid_ops'
+          : 'healthy';
+
+    if (fallbackReason === 'healthy' && queueLatencyMs > maxQueueLatencyMs) {
+      fallbackReason = 'latency';
+    }
+
+    const shouldAcceptEnvelope =
+      fallbackReason === 'healthy' && evaluation.status === 'valid' && Boolean(evaluation.envelope);
+
+    if (shouldAcceptEnvelope && evaluation.envelope) {
+      stateMutated = updateStateField('lastAuthoritativeAt', receivedAt) || stateMutated;
+      lastValidEnvelope = cloneEnvelope(evaluation.envelope);
+      lastReplayEnvelope = null;
+    }
+
+    if (fallbackReason === 'healthy') {
+      const fallbackChanged = setFallback(false, 'healthy');
+      if (stateMutated && !fallbackChanged) {
+        notifySubscribers();
+      }
+      return {
+        ops: evaluation.envelope ? cloneValue(evaluation.envelope.ops) : [],
+        fallbackApplied: false,
+        replayedFromTranscript: false,
+        reason: 'healthy',
+      };
+    }
+
+    const fallbackOps = buildFallbackOps();
+    const fallbackChanged = setFallback(true, fallbackReason);
+    if (stateMutated && !fallbackChanged) {
+      notifySubscribers();
+    }
+    return {
+      ops: fallbackOps,
+      fallbackApplied: true,
+      replayedFromTranscript: lastReplayEnvelope !== null,
+      reason: fallbackReason,
+    };
+  };
+
+  const clampOutgoingOps: TldrawAdapterWatchdog['clampOutgoingOps'] = (ops) => {
+    if (!state.fallbackActive) {
+      return ops ? cloneValue(ops) : [];
+    }
+    return buildFallbackOps();
+  };
+
+  const subscribe: TldrawAdapterWatchdog['subscribe'] = (listener) => {
+    subscribers.add(listener);
+    return () => {
+      subscribers.delete(listener);
+    };
+  };
+
+  return {
+    recordIncoming,
+    clampOutgoingOps,
+    getState: () => ({ ...state }),
+    subscribe,
+    getLastReplayEnvelope: () => (lastReplayEnvelope ? cloneEnvelope(lastReplayEnvelope) : null),
+    reset: () => {
+      state = createDefaultWatchdogState();
+      lastValidEnvelope = null;
+      lastReplayEnvelope = null;
+      lastQueueSampleAt = null;
+      notifySubscribers();
+    },
+  };
+};
+
+export const useTldrawAdapterWatchdogState = (watchdog: TldrawAdapterWatchdog | null): AdapterWatchdogState => {
+  const [state, setState] = useState<AdapterWatchdogState>(() => ({ ...DEFAULT_WATCHDOG_STATE }));
+
+  useEffect(() => {
+    if (!watchdog) {
+      setState({ ...DEFAULT_WATCHDOG_STATE });
+      return;
+    }
+    setState(watchdog.getState());
+    return watchdog.subscribe((next) => {
+      setState(next);
+    });
+  }, [watchdog]);
+
+  return state;
+};
 
 const SIZE_TO_APPROX_FONT_PX: Record<TldrawSizeStyle, number> = {
   s: 14,
