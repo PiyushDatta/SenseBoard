@@ -686,3 +686,268 @@ export const boardToTldrawDraftShapes = (
   drafts.sort((left, right) => left.zIndex - right.zIndex);
   return drafts;
 };
+
+const SHAPE_TEXT_MAX_LENGTH = 4000;
+
+const isFiniteNumber = (value: unknown): value is number => {
+  return typeof value === 'number' && Number.isFinite(value);
+};
+
+const isPositiveFiniteNumber = (value: unknown): value is number => {
+  return isFiniteNumber(value) && value > 0;
+};
+
+const pointsHaveFiniteCoords = (points: TldrawDraftPoint[]): boolean => {
+  for (const point of points) {
+    if (!isFiniteNumber(point.x) || !isFiniteNumber(point.y)) {
+      return false;
+    }
+  }
+  return true;
+};
+
+type DraftShapeValidationResult = { ok: true } | { ok: false; reason: string; shapeId?: string };
+
+const validateDraftShape = (shape: TldrawDraftShape): string | null => {
+  if (!shape.id || typeof shape.id !== 'string') {
+    return 'Shape id must be a non-empty string.';
+  }
+  if (!isFiniteNumber(shape.x) || !isFiniteNumber(shape.y) || !isFiniteNumber(shape.zIndex)) {
+    return 'Shape coordinates and zIndex must be finite numbers.';
+  }
+
+  if (shape.kind === 'geo') {
+    if (!isPositiveFiniteNumber(shape.props.w) || !isPositiveFiniteNumber(shape.props.h)) {
+      return 'Geo shapes must include finite width and height.';
+    }
+    if (shape.props.text.length > SHAPE_TEXT_MAX_LENGTH) {
+      return 'Geo labels exceed supported text length.';
+    }
+    return null;
+  }
+
+  if (shape.kind === 'frame') {
+    if (!isPositiveFiniteNumber(shape.props.w) || !isPositiveFiniteNumber(shape.props.h)) {
+      return 'Frame dimensions must be positive numbers.';
+    }
+    return null;
+  }
+
+  if (shape.kind === 'text') {
+    if (!isFiniteNumber(shape.props.w) || shape.props.w <= 0) {
+      return 'Text width must be a positive finite number.';
+    }
+    if (shape.props.text.length > SHAPE_TEXT_MAX_LENGTH) {
+      return 'Text content exceeds supported length.';
+    }
+    return null;
+  }
+
+  if (shape.kind === 'line') {
+    if (!Array.isArray(shape.props.points) || shape.props.points.length === 0) {
+      return 'Line shapes must include at least one point.';
+    }
+    if (!pointsHaveFiniteCoords(shape.props.points)) {
+      return 'Line points must be finite numbers.';
+    }
+    return null;
+  }
+
+  if (shape.kind === 'arrow') {
+    const { start, end } = shape.props;
+    if (!isFiniteNumber(start.x) || !isFiniteNumber(start.y) || !isFiniteNumber(end.x) || !isFiniteNumber(end.y)) {
+      return 'Arrow endpoints must be finite numbers.';
+    }
+    return null;
+  }
+
+  return 'Unsupported shape kind provided.';
+};
+
+const validateDraftShapes = (shapes: TldrawDraftShape[]): DraftShapeValidationResult => {
+  for (const shape of shapes) {
+    const error = validateDraftShape(shape);
+    if (error) {
+      const shapeId = typeof shape.id === 'string' && shape.id.trim().length > 0 ? shape.id : undefined;
+      return { ok: false, reason: error, shapeId };
+    }
+  }
+  return { ok: true };
+};
+
+const cloneDraftShape = (shape: TldrawDraftShape): TldrawDraftShape => {
+  return JSON.parse(JSON.stringify(shape)) as TldrawDraftShape;
+};
+
+interface ShapeSnapshot {
+  shape: TldrawDraftShape;
+  signature: string;
+}
+
+const createSnapshotMap = (drafts: TldrawDraftShape[]): {
+  snapshot: Map<string, ShapeSnapshot>;
+  signatures: Map<string, string>;
+} => {
+  const snapshot = new Map<string, ShapeSnapshot>();
+  const signatures = new Map<string, string>();
+  for (const draft of drafts) {
+    const signature = JSON.stringify(draft);
+    signatures.set(draft.id, signature);
+    snapshot.set(draft.id, {
+      shape: cloneDraftShape(draft),
+      signature,
+    });
+  }
+  return { snapshot, signatures };
+};
+
+const BATCHER_SKIP_MESSAGES = {
+  invalidWindow: 'Transcript window id is required before diffing.',
+  emptySnapshot: 'No shapes detected for transcript window.',
+  noopDiff: 'No drawable differences detected for transcript window.',
+} as const;
+
+const formatInvalidShapeMessage = (reason: string, shapeId?: string): string => {
+  if (shapeId) {
+    return `Invalid draft shape ${shapeId}: ${reason}`;
+  }
+  return `Invalid draft shape: ${reason}`;
+};
+
+const normalizeTranscriptWindowId = (value: string): string => {
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+export interface TranscriptWindowBatchInput {
+  transcriptWindowId: string;
+  board: BoardState | null | undefined;
+  showAiNotes: boolean;
+}
+
+interface TranscriptWindowBatchDiff {
+  kind: 'diff';
+  transcriptWindowId: string;
+  created: TldrawDraftShape[];
+  updated: TldrawDraftShape[];
+  deleted: string[];
+}
+
+type TranscriptWindowSkipReason =
+  | {
+      reason: 'invalid_window';
+      message: string;
+    }
+  | {
+      reason: 'noop';
+      message: string;
+    }
+  | {
+      reason: 'invalid_shapes';
+      message: string;
+      invalidShapeId?: string;
+    };
+
+interface TranscriptWindowBatchSkipped extends TranscriptWindowSkipReason {
+  kind: 'skipped';
+  transcriptWindowId: string;
+}
+
+export type TranscriptWindowBatchResult = TranscriptWindowBatchDiff | TranscriptWindowBatchSkipped;
+
+export class TranscriptWindowShapeBatcher {
+  private snapshots = new Map<string, Map<string, ShapeSnapshot>>();
+
+  process(input: TranscriptWindowBatchInput): TranscriptWindowBatchResult {
+    const normalizedWindowId = normalizeTranscriptWindowId(input.transcriptWindowId);
+    if (!normalizedWindowId) {
+      return this.buildSkip('', { reason: 'invalid_window', message: BATCHER_SKIP_MESSAGES.invalidWindow });
+    }
+
+    const drafts = boardToTldrawDraftShapes(input.board, input.showAiNotes);
+    const validation = validateDraftShapes(drafts);
+    if (!validation.ok) {
+      return this.buildSkip(normalizedWindowId, {
+        reason: 'invalid_shapes',
+        message: formatInvalidShapeMessage(validation.reason, validation.shapeId),
+        invalidShapeId: validation.shapeId,
+      });
+    }
+
+    return this.diffAgainstWindow(normalizedWindowId, drafts);
+  }
+
+  clear(windowId?: string): void {
+    const normalizedWindowId = normalizeTranscriptWindowId(windowId ?? '');
+    if (normalizedWindowId) {
+      this.snapshots.delete(normalizedWindowId);
+      return;
+    }
+    this.snapshots.clear();
+  }
+
+  private diffAgainstWindow(windowId: string, drafts: TldrawDraftShape[]): TranscriptWindowBatchResult {
+    const { snapshot: nextSnapshot, signatures } = createSnapshotMap(drafts);
+    const previousSnapshot = this.snapshots.get(windowId);
+
+    if (!previousSnapshot) {
+      this.snapshots.set(windowId, nextSnapshot);
+      if (nextSnapshot.size === 0) {
+        return this.buildSkip(windowId, { reason: 'noop', message: BATCHER_SKIP_MESSAGES.emptySnapshot });
+      }
+      return this.buildDiff(windowId, {
+        created: drafts.map((shape) => cloneDraftShape(shape)),
+        updated: [],
+        deleted: [],
+      });
+    }
+
+    const created: TldrawDraftShape[] = [];
+    const updated: TldrawDraftShape[] = [];
+    const deleted: string[] = [];
+
+    for (const draft of drafts) {
+      const signature = signatures.get(draft.id);
+      const previous = previousSnapshot.get(draft.id);
+      if (!previous) {
+        created.push(cloneDraftShape(draft));
+        continue;
+      }
+      if (signature && previous.signature !== signature) {
+        updated.push(cloneDraftShape(draft));
+      }
+    }
+
+    for (const [id] of previousSnapshot) {
+      if (!signatures.has(id)) {
+        deleted.push(id);
+      }
+    }
+
+    this.snapshots.set(windowId, nextSnapshot);
+
+    if (created.length === 0 && updated.length === 0 && deleted.length === 0) {
+      return this.buildSkip(windowId, { reason: 'noop', message: BATCHER_SKIP_MESSAGES.noopDiff });
+    }
+
+    return this.buildDiff(windowId, { created, updated, deleted });
+  }
+
+  private buildSkip(windowId: string, skip: TranscriptWindowSkipReason): TranscriptWindowBatchSkipped {
+    return {
+      kind: 'skipped',
+      transcriptWindowId: windowId,
+      ...skip,
+    };
+  }
+
+  private buildDiff(
+    windowId: string,
+    diff: { created: TldrawDraftShape[]; updated: TldrawDraftShape[]; deleted: string[] },
+  ): TranscriptWindowBatchDiff {
+    return {
+      kind: 'diff',
+      transcriptWindowId: windowId,
+      ...diff,
+    };
+  }
+}
