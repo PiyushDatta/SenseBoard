@@ -1534,8 +1534,9 @@ if (hasBunTestGlobals) {
       expect(recoveredAfterMutation?.elements.box.x).toBe(10);
     });
 
-    it('filters duplicate IDs before returning accepted ops', () => {
-      const guard = createIncrementalBoardOpsGuard();
+    it('filters duplicate IDs before returning accepted ops and reports telemetry', () => {
+      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
+      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
       const board = buildBoardState();
       const envelope: BoardOpsEnvelope = {
         kind: 'board_ops',
@@ -1547,11 +1548,91 @@ if (hasBunTestGlobals) {
         ],
       };
 
-      const result = guard.guardIncomingOps(envelope, { boardBefore: board });
+      const context = { boardBefore: board, provider: 'ai_guard', source: 'unit' };
+      const result = guard.guardIncomingOps(envelope, context);
       expect(result.ok).toBe(true);
       expect(result.acceptedOps).toHaveLength(1);
       expect(result.droppedDuplicateCount).toBe(2);
       expect(result.duplicateIds).toEqual(expect.arrayContaining(['dupe', 'box']));
+      expect(telemetryEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            guard: 'duplicate_id',
+            action: 'repair',
+            provider: context.provider,
+            source: context.source,
+            duplicateIds: expect.arrayContaining(['dupe', 'box']),
+            droppedOps: 2,
+          }),
+        ]),
+      );
+    });
+
+    it('rejects schema mismatches and increments schema counters', () => {
+      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
+      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
+      const context = { provider: 'ai_guard', source: 'unit' };
+      const mismatchedEnvelope: unknown = {
+        kind: 'board_ops',
+        schemaVersion: BOARD_OPS_SCHEMA_VERSION + 1,
+        ops: [],
+      };
+
+      const result = guard.guardIncomingOps(mismatchedEnvelope, context);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe('schema_mismatch');
+      expect(guard.counters.schemaRejections).toBe(1);
+      expect(telemetryEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            guard: 'schema',
+            action: 'reject',
+            reason: 'schema_mismatch',
+            provider: context.provider,
+            source: context.source,
+            counters: expect.objectContaining({ schemaRejections: 1 }),
+          }),
+        ]),
+      );
+    });
+
+    it('rejects when repairs drop all ops and preserves the last board snapshot for recovery', () => {
+      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
+      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
+      const board = buildBoardState();
+      const context = { boardBefore: board, provider: 'ai_guard', source: 'unit' };
+      const invalidEnvelope: unknown = {
+        kind: 'board_ops',
+        schemaVersion: BOARD_OPS_SCHEMA_VERSION,
+        ops: [{ type: 'bogus_op' }],
+      };
+
+      const result = guard.guardIncomingOps(invalidEnvelope, context);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe('empty_ops');
+      expect(result.droppedInvalidCount).toBeGreaterThan(0);
+      const recovered = guard.recoverLastAcceptedBoard();
+      expect(recovered).not.toBeNull();
+      expect(recovered).not.toBe(context.boardBefore);
+      expect(recovered).toEqual(context.boardBefore);
+      expect(telemetryEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            guard: 'payload',
+            action: 'repair',
+            reason: 'invalid_ops',
+            provider: context.provider,
+            source: context.source,
+          }),
+          expect.objectContaining({
+            guard: 'payload',
+            action: 'reject',
+            reason: 'empty_ops',
+            provider: context.provider,
+            source: context.source,
+          }),
+        ]),
+      );
     });
 
     it('repairs malformed ops deterministically', () => {
