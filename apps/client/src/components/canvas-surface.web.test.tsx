@@ -1,12 +1,12 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it } from 'bun:test';
 
 import { createEmptyBoardState } from '../../../shared/board-state';
 import { SENSEBOARD_AI_CONTENT_MAX_X, SENSEBOARD_AI_CONTENT_MIN_X } from '../../../shared/board-dimensions';
 import { BOARD_OPS_SCHEMA_VERSION } from '../../../shared/types';
 import type { BoardElement, BoardOp, BoardOpsEnvelope, BoardState } from '../../../shared/types';
-import { boardToTldrawDraftShapes, guardBoardOpsEnvelope } from './canvas-surface.tldraw-adapter';
+import { boardToTldrawDraftShapes, guardBoardOpsEnvelope, resetDefaultBurstTracker } from './canvas-surface.tldraw-adapter';
 import type { BoardOpsGuardOptions } from './canvas-surface.tldraw-adapter';
 
 const withBoard = (elements: BoardElement[], order?: string[]): BoardState => {
@@ -29,6 +29,10 @@ const buildGuardEnvelope = (ops: unknown[], overrides?: Partial<BoardOpsEnvelope
 
 let burstCounter = 0;
 const nextBurstKey = (prefix: string) => `${prefix}-${++burstCounter}`;
+
+afterEach(() => {
+  resetDefaultBurstTracker();
+});
 
 describe('canvas-surface tldraw adapter', () => {
   it('maps supported board element kinds to tldraw draft shapes', () => {
@@ -493,8 +497,8 @@ describe('board ops guard', () => {
         envelope: buildGuardEnvelope([{ type: 'setElementText', id: '', text: 'valid' } as BoardOp]),
       },
       {
-        reason: 'text:empty',
-        envelope: buildGuardEnvelope([{ type: 'setElementText', id: 'text-empty', text: '   ' }]),
+        reason: 'text:invalid',
+        envelope: buildGuardEnvelope([{ type: 'setElementText', id: 'text-invalid', text: 42 as unknown as string }]),
       },
       {
         reason: 'style:id',
@@ -650,17 +654,16 @@ describe('board ops guard', () => {
       buildGuardEnvelope(clampOps, { schemaVersion: BOARD_OPS_SCHEMA_VERSION + 5 }),
       { burstKey: nextBurstKey('clamp'), now: 3000 },
     );
-
     const expectedReasons = [
       'schema:version',
       'upsert:created_by',
       'upsert:style',
       'upsert:zindex',
-      'upsert:text_sanitized',
+      'upsert:text:sanitized',
       'upsert:text_x',
       'upsert:text_y',
-      'upsert:text_empty',
-      'upsert:sticky_text',
+      'upsert:text:empty',
+      'upsert:sticky_text:sanitized',
       'upsert:line_insufficient_points',
       'append:points:x',
       'append:points:y',
@@ -691,6 +694,106 @@ describe('board ops guard', () => {
     });
   });
 
+  it('allows whitespace-only updates to clear text fields without skipping operations', () => {
+    const envelope = buildGuardEnvelope([
+      { type: 'setElementText', id: 'text-clear', text: '   ' },
+      {
+        type: 'upsertElement',
+        element: {
+          id: 'text-upsert',
+          kind: 'text',
+          x: -20,
+          y: -20,
+          text: '\u0000',
+          createdAt: Number.NaN,
+          createdBy: 'ai',
+        },
+      } as BoardOp,
+    ]);
+    const result = guardBoardOpsEnvelope(envelope, {
+      burstKey: nextBurstKey('clear'),
+      now: 4100,
+    });
+    expect(result.ops.length).toBe(2);
+    const first = result.ops[0];
+    const second = result.ops[1];
+    expect(first?.type).toBe('setElementText');
+    if (first?.type === 'setElementText') {
+      expect(first.text).toBe('');
+    }
+    expect(second?.type).toBe('upsertElement');
+    if (second?.type === 'upsertElement') {
+      expect(second.element.text).toBe('');
+    }
+    expect(result.telemetry.clampReasons).toContain('text:empty');
+    expect(result.telemetry.clampReasons).toContain('upsert:text:empty');
+    expect(result.telemetry.skippedOps).toBe(0);
+  });
+
+  it('tracks nested batch skips and telemetry counts for invalid children', () => {
+    const envelope = buildGuardEnvelope([
+      {
+        type: 'batch',
+        ops: [
+          { type: 'deleteElement', id: '' },
+          { type: 'setElementText', id: 'ok', text: 'fine' },
+          { type: 'setElementText', id: 'oops', text: 123 as unknown as string },
+        ],
+      } as BoardOp,
+    ]);
+    const result = guardBoardOpsEnvelope(envelope, {
+      burstKey: nextBurstKey('batch'),
+      now: 4200,
+    });
+    expect(result.ops.length).toBe(1);
+    const [onlyOp] = result.ops;
+    expect(onlyOp?.type).toBe('batch');
+    if (onlyOp?.type === 'batch') {
+      expect(onlyOp.ops.length).toBe(1);
+      expect(onlyOp.ops[0]?.type).toBe('setElementText');
+    }
+    expect(result.telemetry.skippedNestedOps).toBe(2);
+    expect(result.telemetry.skipReasons['batch:child']).toBeGreaterThanOrEqual(1);
+    expect(result.telemetry.skipReasons['delete:id']).toBeGreaterThanOrEqual(1);
+    expect(result.telemetry.skipReasons['text:invalid']).toBe(1);
+  });
+
+  it('clamps geometry patches and filters invalid control points', () => {
+    const envelope = buildGuardEnvelope([
+      {
+        type: 'setElementGeometry',
+        id: 'geom-shape',
+        x: -500,
+        y: 9999,
+        w: 32000,
+        h: -10,
+        points: [
+          [Number.NaN, 25],
+          [1200, -80],
+          ['bad'] as unknown as [number, number],
+        ],
+      } as BoardOp,
+    ]);
+    const result = guardBoardOpsEnvelope(envelope, {
+      burstKey: nextBurstKey('geom'),
+      now: 4300,
+    });
+    expect(result.ops.length).toBe(1);
+    const [op] = result.ops;
+    expect(op?.type).toBe('setElementGeometry');
+    if (op?.type === 'setElementGeometry') {
+      expect((op.x ?? 0) >= 0).toBe(true);
+      expect((op.y ?? 0) >= 0).toBe(true);
+      expect((op.w ?? 0) > 0).toBe(true);
+      expect((op.h ?? 0) > 0).toBe(true);
+      expect(op.points?.length).toBe(2);
+      op.points?.forEach(([x, y]) => {
+        expect(Number.isFinite(x)).toBe(true);
+        expect(Number.isFinite(y)).toBe(true);
+      });
+    }
+  });
+
   it('applies deterministic fallback after repeated invalid payloads and resets after TTL and valid ops', () => {
     const burstKey = nextBurstKey('burst');
     const options: BoardOpsGuardOptions = {
@@ -698,7 +801,7 @@ describe('board ops guard', () => {
       burstThreshold: 2,
       burstWindowMs: 500,
     };
-    const invalidEnvelope = buildGuardEnvelope([{ type: 'setElementText', id: 'burst', text: ' ' }]);
+    const invalidEnvelope = buildGuardEnvelope([{ type: 'setElementText', id: 'burst', text: 42 as unknown as string }]);
 
     const first = guardBoardOpsEnvelope(invalidEnvelope, { ...options, now: 0 });
     expect(first.fallbackApplied).toBe(false);
