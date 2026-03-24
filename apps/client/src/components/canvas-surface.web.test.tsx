@@ -3,8 +3,11 @@
 import { describe, expect, it } from 'bun:test';
 
 import { createEmptyBoardState } from '../../../shared/board-state';
-import type { BoardElement, BoardState } from '../../../shared/types';
-import { boardToTldrawDraftShapes } from './canvas-surface.tldraw-adapter';
+import { SENSEBOARD_AI_CONTENT_MAX_X, SENSEBOARD_AI_CONTENT_MIN_X } from '../../../shared/board-dimensions';
+import { BOARD_OPS_SCHEMA_VERSION } from '../../../shared/types';
+import type { BoardElement, BoardOp, BoardOpsEnvelope, BoardState } from '../../../shared/types';
+import { boardToTldrawDraftShapes, guardBoardOpsEnvelope } from './canvas-surface.tldraw-adapter';
+import type { BoardOpsGuardOptions } from './canvas-surface.tldraw-adapter';
 
 const withBoard = (elements: BoardElement[], order?: string[]): BoardState => {
   const board = createEmptyBoardState();
@@ -14,6 +17,18 @@ const withBoard = (elements: BoardElement[], order?: string[]): BoardState => {
   }
   return board;
 };
+
+const buildGuardEnvelope = (ops: unknown[], overrides?: Partial<BoardOpsEnvelope>): BoardOpsEnvelope =>
+  ({
+    kind: 'board_ops',
+    schemaVersion: overrides?.schemaVersion ?? BOARD_OPS_SCHEMA_VERSION,
+    summary: overrides?.summary,
+    text: overrides?.text,
+    ops: ops as BoardOp[],
+  }) as BoardOpsEnvelope;
+
+let burstCounter = 0;
+const nextBurstKey = (prefix: string) => `${prefix}-${++burstCounter}`;
 
 describe('canvas-surface tldraw adapter', () => {
   it('maps supported board element kinds to tldraw draft shapes', () => {
@@ -340,5 +355,368 @@ describe('canvas-surface tldraw adapter', () => {
       const lines = text.props.text.split('\n');
       expect(lines.length).toBeLessThanOrEqual(5);
     }
+  });
+});
+
+describe('board ops guard', () => {
+  it('keeps AI-created ops inside the AI lane while preserving system provenance', () => {
+    const aiLine = {
+      type: 'upsertElement',
+      element: {
+        id: 'ai-line',
+        kind: 'line',
+        points: [
+          [SENSEBOARD_AI_CONTENT_MIN_X - 200, 120],
+          [SENSEBOARD_AI_CONTENT_MAX_X + 600, 340],
+        ],
+        createdAt: 0,
+        createdBy: 'ai',
+      },
+    } as BoardOp;
+    const systemLine = {
+      type: 'upsertElement',
+      element: {
+        id: 'sys-line',
+        kind: 'line',
+        points: [
+          [SENSEBOARD_AI_CONTENT_MAX_X + 500, 200],
+          [SENSEBOARD_AI_CONTENT_MAX_X + 650, 320],
+        ],
+        createdAt: 1,
+        createdBy: 'system',
+      },
+    } as BoardOp;
+    const result = guardBoardOpsEnvelope(buildGuardEnvelope([aiLine, systemLine]), {
+      providerTag: 'test-provider',
+      burstKey: nextBurstKey('lane'),
+      now: 1700,
+    });
+    expect(result.ops).toHaveLength(2);
+    const first = result.ops[0];
+    const second = result.ops[1];
+    expect(first?.type).toBe('upsertElement');
+    expect(second?.type).toBe('upsertElement');
+    if (first?.type !== 'upsertElement' || second?.type !== 'upsertElement') {
+      return;
+    }
+    const aiPoints = first.element.kind === 'line' ? first.element.points : [];
+    expect(first.element.createdBy).toBe('ai');
+    aiPoints.forEach(([x]) => {
+      expect(x).toBeGreaterThanOrEqual(SENSEBOARD_AI_CONTENT_MIN_X);
+      expect(x).toBeLessThanOrEqual(SENSEBOARD_AI_CONTENT_MAX_X);
+    });
+    expect(second.element.createdBy).toBe('system');
+    if (second.element.kind === 'line') {
+      expect(second.element.points[0]?.[0]).toBeGreaterThan(SENSEBOARD_AI_CONTENT_MAX_X);
+    }
+    expect(result.telemetry.clampReasons).toContain('upsert:line_points:x');
+    expect(result.telemetry.clampReasons).not.toContain('upsert:created_by');
+  });
+
+  it('reports invalid envelope metadata', () => {
+    const missing = guardBoardOpsEnvelope(null, { burstKey: nextBurstKey('meta'), now: 10 });
+    expect(missing.telemetry.skipReasons['envelope:missing']).toBe(1);
+
+    const badKind = guardBoardOpsEnvelope(
+      {
+        kind: 'not-board-ops',
+        schemaVersion: 0,
+        ops: [],
+      } as unknown as BoardOpsEnvelope,
+      { burstKey: nextBurstKey('meta'), now: 20 },
+    );
+    expect(badKind.telemetry.skipReasons['envelope:kind']).toBe(1);
+
+    const badOps = guardBoardOpsEnvelope(
+      {
+        kind: 'board_ops',
+        schemaVersion: 0,
+        ops: 'oops' as unknown as BoardOp[],
+      } as BoardOpsEnvelope,
+      { burstKey: nextBurstKey('meta'), now: 30 },
+    );
+    expect(badOps.telemetry.skipReasons['envelope:ops']).toBe(1);
+  });
+
+  it('tracks every skip reason bucket', () => {
+    const skipCases: Array<{ reason: string; envelope: BoardOpsEnvelope }> = [
+      { reason: 'op:invalid', envelope: buildGuardEnvelope([null as unknown as BoardOp]) },
+      {
+        reason: 'upsert:invalid_element',
+        envelope: buildGuardEnvelope([
+          {
+            type: 'upsertElement',
+            element: {
+              id: '',
+              kind: 'text',
+              x: 10,
+              y: 10,
+              text: 'invalid',
+              createdAt: 0,
+              createdBy: 'ai',
+            },
+          } as BoardOp,
+        ]),
+      },
+      {
+        reason: 'append:id',
+        envelope: buildGuardEnvelope([{ type: 'appendStrokePoints', id: '', points: [[0, 0]] } as BoardOp]),
+      },
+      {
+        reason: 'append:points_empty',
+        envelope: buildGuardEnvelope([{ type: 'appendStrokePoints', id: 'stroke-empty', points: [] }]),
+      },
+      {
+        reason: 'geometry:id',
+        envelope: buildGuardEnvelope([{ type: 'setElementGeometry', id: '', x: 1 } as BoardOp]),
+      },
+      {
+        reason: 'geometry:points_invalid',
+        envelope: buildGuardEnvelope([
+          { type: 'setElementGeometry', id: 'geom-points', points: [['lonely']] } as unknown as BoardOp,
+        ]),
+      },
+      {
+        reason: 'geometry:empty',
+        envelope: buildGuardEnvelope([{ type: 'setElementGeometry', id: 'geom-empty' } as BoardOp]),
+      },
+      {
+        reason: 'offset:id',
+        envelope: buildGuardEnvelope([{ type: 'offsetElement', id: '', dx: 1, dy: 1 } as BoardOp]),
+      },
+      {
+        reason: 'offset:zero_delta',
+        envelope: buildGuardEnvelope([{ type: 'offsetElement', id: 'shape', dx: 0, dy: 0 }]),
+      },
+      {
+        reason: 'text:id',
+        envelope: buildGuardEnvelope([{ type: 'setElementText', id: '', text: 'valid' } as BoardOp]),
+      },
+      {
+        reason: 'text:empty',
+        envelope: buildGuardEnvelope([{ type: 'setElementText', id: 'text-empty', text: '   ' }]),
+      },
+      {
+        reason: 'style:id',
+        envelope: buildGuardEnvelope([{ type: 'setElementStyle', id: '', style: {} } as BoardOp]),
+      },
+      {
+        reason: 'style:empty',
+        envelope: buildGuardEnvelope([
+          { type: 'setElementStyle', id: 'style-empty', style: { strokeWidth: 'wide' as unknown as number } },
+        ]),
+      },
+      {
+        reason: 'delete:id',
+        envelope: buildGuardEnvelope([{ type: 'deleteElement', id: '' } as BoardOp]),
+      },
+      {
+        reason: 'duplicate:id',
+        envelope: buildGuardEnvelope([{ type: 'duplicateElement', id: '', newId: '' } as BoardOp]),
+      },
+      {
+        reason: 'zindex:invalid',
+        envelope: buildGuardEnvelope([{ type: 'setElementZIndex', id: 'z', zIndex: Number.NaN } as BoardOp]),
+      },
+      {
+        reason: 'align:ids',
+        envelope: buildGuardEnvelope([{ type: 'alignElements', ids: ['solo'], axis: 'left' } as BoardOp]),
+      },
+      {
+        reason: 'distribute:ids',
+        envelope: buildGuardEnvelope([{ type: 'distributeElements', ids: ['solo'], axis: 'horizontal' } as BoardOp]),
+      },
+      {
+        reason: 'viewport:empty',
+        envelope: buildGuardEnvelope([{ type: 'setViewport', viewport: {} } as BoardOp]),
+      },
+      {
+        reason: 'batch:invalid',
+        envelope: buildGuardEnvelope([{ type: 'batch', ops: 'nope' as unknown as BoardOp[] } as BoardOp]),
+      },
+      {
+        reason: 'batch:child',
+        envelope: buildGuardEnvelope([
+          { type: 'batch', ops: [{ type: 'deleteElement', id: '' } as BoardOp] } as BoardOp,
+        ]),
+      },
+      {
+        reason: 'batch:empty',
+        envelope: buildGuardEnvelope([{ type: 'batch', ops: [] } as BoardOp]),
+      },
+    ];
+
+    skipCases.forEach((testCase, index) => {
+      const result = guardBoardOpsEnvelope(testCase.envelope, {
+        burstKey: nextBurstKey('skip'),
+        now: 2000 + index,
+      });
+      expect(result.telemetry.skipReasons[testCase.reason] ?? 0).toBeGreaterThan(0);
+    });
+  });
+
+  it('captures clamp reasons across operations', () => {
+    const clampOps: unknown[] = [
+      {
+        type: 'upsertElement',
+        element: {
+          id: 'text-bound',
+          kind: 'text',
+          x: -200,
+          y: 99999,
+          text: 'Line with carriage\rreturn',
+          createdAt: 0,
+          createdBy: 'robot',
+          zIndex: 200000,
+          style: { strokeWidth: 999, fontSize: 999 },
+        },
+      },
+      {
+        type: 'upsertElement',
+        element: {
+          id: 'sticky-long',
+          kind: 'sticky',
+          x: 80,
+          y: 40,
+          w: 200,
+          h: 200,
+          text: 's'.repeat(5000),
+          createdAt: 1,
+          createdBy: 'ai',
+        },
+      },
+      {
+        type: 'upsertElement',
+        element: {
+          id: 'text-empty',
+          kind: 'text',
+          x: 44,
+          y: 44,
+          text: ' ',
+          createdAt: 2,
+          createdBy: 'ai',
+        },
+      },
+      {
+        type: 'upsertElement',
+        element: {
+          id: 'line-short',
+          kind: 'line',
+          points: [[60, 60]],
+          createdAt: 3,
+          createdBy: 'ai',
+        },
+      },
+      {
+        type: 'appendStrokePoints',
+        id: 'stroke-1',
+        points: [
+          [Number.NaN, Number.NaN],
+          ['lonely'] as unknown as [number, number],
+        ],
+      },
+      {
+        type: 'setElementGeometry',
+        id: 'geom-1',
+        x: -60,
+        y: 12000,
+        w: 32000,
+        h: 32000,
+        points: [
+          [Number.NaN, 40],
+          [40, Number.NaN],
+          ['bad'] as unknown as [number, number],
+        ],
+      },
+      { type: 'offsetElement', id: 'shape-1', dx: 40000, dy: -40000 },
+      { type: 'duplicateElement', id: 'shape-1', newId: 'shape-2', dx: 50000, dy: -60000 },
+      { type: 'setElementZIndex', id: 'shape-1', zIndex: 999999 },
+      { type: 'alignElements', ids: ['a', 'b'], axis: 'diagonal' as 'left' },
+      {
+        type: 'distributeElements',
+        ids: ['a', 'b'],
+        axis: 'slanted' as 'horizontal',
+        gap: 90000,
+      },
+      {
+        type: 'setViewport',
+        viewport: { x: -250, y: 99000, zoom: 90 },
+      },
+      { type: 'setElementText', id: 'text-set', text: 'Normalized\r\ntext' },
+      { type: 'clearBoard' },
+    ];
+
+    const result = guardBoardOpsEnvelope(
+      buildGuardEnvelope(clampOps, { schemaVersion: BOARD_OPS_SCHEMA_VERSION + 5 }),
+      { burstKey: nextBurstKey('clamp'), now: 3000 },
+    );
+
+    const expectedReasons = [
+      'schema:version',
+      'upsert:created_by',
+      'upsert:style',
+      'upsert:zindex',
+      'upsert:text_sanitized',
+      'upsert:text_x',
+      'upsert:text_y',
+      'upsert:text_empty',
+      'upsert:sticky_text',
+      'upsert:line_insufficient_points',
+      'append:points:x',
+      'append:points:y',
+      'append:points:invalid_point',
+      'geometry:w',
+      'geometry:h',
+      'geometry:x',
+      'geometry:y',
+      'geometry:points:x',
+      'geometry:points:y',
+      'geometry:points:invalid_point',
+      'offset:dx',
+      'offset:dy',
+      'duplicate:dx',
+      'duplicate:dy',
+      'zindex:clamped',
+      'align:axis',
+      'distribute:axis',
+      'distribute:gap',
+      'viewport:x',
+      'viewport:y',
+      'viewport:zoom',
+      'text:sanitized',
+    ];
+
+    expectedReasons.forEach((reason) => {
+      expect(result.telemetry.clampReasons).toContain(reason);
+    });
+  });
+
+  it('applies deterministic fallback after repeated invalid payloads and resets after TTL and valid ops', () => {
+    const burstKey = nextBurstKey('burst');
+    const options: BoardOpsGuardOptions = {
+      burstKey,
+      burstThreshold: 2,
+      burstWindowMs: 500,
+    };
+    const invalidEnvelope = buildGuardEnvelope([{ type: 'setElementText', id: 'burst', text: ' ' }]);
+
+    const first = guardBoardOpsEnvelope(invalidEnvelope, { ...options, now: 0 });
+    expect(first.fallbackApplied).toBe(false);
+
+    const second = guardBoardOpsEnvelope(invalidEnvelope, { ...options, now: 400 });
+    expect(second.fallbackApplied).toBe(true);
+    expect(second.telemetry.clampReasons).toContain('fallback:transcript_burst');
+
+    const afterTtl = guardBoardOpsEnvelope(invalidEnvelope, { ...options, now: 3600 });
+    expect(afterTtl.fallbackApplied).toBe(false);
+
+    const recovery = guardBoardOpsEnvelope(buildGuardEnvelope([{ type: 'clearBoard' }]), {
+      ...options,
+      now: 3700,
+    });
+    expect(recovery.fallbackApplied).toBe(false);
+
+    const nextInvalid = guardBoardOpsEnvelope(invalidEnvelope, { ...options, now: 3800 });
+    expect(nextInvalid.fallbackApplied).toBe(false);
   });
 });

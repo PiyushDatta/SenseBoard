@@ -475,18 +475,53 @@ interface BurstTrackerState {
 }
 
 const transcriptBurstHistory = new Map<string, BurstTrackerState>();
+const MAX_BURST_HISTORY_ENTRIES = 128;
+const BURST_HISTORY_TTL_MULTIPLIER = 4;
+
+const pruneTranscriptBurstHistory = (now: number, windowMs: number) => {
+  const ttl = Math.max(500, windowMs);
+  const expiredBefore = now - ttl * BURST_HISTORY_TTL_MULTIPLIER;
+  for (const [key, entry] of transcriptBurstHistory.entries()) {
+    if (entry.lastTimestamp < expiredBefore) {
+      transcriptBurstHistory.delete(key);
+    }
+  }
+  if (transcriptBurstHistory.size > MAX_BURST_HISTORY_ENTRIES) {
+    const ordered = Array.from(transcriptBurstHistory.entries()).sort(
+      (left, right) => left[1].lastTimestamp - right[1].lastTimestamp,
+    );
+    while (transcriptBurstHistory.size > MAX_BURST_HISTORY_ENTRIES && ordered.length > 0) {
+      const [staleKey] = ordered.shift() ?? [];
+      if (staleKey) {
+        transcriptBurstHistory.delete(staleKey);
+      }
+    }
+  }
+};
 
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
-const sanitizeBoardText = (value: unknown): string | null => {
+interface SanitizedTextResult {
+  text: string;
+  changed: boolean;
+}
+
+const CONTROL_CHAR_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]+/g;
+
+const sanitizeBoardText = (value: unknown): SanitizedTextResult | null => {
   if (typeof value !== 'string') {
     return null;
   }
-  const normalized = value.replace(/\r\n/g, '\n').trim();
-  if (!normalized) {
+  const normalizedLineEndings = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const withoutControlChars = normalizedLineEndings.replace(CONTROL_CHAR_PATTERN, '');
+  if (withoutControlChars.trim().length === 0) {
     return null;
   }
-  return normalized.slice(0, MAX_TEXT_LENGTH);
+  const text = withoutControlChars.slice(0, MAX_TEXT_LENGTH);
+  return {
+    text,
+    changed: text !== value,
+  };
 };
 
 const registerSkipReason = (skipReasons: Map<string, number>, reason: string) => {
@@ -566,11 +601,17 @@ const clampBoardElementForOps = (
   if (!element || typeof element.id !== 'string' || element.id.trim().length === 0) {
     return null;
   }
-  const createdBy = element.createdBy === 'system' ? 'system' : 'ai';
   const createdAt = isFiniteNumber(element.createdAt) ? element.createdAt : Date.now();
-  const bounds = createdBy === 'ai' ? AI_ELEMENT_BOUNDS : CANVAS_ELEMENT_BOUNDS;
-  const yMax = bounds.maxY;
   const counter: ClampCounter = { count: 0 };
+  const validCreatedBy = element.createdBy === 'ai' || element.createdBy === 'system';
+  const sanitizedCreatedBy: BoardElement['createdBy'] = validCreatedBy ? element.createdBy : 'ai';
+  if (!validCreatedBy) {
+    clampReasons.add('upsert:created_by');
+    counter.count += 1;
+  }
+  // AI-authored elements get nudged into the AI lane while system-created items can use the full canvas.
+  const bounds = sanitizedCreatedBy === 'ai' ? AI_ELEMENT_BOUNDS : CANVAS_ELEMENT_BOUNDS;
+  const yMax = bounds.maxY;
   const stylePatch = clampStylePatch(element.style);
   const sanitizedStyle = Object.keys(stylePatch).length > 0 ? (stylePatch as BoardElementStyle) : undefined;
   const styleChanged = STYLE_FIELDS.some(
@@ -597,7 +638,7 @@ const clampBoardElementForOps = (
   }
   const baseOverrides: Pick<BoardElement, 'createdAt' | 'createdBy' | 'style' | 'zIndex'> = {
     createdAt,
-    createdBy,
+    createdBy: sanitizedCreatedBy,
     style: sanitizedStyle,
     zIndex: sanitizedZIndex,
   };
@@ -622,17 +663,21 @@ const clampBoardElementForOps = (
   };
 
   if (element.kind === 'text') {
-    const text = sanitizeBoardText(element.text);
-    if (!text) {
+    const sanitizedText = sanitizeBoardText(element.text);
+    if (!sanitizedText) {
       clampReasons.add('upsert:text_empty');
       return null;
+    }
+    if (sanitizedText.changed) {
+      clampReasons.add('upsert:text_sanitized');
+      counter.count += 1;
     }
     const x = clampNumericValue(element.x, bounds.minX, bounds.maxX, 'upsert:text_x', clampReasons, counter);
     const y = clampNumericValue(element.y, bounds.minY, yMax, 'upsert:text_y', clampReasons, counter);
     return {
       element: {
         ...element,
-        text,
+        text: sanitizedText.text,
         x,
         y,
         ...baseOverrides,
@@ -652,7 +697,12 @@ const clampBoardElementForOps = (
     const prefix = `upsert:${element.kind}`;
     const rect = clampRectLike(element, prefix);
     if (element.kind === 'sticky') {
-      const text = typeof element.text === 'string' ? element.text.slice(0, MAX_TEXT_LENGTH) : '';
+      const stickySanitized = sanitizeBoardText(element.text);
+      const text = stickySanitized?.text ?? '';
+      if (stickySanitized?.changed) {
+        clampReasons.add('upsert:sticky_text');
+        counter.count += 1;
+      }
       return {
         element: {
           ...rect,
@@ -675,7 +725,7 @@ const clampBoardElementForOps = (
   }
 
   if (element.kind === 'line' || element.kind === 'stroke' || element.kind === 'arrow') {
-    const points = clampStrokePoints(element.points, CANVAS_ELEMENT_BOUNDS, `upsert:${element.kind}_points`, clampReasons, counter);
+    const points = clampStrokePoints(element.points, bounds, `upsert:${element.kind}_points`, clampReasons, counter);
     if (points.length < 2) {
       clampReasons.add(`upsert:${element.kind}_insufficient_points`);
       return null;
@@ -767,20 +817,28 @@ const clampSingleBoardOp = (
     const counter: ClampCounter = { count: 0 };
     const patch: BoardOp & { type: 'setElementGeometry' } = { type: 'setElementGeometry', id: op.id };
     let mutated = false;
+    let nextWidth: number | undefined;
+    if (op.w !== undefined) {
+      nextWidth = clampNumericValue(op.w, 1, CANVAS_ELEMENT_BOUNDS.maxWidth, 'geometry:w', clampReasons, counter);
+      patch.w = nextWidth;
+      mutated = true;
+    }
+    let nextHeight: number | undefined;
+    if (op.h !== undefined) {
+      nextHeight = clampNumericValue(op.h, 1, CANVAS_ELEMENT_BOUNDS.maxHeight, 'geometry:h', clampReasons, counter);
+      patch.h = nextHeight;
+      mutated = true;
+    }
     if (op.x !== undefined) {
-      patch.x = clampNumericValue(op.x, CANVAS_ELEMENT_BOUNDS.minX, CANVAS_ELEMENT_BOUNDS.maxX, 'geometry:x', clampReasons, counter);
+      const widthForClamp = nextWidth ?? 1;
+      const maxX = Math.max(CANVAS_ELEMENT_BOUNDS.minX, CANVAS_ELEMENT_BOUNDS.maxX - widthForClamp);
+      patch.x = clampNumericValue(op.x, CANVAS_ELEMENT_BOUNDS.minX, maxX, 'geometry:x', clampReasons, counter);
       mutated = true;
     }
     if (op.y !== undefined) {
-      patch.y = clampNumericValue(op.y, CANVAS_ELEMENT_BOUNDS.minY, CANVAS_ELEMENT_BOUNDS.maxY, 'geometry:y', clampReasons, counter);
-      mutated = true;
-    }
-    if (op.w !== undefined) {
-      patch.w = clampNumericValue(op.w, 1, CANVAS_ELEMENT_BOUNDS.maxWidth, 'geometry:w', clampReasons, counter);
-      mutated = true;
-    }
-    if (op.h !== undefined) {
-      patch.h = clampNumericValue(op.h, 1, CANVAS_ELEMENT_BOUNDS.maxHeight, 'geometry:h', clampReasons, counter);
+      const heightForClamp = nextHeight ?? 1;
+      const maxY = Math.max(CANVAS_ELEMENT_BOUNDS.minY, CANVAS_ELEMENT_BOUNDS.maxY - heightForClamp);
+      patch.y = clampNumericValue(op.y, CANVAS_ELEMENT_BOUNDS.minY, maxY, 'geometry:y', clampReasons, counter);
       mutated = true;
     }
     if (Array.isArray(op.points) && op.points.length > 0) {
@@ -835,14 +893,19 @@ const clampSingleBoardOp = (
       registerSkipReason(skipReasons, 'text:id');
       return null;
     }
-    const text = sanitizeBoardText(op.text);
-    if (!text) {
+    const sanitizedText = sanitizeBoardText(op.text);
+    if (!sanitizedText) {
       registerSkipReason(skipReasons, 'text:empty');
       return null;
     }
+    let clamped = 0;
+    if (sanitizedText.changed) {
+      clampReasons.add('text:sanitized');
+      clamped = 1;
+    }
     return {
-      op: { type: 'setElementText', id: op.id, text },
-      clamped: 0,
+      op: { type: 'setElementText', id: op.id, text: sanitizedText.text },
+      clamped,
       skippedChildren: 0,
     };
   }
@@ -1045,6 +1108,7 @@ const trackTranscriptBurst = (
   threshold: number,
   windowMs: number,
 ): { burstCount: number; triggered: boolean } => {
+  pruneTranscriptBurstHistory(now, windowMs);
   if (!invalidPayload) {
     transcriptBurstHistory.set(key, { count: 0, lastTimestamp: now });
     return { burstCount: 0, triggered: false };
