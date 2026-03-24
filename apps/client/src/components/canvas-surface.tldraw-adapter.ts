@@ -1,3 +1,12 @@
+import {
+  SENSEBOARD_AI_CONTENT_MAX_X,
+  SENSEBOARD_AI_CONTENT_MIN_X,
+  SENSEBOARD_AI_ELEMENT_MAX_HEIGHT,
+  SENSEBOARD_AI_ELEMENT_MAX_WIDTH,
+  SENSEBOARD_CANVAS_HEIGHT,
+  SENSEBOARD_CANVAS_PADDING,
+  SENSEBOARD_CANVAS_WIDTH,
+} from '../../../shared/board-dimensions';
 import type { BoardElement, BoardPoint, BoardState } from '../../../shared/types';
 
 export type TldrawColorName =
@@ -370,6 +379,430 @@ const clampNumber = (value: number, min: number, max: number): number => {
   return Math.min(max, Math.max(min, value));
 };
 
+const CANVAS_MIN_X = SENSEBOARD_CANVAS_PADDING;
+const CANVAS_MAX_X = SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING;
+const CANVAS_MIN_Y = SENSEBOARD_CANVAS_PADDING;
+const CANVAS_MAX_Y = SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING;
+const AI_LANE_MIN_X = clampNumber(SENSEBOARD_AI_CONTENT_MIN_X, CANVAS_MIN_X, CANVAS_MAX_X);
+const AI_LANE_MAX_X = clampNumber(SENSEBOARD_AI_CONTENT_MAX_X, AI_LANE_MIN_X + 1, CANVAS_MAX_X);
+const AI_LANE_MAX_WIDTH = Math.max(1, Math.min(AI_LANE_MAX_X - AI_LANE_MIN_X, SENSEBOARD_AI_ELEMENT_MAX_WIDTH));
+const AI_LANE_MAX_HEIGHT = Math.max(1, Math.min(CANVAS_MAX_Y - CANVAS_MIN_Y, SENSEBOARD_AI_ELEMENT_MAX_HEIGHT));
+const DEFAULT_GEOMETRY_WIDTH = 320;
+const DEFAULT_GEOMETRY_HEIGHT = 180;
+const FALLBACK_TEXT_WIDTH = 520;
+const FALLBACK_MIN_TEXT_WIDTH = 200;
+const FALLBACK_HORIZONTAL_MARGIN = 12;
+const FALLBACK_VERTICAL_MARGIN_TOP = 20;
+const FALLBACK_VERTICAL_MARGIN_BOTTOM = 40;
+const FALLBACK_ROW_SPACING = 64;
+const FALLBACK_COLUMN_GAP = 48;
+const FALLBACK_Z_INDEX_BASE = 1000000;
+const FALLBACK_TEXT_MAX_LINES = 3;
+
+interface GeometryBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  maxWidth: number;
+  maxHeight: number;
+}
+
+type GeometryCorrectionAction =
+  | {
+      type: 'clamp';
+      field: 'x' | 'y' | 'w' | 'h';
+      reason: 'non_finite' | 'out_of_bounds';
+      from: number | null;
+      to: number;
+    }
+  | {
+      type: 'clamp_point';
+      pointIndex: number;
+      reason: 'out_of_bounds';
+      from: [number | null, number | null];
+      to: [number, number];
+    }
+  | {
+      type: 'drop_point';
+      pointIndex: number;
+      reason: 'non_finite';
+      from: [number | null, number | null] | null;
+    }
+  | {
+      type: 'drop';
+      reason: string;
+    };
+
+interface GeometryCorrectionEvent {
+  elementId: string;
+  kind: BoardElement['kind'];
+  actions: GeometryCorrectionAction[];
+}
+
+type GeometryCorrectionMap = Map<string, GeometryCorrectionEvent>;
+
+interface GeometryCorrectionSummary {
+  events: number;
+  clamped: number;
+  clampedPoints: number;
+  droppedPoints: number;
+  droppedElements: number;
+  fallbackDrafts: number;
+}
+
+interface GeometryCorrectionMetricPayload {
+  kind: 'senseboard_geometry_correction';
+  source: 'canvas-surface.tldraw-adapter';
+  summary: GeometryCorrectionSummary;
+  events: GeometryCorrectionEvent[];
+  timestamp: number;
+}
+
+interface SenseboardTelemetrySink {
+  emit: (payload: GeometryCorrectionMetricPayload) => void;
+  log?: (payload: GeometryCorrectionMetricPayload) => void;
+}
+
+declare global {
+  interface Window {
+    senseboardTelemetry?: SenseboardTelemetrySink;
+  }
+}
+
+type SanitizedElementResult =
+  | { element: BoardElement; dropped: false }
+  | { element: BoardElement; dropped: true; reason: string };
+
+const safeMetricNumber = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  return null;
+};
+
+const recordGeometryCorrection = (map: GeometryCorrectionMap, element: BoardElement, action: GeometryCorrectionAction) => {
+  let record = map.get(element.id);
+  if (!record) {
+    record = {
+      elementId: element.id,
+      kind: element.kind,
+      actions: [],
+    };
+    map.set(element.id, record);
+  }
+  record.actions.push(action);
+};
+
+const getGeometryBounds = (element: BoardElement): GeometryBounds => {
+  const minX = CANVAS_MIN_X;
+  const maxX = CANVAS_MAX_X;
+  const minY = CANVAS_MIN_Y;
+  const maxY = CANVAS_MAX_Y;
+  const widthLimit =
+    element.createdBy === 'ai'
+      ? Math.min(CANVAS_MAX_X - CANVAS_MIN_X, AI_LANE_MAX_WIDTH)
+      : CANVAS_MAX_X - CANVAS_MIN_X;
+  const heightLimit =
+    element.createdBy === 'ai'
+      ? Math.min(CANVAS_MAX_Y - CANVAS_MIN_Y, AI_LANE_MAX_HEIGHT)
+      : CANVAS_MAX_Y - CANVAS_MIN_Y;
+  return {
+    minX,
+    maxX,
+    minY,
+    maxY,
+    maxWidth: Math.max(1, widthLimit),
+    maxHeight: Math.max(1, heightLimit),
+  };
+};
+
+const clampCoordinateValue = (
+  element: BoardElement,
+  corrections: GeometryCorrectionMap,
+  field: 'x' | 'y',
+  value: number,
+  min: number,
+  max: number,
+): number => {
+  const boundedMax = Math.max(min, max);
+  if (!Number.isFinite(value)) {
+    const fallback = min;
+    recordGeometryCorrection(corrections, element, {
+      type: 'clamp',
+      field,
+      reason: 'non_finite',
+      from: safeMetricNumber(value),
+      to: fallback,
+    });
+    return fallback;
+  }
+  const clamped = clampNumber(value, min, boundedMax);
+  if (clamped !== value) {
+    recordGeometryCorrection(corrections, element, {
+      type: 'clamp',
+      field,
+      reason: 'out_of_bounds',
+      from: safeMetricNumber(value),
+      to: clamped,
+    });
+  }
+  return clamped;
+};
+
+const clampDimensionValue = (
+  element: BoardElement,
+  corrections: GeometryCorrectionMap,
+  field: 'w' | 'h',
+  value: number,
+  maxValue: number,
+): number => {
+  const min = 1;
+  const boundedMax = Math.max(min, maxValue);
+  const fallback = clampNumber(field === 'w' ? DEFAULT_GEOMETRY_WIDTH : DEFAULT_GEOMETRY_HEIGHT, min, boundedMax);
+  if (!Number.isFinite(value)) {
+    recordGeometryCorrection(corrections, element, {
+      type: 'clamp',
+      field,
+      reason: 'non_finite',
+      from: safeMetricNumber(value),
+      to: fallback,
+    });
+    return fallback;
+  }
+  const clamped = clampNumber(value, min, boundedMax);
+  if (clamped !== value) {
+    recordGeometryCorrection(corrections, element, {
+      type: 'clamp',
+      field,
+      reason: 'out_of_bounds',
+      from: safeMetricNumber(value),
+      to: clamped,
+    });
+  }
+  return clamped;
+};
+
+const sanitizeBoardElementGeometry = (element: BoardElement, corrections: GeometryCorrectionMap): SanitizedElementResult => {
+  const bounds = getGeometryBounds(element);
+
+  if (element.kind === 'text') {
+    const x = clampCoordinateValue(element, corrections, 'x', element.x, bounds.minX, bounds.maxX);
+    const y = clampCoordinateValue(element, corrections, 'y', element.y, bounds.minY, bounds.maxY);
+    return {
+      element: {
+        ...element,
+        x,
+        y,
+      },
+      dropped: false,
+    };
+  }
+
+  if (isContainerElement(element)) {
+    const w = clampDimensionValue(element, corrections, 'w', element.w, bounds.maxWidth);
+    const h = clampDimensionValue(element, corrections, 'h', element.h, bounds.maxHeight);
+    const x = clampCoordinateValue(element, corrections, 'x', element.x, bounds.minX, Math.max(bounds.minX, bounds.maxX - w));
+    const y = clampCoordinateValue(element, corrections, 'y', element.y, bounds.minY, Math.max(bounds.minY, bounds.maxY - h));
+    return {
+      element: {
+        ...element,
+        x,
+        y,
+        w,
+        h,
+      },
+      dropped: false,
+    };
+  }
+
+  if (element.kind === 'stroke' || element.kind === 'line' || element.kind === 'arrow') {
+    const sanitizedPoints: BoardPoint[] = [];
+    for (let index = 0; index < element.points.length; index += 1) {
+      const point = element.points[index];
+      if (!point || point.length < 2) {
+        recordGeometryCorrection(corrections, element, {
+          type: 'drop_point',
+          pointIndex: index,
+          reason: 'non_finite',
+          from: null,
+        });
+        continue;
+      }
+      const [xRaw, yRaw] = point;
+      const hasFiniteX = typeof xRaw === 'number' && Number.isFinite(xRaw);
+      const hasFiniteY = typeof yRaw === 'number' && Number.isFinite(yRaw);
+      if (!hasFiniteX || !hasFiniteY) {
+        recordGeometryCorrection(corrections, element, {
+          type: 'drop_point',
+          pointIndex: index,
+          reason: 'non_finite',
+          from: [safeMetricNumber(xRaw), safeMetricNumber(yRaw)],
+        });
+        continue;
+      }
+      const x = clampNumber(xRaw, bounds.minX, bounds.maxX);
+      const y = clampNumber(yRaw, bounds.minY, bounds.maxY);
+      if (x !== xRaw || y !== yRaw) {
+        recordGeometryCorrection(corrections, element, {
+          type: 'clamp_point',
+          pointIndex: index,
+          reason: 'out_of_bounds',
+          from: [safeMetricNumber(xRaw), safeMetricNumber(yRaw)],
+          to: [x, y],
+        });
+      }
+      sanitizedPoints.push([x, y]);
+    }
+
+    if (sanitizedPoints.length < 2) {
+      recordGeometryCorrection(corrections, element, {
+        type: 'drop',
+        reason: 'insufficient_points',
+      });
+      return { element, dropped: true, reason: 'insufficient_points' };
+    }
+
+    return {
+      element: {
+        ...element,
+        points: sanitizedPoints,
+      },
+      dropped: false,
+    };
+  }
+
+  return { element, dropped: false };
+};
+
+const describeFallbackReason = (value: string): string => {
+  if (value === 'insufficient_points') {
+    return 'insufficient geometry data';
+  }
+  return value.replace(/[_-]+/g, ' ');
+};
+
+const shortenElementId = (value: string): string => {
+  const normalized = value.trim();
+  if (normalized.length <= 32) {
+    return normalized;
+  }
+  return `${normalized.slice(0, 12)}...${normalized.slice(-8)}`;
+};
+
+const createGeometryFallbackDraft = (element: BoardElement, index: number, reason: string): TldrawDraftTextShape => {
+  const laneWidth = Math.max(1, AI_LANE_MAX_X - AI_LANE_MIN_X);
+  const maxWidth = Math.max(1, laneWidth - FALLBACK_HORIZONTAL_MARGIN * 2);
+  const minWidth = Math.min(FALLBACK_MIN_TEXT_WIDTH, maxWidth);
+  const width = Math.max(minWidth, Math.min(FALLBACK_TEXT_WIDTH, maxWidth));
+  const verticalSpace = Math.max(
+    1,
+    CANVAS_MAX_Y - CANVAS_MIN_Y - (FALLBACK_VERTICAL_MARGIN_TOP + FALLBACK_VERTICAL_MARGIN_BOTTOM),
+  );
+  const usableRows = Math.max(1, Math.floor(verticalSpace / FALLBACK_ROW_SPACING));
+  const column = Math.floor(index / usableRows);
+  const row = index % usableRows;
+  const minX = AI_LANE_MIN_X + FALLBACK_HORIZONTAL_MARGIN;
+  const maxX = Math.max(minX, AI_LANE_MAX_X - FALLBACK_HORIZONTAL_MARGIN - width);
+  const x = clampNumber(minX + column * (width + FALLBACK_COLUMN_GAP), minX, maxX);
+  const minY = CANVAS_MIN_Y + FALLBACK_VERTICAL_MARGIN_TOP;
+  const maxY = Math.max(minY, CANVAS_MAX_Y - FALLBACK_VERTICAL_MARGIN_BOTTOM);
+  const y = clampNumber(minY + row * FALLBACK_ROW_SPACING, minY, maxY);
+  const prefix = element.createdBy === 'ai' ? 'AI geometry correction' : 'Geometry correction';
+  const message = `${prefix} (${element.kind} ${shortenElementId(element.id)}): ${describeFallbackReason(reason)}`;
+  return {
+    kind: 'text',
+    id: toSafeShapeKey(`fallback:${element.id}:${index}`),
+    x,
+    y,
+    zIndex: FALLBACK_Z_INDEX_BASE + index,
+    props: {
+      text: wrapTextToShape(message, width, 's', FALLBACK_TEXT_MAX_LINES),
+      color: 'red',
+      size: 's',
+      w: width,
+      autoSize: false,
+    },
+  };
+};
+
+const emitGeometryCorrectionMetrics = (events: GeometryCorrectionEvent[], fallbackDraftCount: number) => {
+  if (events.length === 0 && fallbackDraftCount === 0) {
+    return;
+  }
+  const summary = events.reduce<GeometryCorrectionSummary>(
+    (acc, event) => {
+      for (const action of event.actions) {
+        if (action.type === 'clamp') {
+          acc.clamped += 1;
+        } else if (action.type === 'clamp_point') {
+          acc.clampedPoints += 1;
+        } else if (action.type === 'drop_point') {
+          acc.droppedPoints += 1;
+        } else if (action.type === 'drop') {
+          acc.droppedElements += 1;
+        }
+      }
+      return acc;
+    },
+    {
+      events: events.length,
+      clamped: 0,
+      clampedPoints: 0,
+      droppedPoints: 0,
+      droppedElements: 0,
+      fallbackDrafts: fallbackDraftCount,
+    },
+  );
+
+  const payload: GeometryCorrectionMetricPayload = {
+    kind: 'senseboard_geometry_correction',
+    source: 'canvas-surface.tldraw-adapter',
+    summary,
+    events,
+    timestamp: Date.now(),
+  };
+
+  if (typeof window !== 'undefined') {
+    const telemetry = window.senseboardTelemetry;
+    if (telemetry) {
+      if (typeof telemetry.emit === 'function') {
+        try {
+          telemetry.emit(payload);
+        } catch {
+          /* ignore telemetry errors */
+        }
+      }
+      if (typeof telemetry.log === 'function') {
+        try {
+          telemetry.log(payload);
+        } catch {
+          /* ignore telemetry errors */
+        }
+      }
+    }
+    if (typeof window.dispatchEvent === 'function') {
+      const CustomEventCtor =
+        typeof window.CustomEvent === 'function'
+          ? window.CustomEvent
+          : typeof CustomEvent === 'function'
+            ? CustomEvent
+            : null;
+      if (CustomEventCtor) {
+        try {
+          window.dispatchEvent(new CustomEventCtor('senseboard:geometry_correction', { detail: payload }));
+        } catch {
+          /* ignore event errors */
+        }
+      }
+    }
+  }
+
+  if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+    console.warn('[SenseBoard][geometry]', payload);
+  }
+};
+
 const isContainerElement = (
   element: BoardElement,
 ): element is Extract<BoardElement, { kind: 'rect' | 'ellipse' | 'diamond' | 'triangle' | 'sticky' | 'frame' }> => {
@@ -675,14 +1108,36 @@ export const boardToTldrawDraftShapes = (
   }
 
   const ordered = getOrderedElements(board);
-  const textContainers = ordered
+  const corrections: GeometryCorrectionMap = new Map();
+  const sanitizedElements: BoardElement[] = [];
+  const fallbackDrafts: TldrawDraftShape[] = [];
+
+  let fallbackIndex = 0;
+  for (let index = 0; index < ordered.length; index += 1) {
+    const element = ordered[index]!;
+    const sanitized = sanitizeBoardElementGeometry(element, corrections);
+    if (sanitized.dropped) {
+      fallbackDrafts.push(createGeometryFallbackDraft(sanitized.element, fallbackIndex, sanitized.reason));
+      fallbackIndex += 1;
+      continue;
+    }
+    sanitizedElements.push(sanitized.element);
+  }
+
+  const textContainers = sanitizedElements
     .map((element) => toContainerBounds(element))
     .filter((value): value is TextContainerBounds => value !== null)
     .sort((left, right) => left.w * left.h - right.w * right.h);
-  const drafts = ordered
+  const drafts = sanitizedElements
     .map((element, orderIndex) => toDraftShape(element, orderIndex, showAiNotes, textContainers))
     .filter((shape): shape is TldrawDraftShape => Boolean(shape));
 
-  drafts.sort((left, right) => left.zIndex - right.zIndex);
-  return drafts;
+  const combinedDrafts = [...drafts, ...fallbackDrafts];
+  combinedDrafts.sort((left, right) => left.zIndex - right.zIndex);
+
+  if (corrections.size > 0) {
+    emitGeometryCorrectionMetrics(Array.from(corrections.values()), fallbackDrafts.length);
+  }
+
+  return combinedDrafts;
 };
