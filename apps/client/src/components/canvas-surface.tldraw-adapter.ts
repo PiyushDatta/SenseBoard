@@ -1,4 +1,13 @@
-import type { BoardElement, BoardPoint, BoardState } from '../../../shared/types';
+import {
+  SENSEBOARD_AI_CONTENT_MAX_X,
+  SENSEBOARD_AI_CONTENT_MIN_X,
+  SENSEBOARD_AI_ELEMENT_MAX_HEIGHT,
+  SENSEBOARD_AI_ELEMENT_MAX_WIDTH,
+  SENSEBOARD_CANVAS_HEIGHT,
+  SENSEBOARD_CANVAS_PADDING,
+  SENSEBOARD_CANVAS_WIDTH,
+} from '../../../shared/board-dimensions';
+import type { BoardElement, BoardElementStyle, BoardOp, BoardOpsEnvelope, BoardPoint, BoardState } from '../../../shared/types';
 
 export type TldrawColorName =
   | 'black'
@@ -368,6 +377,809 @@ const clampNumber = (value: number, min: number, max: number): number => {
     return min;
   }
   return Math.min(max, Math.max(min, value));
+};
+
+interface GuardBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  maxWidth: number;
+  maxHeight: number;
+}
+
+const CANVAS_ELEMENT_BOUNDS: GuardBounds = {
+  minX: SENSEBOARD_CANVAS_PADDING,
+  maxX: SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING,
+  minY: SENSEBOARD_CANVAS_PADDING,
+  maxY: SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING,
+  maxWidth: Math.max(1, SENSEBOARD_CANVAS_WIDTH - SENSEBOARD_CANVAS_PADDING * 2),
+  maxHeight: Math.max(1, SENSEBOARD_CANVAS_HEIGHT - SENSEBOARD_CANVAS_PADDING * 2),
+};
+
+const AI_MIN_X = clampNumber(SENSEBOARD_AI_CONTENT_MIN_X, CANVAS_ELEMENT_BOUNDS.minX, CANVAS_ELEMENT_BOUNDS.maxX - 1);
+const AI_MAX_X = clampNumber(SENSEBOARD_AI_CONTENT_MAX_X, AI_MIN_X + 1, CANVAS_ELEMENT_BOUNDS.maxX);
+
+const AI_ELEMENT_BOUNDS: GuardBounds = {
+  minX: AI_MIN_X,
+  maxX: AI_MAX_X,
+  minY: CANVAS_ELEMENT_BOUNDS.minY,
+  maxY: CANVAS_ELEMENT_BOUNDS.maxY,
+  maxWidth: Math.max(1, Math.min(SENSEBOARD_AI_ELEMENT_MAX_WIDTH, AI_MAX_X - AI_MIN_X)),
+  maxHeight: Math.max(1, Math.min(SENSEBOARD_AI_ELEMENT_MAX_HEIGHT, CANVAS_ELEMENT_BOUNDS.maxHeight)),
+};
+
+const MAX_TEXT_LENGTH = 4000;
+const MAX_MOVE_DELTA = SENSEBOARD_CANVAS_WIDTH;
+const MIN_VIEWPORT_ZOOM = 0.05;
+const MAX_VIEWPORT_ZOOM = 6;
+const DEFAULT_PROVIDER_TAG = 'unknown-provider';
+const DEFAULT_BURST_WINDOW_MS = 2500;
+const DEFAULT_BURST_THRESHOLD = 3;
+
+interface ClampCounter {
+  count: number;
+}
+
+interface ClampBoardOpResult {
+  op: BoardOp;
+  clamped: number;
+  skippedChildren: number;
+}
+
+export interface BoardOpsGuardTelemetry {
+  providerTag: string;
+  schemaVersion: number;
+  receivedOps: number;
+  forwardedOps: number;
+  skippedOps: number;
+  clampedOps: number;
+  clampReasons: string[];
+  skipReasons: Record<string, number>;
+  fallbackApplied: boolean;
+  fallbackReason: string | null;
+  burstCount: number;
+  burstKey: string;
+}
+
+interface BoardOpsGuardNotice {
+  kind: 'board_ops_guard';
+  message: string;
+  telemetry: BoardOpsGuardTelemetry;
+}
+
+type BoardOpsGuardLogger = (entry: { severity: 'debug' | 'info' | 'warn'; message: string; telemetry: BoardOpsGuardTelemetry }) => void;
+
+export interface BoardOpsGuardOptions {
+  providerTag?: string;
+  burstKey?: string;
+  now?: number;
+  burstThreshold?: number;
+  burstWindowMs?: number;
+  logger?: BoardOpsGuardLogger;
+  onNotice?: (notice: BoardOpsGuardNotice) => void;
+}
+
+export interface BoardOpsGuardResult {
+  ops: BoardOp[];
+  telemetry: BoardOpsGuardTelemetry;
+  fallbackApplied: boolean;
+}
+
+interface BurstTrackerState {
+  count: number;
+  lastTimestamp: number;
+}
+
+const transcriptBurstHistory = new Map<string, BurstTrackerState>();
+
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+
+const sanitizeBoardText = (value: unknown): string | null => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const normalized = value.replace(/\r\n/g, '\n').trim();
+  if (!normalized) {
+    return null;
+  }
+  return normalized.slice(0, MAX_TEXT_LENGTH);
+};
+
+const registerSkipReason = (skipReasons: Map<string, number>, reason: string) => {
+  skipReasons.set(reason, (skipReasons.get(reason) ?? 0) + 1);
+};
+
+const clampNumericValue = (
+  value: unknown,
+  min: number,
+  max: number,
+  reason: string,
+  clampReasons: Set<string>,
+  counter: ClampCounter,
+  fallback?: number,
+): number => {
+  const numeric = isFiniteNumber(value) ? value : fallback ?? min;
+  const clamped = clampNumber(numeric, min, max);
+  if (clamped !== numeric || numeric !== value) {
+    clampReasons.add(reason);
+    counter.count += 1;
+  }
+  return clamped;
+};
+
+const clampPointWithinBounds = (
+  point: unknown,
+  bounds: GuardBounds,
+  reason: string,
+  clampReasons: Set<string>,
+  counter: ClampCounter,
+): BoardPoint | null => {
+  if (!Array.isArray(point) || point.length < 2) {
+    clampReasons.add(`${reason}:invalid_point`);
+    counter.count += 1;
+    return null;
+  }
+  const [xRaw, yRaw] = point;
+  const xNumeric = isFiniteNumber(xRaw) ? xRaw : bounds.minX;
+  const yNumeric = isFiniteNumber(yRaw) ? yRaw : bounds.minY;
+  const x = clampNumber(xNumeric, bounds.minX, bounds.maxX);
+  const y = clampNumber(yNumeric, bounds.minY, bounds.maxY);
+  if (x !== xNumeric || xNumeric !== xRaw) {
+    clampReasons.add(`${reason}:x`);
+    counter.count += 1;
+  }
+  if (y !== yNumeric || yNumeric !== yRaw) {
+    clampReasons.add(`${reason}:y`);
+    counter.count += 1;
+  }
+  return [x, y];
+};
+
+const clampStrokePoints = (
+  points: unknown,
+  bounds: GuardBounds,
+  reason: string,
+  clampReasons: Set<string>,
+  counter: ClampCounter,
+): BoardPoint[] => {
+  if (!Array.isArray(points)) {
+    return [];
+  }
+  const sanitized: BoardPoint[] = [];
+  for (const entry of points) {
+    const clamped = clampPointWithinBounds(entry, bounds, reason, clampReasons, counter);
+    if (clamped) {
+      sanitized.push(clamped);
+    }
+  }
+  return sanitized;
+};
+
+const clampBoardElementForOps = (
+  element: BoardElement | null | undefined,
+  clampReasons: Set<string>,
+): { element: BoardElement; clamped: number } | null => {
+  if (!element || typeof element.id !== 'string' || element.id.trim().length === 0) {
+    return null;
+  }
+  const createdBy = element.createdBy === 'system' ? 'system' : 'ai';
+  const createdAt = isFiniteNumber(element.createdAt) ? element.createdAt : deterministicTimestampFromSeed(element.id);
+  const bounds = createdBy === 'ai' ? AI_ELEMENT_BOUNDS : CANVAS_ELEMENT_BOUNDS;
+  const yMax = bounds.maxY;
+  const counter: ClampCounter = { count: 0 };
+
+  const clampRectLike = <T extends { x: number; y: number; w: number; h: number }>(
+    target: T,
+    prefix: string,
+  ): T => {
+    const width = clampNumericValue(target.w, 1, bounds.maxWidth, `${prefix}:w`, clampReasons, counter);
+    const height = clampNumericValue(target.h, 1, bounds.maxHeight, `${prefix}:h`, clampReasons, counter);
+    const maxX = Math.max(bounds.minX, bounds.maxX - width);
+    const maxY = Math.max(bounds.minY, yMax - height);
+    const x = clampNumericValue(target.x, bounds.minX, maxX, `${prefix}:x`, clampReasons, counter);
+    const y = clampNumericValue(target.y, bounds.minY, maxY, `${prefix}:y`, clampReasons, counter);
+    return {
+      ...target,
+      x,
+      y,
+      w: width,
+      h: height,
+    };
+  };
+
+  if (element.kind === 'text') {
+    const text = sanitizeBoardText(element.text);
+    if (!text) {
+      clampReasons.add('upsert:text_empty');
+      return null;
+    }
+    const x = clampNumericValue(element.x, bounds.minX, bounds.maxX, 'upsert:text_x', clampReasons, counter);
+    const y = clampNumericValue(element.y, bounds.minY, yMax, 'upsert:text_y', clampReasons, counter);
+    return {
+      element: {
+        ...element,
+        text,
+        x,
+        y,
+        createdAt,
+        createdBy,
+      },
+      clamped: counter.count,
+    };
+  }
+
+  if (
+    element.kind === 'rect' ||
+    element.kind === 'ellipse' ||
+    element.kind === 'diamond' ||
+    element.kind === 'triangle' ||
+    element.kind === 'sticky' ||
+    element.kind === 'frame'
+  ) {
+    const prefix = `upsert:${element.kind}`;
+    const rect = clampRectLike(element, prefix);
+    if (element.kind === 'sticky') {
+      const text = typeof element.text === 'string' ? element.text.slice(0, MAX_TEXT_LENGTH) : '';
+      return {
+        element: {
+          ...rect,
+          text,
+          createdAt,
+          createdBy,
+        } as BoardElement,
+        clamped: counter.count,
+      };
+    }
+    if (element.kind === 'frame' && typeof element.title === 'string') {
+      rect.title = element.title.slice(0, MAX_TEXT_LENGTH);
+    }
+    return {
+      element: {
+        ...rect,
+        createdAt,
+        createdBy,
+      } as BoardElement,
+      clamped: counter.count,
+    };
+  }
+
+  if (element.kind === 'line' || element.kind === 'stroke' || element.kind === 'arrow') {
+    const points = clampStrokePoints(element.points, CANVAS_ELEMENT_BOUNDS, `upsert:${element.kind}_points`, clampReasons, counter);
+    if (points.length < 2) {
+      clampReasons.add(`upsert:${element.kind}_insufficient_points`);
+      return null;
+    }
+    return {
+      element: {
+        ...element,
+        points,
+        createdAt,
+        createdBy,
+      },
+      clamped: counter.count,
+    };
+  }
+
+  return null;
+};
+
+const clampStylePatch = (style: unknown): Partial<BoardElementStyle> => {
+  if (!style || typeof style !== 'object') {
+    return {};
+  }
+  const next: Partial<BoardElementStyle> = {};
+  if (typeof (style as BoardElementStyle).strokeColor === 'string') {
+    next.strokeColor = (style as BoardElementStyle).strokeColor.slice(0, 64);
+  }
+  if (typeof (style as BoardElementStyle).fillColor === 'string') {
+    next.fillColor = (style as BoardElementStyle).fillColor.slice(0, 64);
+  }
+  if (isFiniteNumber((style as BoardElementStyle).strokeWidth)) {
+    next.strokeWidth = clampNumber((style as BoardElementStyle).strokeWidth ?? 1, 0.2, 32);
+  }
+  if (isFiniteNumber((style as BoardElementStyle).roughness)) {
+    next.roughness = clampNumber((style as BoardElementStyle).roughness ?? 0, 0, 2);
+  }
+  if (isFiniteNumber((style as BoardElementStyle).fontSize)) {
+    next.fontSize = clampNumber((style as BoardElementStyle).fontSize ?? 16, 8, 120);
+  }
+  return next;
+};
+
+const clampSingleBoardOp = (
+  op: BoardOp | null | undefined,
+  clampReasons: Set<string>,
+  skipReasons: Map<string, number>,
+): ClampBoardOpResult | null => {
+  if (!op || typeof op !== 'object' || typeof op.type !== 'string') {
+    registerSkipReason(skipReasons, 'op:invalid');
+    return null;
+  }
+
+  if (op.type === 'upsertElement') {
+    const result = clampBoardElementForOps(op.element, clampReasons);
+    if (!result) {
+      registerSkipReason(skipReasons, 'upsert:invalid_element');
+      return null;
+    }
+    return {
+      op: { type: 'upsertElement', element: result.element },
+      clamped: result.clamped,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'appendStrokePoints') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0) {
+      registerSkipReason(skipReasons, 'append:id');
+      return null;
+    }
+    const counter: ClampCounter = { count: 0 };
+    const points = clampStrokePoints(op.points, CANVAS_ELEMENT_BOUNDS, 'append:points', clampReasons, counter);
+    if (points.length === 0) {
+      registerSkipReason(skipReasons, 'append:points_empty');
+      return null;
+    }
+    return {
+      op: { type: 'appendStrokePoints', id: op.id, points },
+      clamped: counter.count,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'setElementGeometry') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0) {
+      registerSkipReason(skipReasons, 'geometry:id');
+      return null;
+    }
+    const counter: ClampCounter = { count: 0 };
+    const patch: BoardOp & { type: 'setElementGeometry' } = { type: 'setElementGeometry', id: op.id };
+    let mutated = false;
+    if (op.x !== undefined) {
+      patch.x = clampNumericValue(op.x, CANVAS_ELEMENT_BOUNDS.minX, CANVAS_ELEMENT_BOUNDS.maxX, 'geometry:x', clampReasons, counter);
+      mutated = true;
+    }
+    if (op.y !== undefined) {
+      patch.y = clampNumericValue(op.y, CANVAS_ELEMENT_BOUNDS.minY, CANVAS_ELEMENT_BOUNDS.maxY, 'geometry:y', clampReasons, counter);
+      mutated = true;
+    }
+    if (op.w !== undefined) {
+      patch.w = clampNumericValue(op.w, 1, CANVAS_ELEMENT_BOUNDS.maxWidth, 'geometry:w', clampReasons, counter);
+      mutated = true;
+    }
+    if (op.h !== undefined) {
+      patch.h = clampNumericValue(op.h, 1, CANVAS_ELEMENT_BOUNDS.maxHeight, 'geometry:h', clampReasons, counter);
+      mutated = true;
+    }
+    if (Array.isArray(op.points) && op.points.length > 0) {
+      const points = clampStrokePoints(op.points, CANVAS_ELEMENT_BOUNDS, 'geometry:points', clampReasons, counter);
+      if (points.length > 0) {
+        patch.points = points;
+        mutated = true;
+      } else {
+        registerSkipReason(skipReasons, 'geometry:points_invalid');
+      }
+    }
+    if (!mutated) {
+      registerSkipReason(skipReasons, 'geometry:empty');
+      return null;
+    }
+    return {
+      op: patch,
+      clamped: counter.count,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'offsetElement') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0) {
+      registerSkipReason(skipReasons, 'offset:id');
+      return null;
+    }
+    const dx = isFiniteNumber(op.dx) ? clampNumber(op.dx, -MAX_MOVE_DELTA, MAX_MOVE_DELTA) : 0;
+    const dy = isFiniteNumber(op.dy) ? clampNumber(op.dy, -MAX_MOVE_DELTA, MAX_MOVE_DELTA) : 0;
+    if (dx === 0 && dy === 0) {
+      registerSkipReason(skipReasons, 'offset:zero_delta');
+      return null;
+    }
+    let clamped = 0;
+    if (dx !== op.dx) {
+      clampReasons.add('offset:dx');
+      clamped += 1;
+    }
+    if (dy !== op.dy) {
+      clampReasons.add('offset:dy');
+      clamped += 1;
+    }
+    return {
+      op: { type: 'offsetElement', id: op.id, dx, dy },
+      clamped,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'setElementText') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0) {
+      registerSkipReason(skipReasons, 'text:id');
+      return null;
+    }
+    const text = sanitizeBoardText(op.text);
+    if (!text) {
+      registerSkipReason(skipReasons, 'text:empty');
+      return null;
+    }
+    return {
+      op: { type: 'setElementText', id: op.id, text },
+      clamped: 0,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'setElementStyle') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0) {
+      registerSkipReason(skipReasons, 'style:id');
+      return null;
+    }
+    const style = clampStylePatch(op.style);
+    if (Object.keys(style).length === 0) {
+      registerSkipReason(skipReasons, 'style:empty');
+      return null;
+    }
+    return {
+      op: { type: 'setElementStyle', id: op.id, style },
+      clamped: 0,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'duplicateElement') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0 || typeof op.newId !== 'string' || op.newId.trim().length === 0) {
+      registerSkipReason(skipReasons, 'duplicate:id');
+      return null;
+    }
+    const dx = isFiniteNumber(op.dx) ? clampNumber(op.dx, -MAX_MOVE_DELTA, MAX_MOVE_DELTA) : 24;
+    const dy = isFiniteNumber(op.dy) ? clampNumber(op.dy, -MAX_MOVE_DELTA, MAX_MOVE_DELTA) : 24;
+    let clamped = 0;
+    if (dx !== op.dx) {
+      clampReasons.add('duplicate:dx');
+      clamped += 1;
+    }
+    if (dy !== op.dy) {
+      clampReasons.add('duplicate:dy');
+      clamped += 1;
+    }
+    return {
+      op: { type: 'duplicateElement', id: op.id, newId: op.newId, dx, dy },
+      clamped,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'setElementZIndex') {
+    if (typeof op.id !== 'string' || op.id.trim().length === 0 || !isFiniteNumber(op.zIndex)) {
+      registerSkipReason(skipReasons, 'zindex:invalid');
+      return null;
+    }
+    const zIndex = Math.round(clampNumber(op.zIndex, -100000, 100000));
+    if (zIndex === op.zIndex) {
+      return {
+        op,
+        clamped: 0,
+        skippedChildren: 0,
+      };
+    }
+    clampReasons.add('zindex:clamped');
+    return {
+      op: { type: 'setElementZIndex', id: op.id, zIndex },
+      clamped: 1,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'alignElements') {
+    const ids = Array.isArray(op.ids) ? op.ids.filter((id): id is string => typeof id === 'string' && id.trim().length > 0) : [];
+    if (ids.length < 2) {
+      registerSkipReason(skipReasons, 'align:ids');
+      return null;
+    }
+    const allowedAxes: Array<typeof op.axis> = ['left', 'center', 'right', 'x', 'top', 'middle', 'bottom', 'y'];
+    const axis = allowedAxes.includes(op.axis) ? op.axis : 'center';
+    if (axis !== op.axis) {
+      clampReasons.add('align:axis');
+    }
+    return {
+      op: { type: 'alignElements', ids, axis },
+      clamped: axis === op.axis ? 0 : 1,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'distributeElements') {
+    const ids = Array.isArray(op.ids) ? op.ids.filter((id): id is string => typeof id === 'string' && id.trim().length > 0) : [];
+    if (ids.length < 2) {
+      registerSkipReason(skipReasons, 'distribute:ids');
+      return null;
+    }
+    const allowedAxes: Array<typeof op.axis> = ['horizontal', 'vertical', 'x', 'y'];
+    const axis = allowedAxes.includes(op.axis) ? op.axis : 'horizontal';
+    if (axis !== op.axis) {
+      clampReasons.add('distribute:axis');
+    }
+    let clamped = axis === op.axis ? 0 : 1;
+    let gap: number | undefined;
+    if (op.gap !== undefined) {
+      gap = clampNumber(isFiniteNumber(op.gap) ? op.gap : 0, -MAX_MOVE_DELTA, MAX_MOVE_DELTA);
+      if (gap !== op.gap) {
+        clampReasons.add('distribute:gap');
+        clamped += 1;
+      }
+    }
+    return {
+      op: gap === undefined ? { type: 'distributeElements', ids, axis } : { type: 'distributeElements', ids, axis, gap },
+      clamped,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'setViewport') {
+    const viewport = op.viewport ?? {};
+    const nextViewport: typeof viewport = {};
+    const counter: ClampCounter = { count: 0 };
+    let mutated = false;
+    if (viewport.x !== undefined) {
+      nextViewport.x = clampNumericValue(viewport.x, CANVAS_ELEMENT_BOUNDS.minX, CANVAS_ELEMENT_BOUNDS.maxX, 'viewport:x', clampReasons, counter, CANVAS_ELEMENT_BOUNDS.minX);
+      mutated = true;
+    }
+    if (viewport.y !== undefined) {
+      nextViewport.y = clampNumericValue(viewport.y, CANVAS_ELEMENT_BOUNDS.minY, CANVAS_ELEMENT_BOUNDS.maxY, 'viewport:y', clampReasons, counter, CANVAS_ELEMENT_BOUNDS.minY);
+      mutated = true;
+    }
+    if (viewport.zoom !== undefined) {
+      nextViewport.zoom = clampNumericValue(viewport.zoom, MIN_VIEWPORT_ZOOM, MAX_VIEWPORT_ZOOM, 'viewport:zoom', clampReasons, counter, 1);
+      mutated = true;
+    }
+    if (!mutated) {
+      registerSkipReason(skipReasons, 'viewport:empty');
+      return null;
+    }
+    return {
+      op: { type: 'setViewport', viewport: nextViewport },
+      clamped: counter.count,
+      skippedChildren: 0,
+    };
+  }
+
+  if (op.type === 'batch') {
+    if (!Array.isArray(op.ops)) {
+      registerSkipReason(skipReasons, 'batch:invalid');
+      return null;
+    }
+    const sanitized: BoardOp[] = [];
+    let clamped = 0;
+    let skippedChildren = 0;
+    for (const nested of op.ops) {
+      const nestedResult = clampSingleBoardOp(nested as BoardOp, clampReasons, skipReasons);
+      if (nestedResult) {
+        sanitized.push(nestedResult.op);
+        clamped += nestedResult.clamped;
+        skippedChildren += nestedResult.skippedChildren;
+      } else {
+        skippedChildren += 1;
+        registerSkipReason(skipReasons, 'batch:child');
+      }
+    }
+    if (sanitized.length === 0) {
+      registerSkipReason(skipReasons, 'batch:empty');
+      return null;
+    }
+    return {
+      op: { type: 'batch', ops: sanitized },
+      clamped,
+      skippedChildren,
+    };
+  }
+
+  return {
+    op,
+    clamped: 0,
+    skippedChildren: 0,
+  };
+};
+
+const trackTranscriptBurst = (
+  key: string,
+  invalidPayload: boolean,
+  now: number,
+  threshold: number,
+  windowMs: number,
+): { burstCount: number; triggered: boolean } => {
+  if (!invalidPayload) {
+    transcriptBurstHistory.set(key, { count: 0, lastTimestamp: now });
+    return { burstCount: 0, triggered: false };
+  }
+  const previous = transcriptBurstHistory.get(key);
+  const withinWindow = previous && now - previous.lastTimestamp <= windowMs;
+  const nextCount = withinWindow ? (previous?.count ?? 0) + 1 : 1;
+  transcriptBurstHistory.set(key, { count: nextCount, lastTimestamp: now });
+  return { burstCount: nextCount, triggered: nextCount >= threshold };
+};
+
+const defaultGuardLogger: BoardOpsGuardLogger = (entry) => {
+  const target =
+    entry.severity === 'warn' ? console.warn : entry.severity === 'info' ? console.info : console.debug;
+  target('[board_ops_guard]', entry.message, entry.telemetry);
+};
+
+const defaultHostNoticeEmitter = (notice: BoardOpsGuardNotice) => {
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    try {
+      const event =
+        typeof CustomEvent === 'function'
+          ? new CustomEvent('senseboard:host-notice', { detail: notice })
+          : new Event('senseboard:host-notice');
+      window.dispatchEvent(event);
+    } catch {
+      // Swallow errors when the environment does not support CustomEvent.
+    }
+  }
+  console.warn('[host-notice]', notice.message, notice.telemetry);
+};
+
+const hashSeed = (value: string): number => {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+};
+
+const DETERMINISTIC_FALLBACK_EPOCH_MS = 1_700_000_000_000;
+
+const deterministicTimestampFromSeed = (seed: string, offset = 0): number => {
+  const hash = hashSeed(`${seed}:${offset}`);
+  return DETERMINISTIC_FALLBACK_EPOCH_MS + (hash % 1_000_000);
+};
+
+const buildDeterministicFallbackOps = (seed: string): BoardOp[] => {
+  const hash = hashSeed(seed);
+  const laneWidth = Math.max(1, AI_ELEMENT_BOUNDS.maxX - AI_ELEMENT_BOUNDS.minX);
+  const laneOffset = hash % laneWidth;
+  const baseX = clampNumber(AI_ELEMENT_BOUNDS.minX + 40 + laneOffset, AI_ELEMENT_BOUNDS.minX + 40, AI_ELEMENT_BOUNDS.maxX - 240);
+  const baseY = clampNumber(CANVAS_ELEMENT_BOUNDS.minY + 120 + (hash % 200), CANVAS_ELEMENT_BOUNDS.minY + 80, CANVAS_ELEMENT_BOUNDS.maxY - 240);
+  const connectorEndX = clampNumber(baseX + 320, AI_ELEMENT_BOUNDS.minX + 120, AI_ELEMENT_BOUNDS.maxX - 40);
+  const fallbackTimestamp = deterministicTimestampFromSeed(`${seed}:fallback`);
+
+  const fallbackElements: BoardElement[] = [
+    {
+      id: `guard:text:${seed}`,
+      kind: 'text',
+      x: baseX,
+      y: baseY,
+      text: 'Capturing the spoken flow while board ops stabilize.',
+      createdAt: fallbackTimestamp,
+      createdBy: 'ai',
+    },
+    {
+      id: `guard:connector:${seed}`,
+      kind: 'arrow',
+      points: [
+        [baseX + 40, baseY + 120],
+        [connectorEndX, baseY + 120],
+      ],
+      createdAt: fallbackTimestamp + 1,
+      createdBy: 'ai',
+    },
+    {
+      id: `guard:note:${seed}`,
+      kind: 'text',
+      x: connectorEndX - 40,
+      y: baseY + 96,
+      text: 'Placeholder connectors rendered deterministically.',
+      createdAt: fallbackTimestamp + 2,
+      createdBy: 'ai',
+    },
+  ];
+
+  return fallbackElements.map<BoardOp>((element) => ({ type: 'upsertElement', element }));
+};
+
+export const guardBoardOpsEnvelope = (
+  envelope: BoardOpsEnvelope | null | undefined,
+  options?: BoardOpsGuardOptions,
+): BoardOpsGuardResult => {
+  const providerTag = options?.providerTag ?? DEFAULT_PROVIDER_TAG;
+  const burstKey = options?.burstKey ?? providerTag;
+  const now = options?.now ?? Date.now();
+  const logger = options?.logger ?? defaultGuardLogger;
+  const noticeEmitter = options?.onNotice ?? defaultHostNoticeEmitter;
+  const rawOps = Array.isArray(envelope?.ops) ? envelope!.ops : [];
+  const clampReasons = new Set<string>();
+  const skipReasons = new Map<string, number>();
+
+  const sanitizedOps: BoardOp[] = [];
+  let clampedFields = 0;
+  let skippedTopLevel = 0;
+  let skippedNested = 0;
+
+  for (const raw of rawOps) {
+    const result = clampSingleBoardOp(raw as BoardOp, clampReasons, skipReasons);
+    if (result) {
+      sanitizedOps.push(result.op);
+      clampedFields += result.clamped;
+      skippedNested += result.skippedChildren;
+    } else {
+      skippedTopLevel += 1;
+    }
+  }
+
+  const { burstCount, triggered } = trackTranscriptBurst(
+    burstKey,
+    sanitizedOps.length === 0,
+    now,
+    options?.burstThreshold ?? DEFAULT_BURST_THRESHOLD,
+    options?.burstWindowMs ?? DEFAULT_BURST_WINDOW_MS,
+  );
+
+  let fallbackApplied = false;
+  let fallbackReason: string | null = null;
+  let forwardedOps = sanitizedOps;
+
+  if (sanitizedOps.length === 0) {
+    fallbackApplied = true;
+    fallbackReason = triggered
+      ? 'transcript_burst'
+      : rawOps.length === 0
+        ? 'empty_payload'
+        : 'invalid_ops';
+    const fallbackSeed = `${burstKey}:${fallbackReason}`;
+    forwardedOps = buildDeterministicFallbackOps(fallbackSeed);
+    clampReasons.add(`fallback:${fallbackReason}`);
+  }
+
+  const skipReasonsRecord = Object.fromEntries(skipReasons.entries());
+  const telemetry: BoardOpsGuardTelemetry = {
+    providerTag,
+    schemaVersion: envelope?.schemaVersion ?? 0,
+    receivedOps: rawOps.length,
+    forwardedOps: forwardedOps.length,
+    skippedOps: skippedTopLevel + skippedNested,
+    clampedOps: clampedFields,
+    clampReasons: Array.from(clampReasons).sort(),
+    skipReasons: skipReasonsRecord,
+    fallbackApplied,
+    fallbackReason,
+    burstCount,
+    burstKey,
+  };
+
+  const guardIntervened = fallbackApplied || telemetry.clampedOps > 0 || telemetry.skippedOps > 0;
+  if (guardIntervened) {
+    const severity: 'warn' | 'info' | 'debug' = fallbackApplied ? 'warn' : telemetry.clampedOps > 0 ? 'info' : 'debug';
+    const message = fallbackApplied
+      ? `Fallback board_ops (${fallbackReason ?? 'unknown'}) applied for provider=${providerTag}; burstCount=${burstCount}.`
+      : `Sanitized ${telemetry.clampedOps} board_ops fields for provider=${providerTag}.`;
+    logger({ severity, message, telemetry });
+    noticeEmitter({
+      kind: 'board_ops_guard',
+      message: fallbackApplied
+        ? fallbackReason === 'transcript_burst'
+          ? 'Rendered deterministic connectors while AI recovers.'
+          : fallbackReason === 'empty_payload'
+            ? 'Rendered deterministic placeholders while waiting for board ops.'
+            : 'Rendered deterministic placeholders after sanitizing board ops.'
+        : 'Board ops sanitized before rendering.',
+      telemetry,
+    });
+  } else if (options?.logger) {
+    logger({ severity: 'debug', message: `Board ops guard pass-through for provider=${providerTag}.`, telemetry });
+  }
+
+  return {
+    ops: forwardedOps,
+    telemetry,
+    fallbackApplied,
+  };
 };
 
 const isContainerElement = (
