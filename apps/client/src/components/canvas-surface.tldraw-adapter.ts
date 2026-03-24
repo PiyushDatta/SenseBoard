@@ -118,6 +118,304 @@ interface TextContainerBounds {
   h: number;
 }
 
+interface MotifMinerContext {
+  board: BoardState;
+  showAiNotes: boolean;
+  totalElementCount: number;
+  aiElementCount: number;
+}
+
+interface MotifMinerDecision {
+  motifId?: string;
+  confidence?: number;
+  allowAutonomy?: boolean;
+  overrideBoard?: BoardState;
+  metadata?: Record<string, unknown>;
+  reason?: string;
+}
+
+type MotifMinerConsult = (context: MotifMinerContext) => MotifMinerDecision | null | undefined;
+
+interface MotifTelemetryEvent {
+  motifId: string;
+  confidence: number | null;
+  boardRevision: number;
+  decision: 'applied' | 'approved' | 'fallback' | 'skipped' | 'error';
+  durationMs: number;
+  reason?: string;
+  showAiNotes: boolean;
+  aiElementCount: number;
+  totalElementCount: number;
+  metadata?: Record<string, unknown>;
+}
+
+type MotifTelemetryEmitter = (event: MotifTelemetryEvent) => void;
+
+interface WorkerPalMotifMiner {
+  consult?: MotifMinerConsult;
+  telemetry?: MotifTelemetryEmitter;
+}
+
+interface WorkerPalTelemetry {
+  emit: (eventName: string, payload: Record<string, unknown>) => void;
+}
+
+interface WorkerPalRuntime {
+  motif_miner?: WorkerPalMotifMiner;
+  telemetry?: WorkerPalTelemetry;
+}
+
+interface WorkerPalAwareGlobal {
+  workerpal?: WorkerPalRuntime;
+}
+
+type WorkerPalRuntimeProvider = () => WorkerPalRuntime | null;
+
+const defaultWorkerPalRuntimeProvider: WorkerPalRuntimeProvider = () => {
+  if (typeof globalThis !== 'object' || globalThis === null) {
+    return null;
+  }
+  return (globalThis as WorkerPalAwareGlobal).workerpal ?? null;
+};
+
+let workerPalRuntimeProvider: WorkerPalRuntimeProvider = defaultWorkerPalRuntimeProvider;
+
+export const setWorkerPalRuntimeProvider = (provider: WorkerPalRuntimeProvider | null) => {
+  workerPalRuntimeProvider = provider ?? defaultWorkerPalRuntimeProvider;
+};
+
+interface MotifMinerHooks {
+  consult: MotifMinerConsult | null;
+  telemetry: MotifTelemetryEmitter | null;
+}
+
+const MOTIF_CONFIDENCE_THRESHOLD = 0.65;
+const MOTIF_TELEMETRY_EVENT = 'motif_miner.decision';
+
+const fallbackMotifTelemetryEmitter: MotifTelemetryEmitter = (event) => {
+  if (typeof console !== 'undefined' && typeof console.debug === 'function') {
+    console.debug('[motif_miner]', event);
+  }
+};
+
+const nowMs = (): number => {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+};
+
+const countAiAuthoredElements = (board: BoardState): number => {
+  return Object.values(board.elements).reduce((count, element) => {
+    if (element && element.createdBy === 'ai') {
+      return count + 1;
+    }
+    return count;
+  }, 0);
+};
+
+const isBoardStateLike = (value: unknown): value is BoardState => {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<BoardState>;
+  return (
+    typeof candidate.revision === 'number' &&
+    typeof candidate.lastUpdatedAt === 'number' &&
+    typeof candidate.elements === 'object' &&
+    candidate.elements !== null &&
+    typeof candidate.order === 'object' &&
+    Array.isArray(candidate.order)
+  );
+};
+
+const isPromiseLike = (value: unknown): value is PromiseLike<MotifMinerDecision | null | undefined> => {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'then' in value &&
+    typeof (value as PromiseLike<unknown>).then === 'function'
+  );
+};
+
+const getWorkerPalRuntime = (): WorkerPalRuntime | null => {
+  try {
+    return workerPalRuntimeProvider();
+  } catch {
+    return null;
+  }
+};
+
+const getMotifMinerHooks = (): MotifMinerHooks => {
+  const runtime = getWorkerPalRuntime();
+  if (!runtime) {
+    return { consult: null, telemetry: null };
+  }
+  const consult =
+    typeof runtime.motif_miner?.consult === 'function' ? runtime.motif_miner.consult.bind(runtime.motif_miner) : null;
+  let telemetry: MotifTelemetryEmitter | null = null;
+  if (typeof runtime.motif_miner?.telemetry === 'function') {
+    telemetry = runtime.motif_miner.telemetry.bind(runtime.motif_miner);
+  } else if (typeof runtime.telemetry?.emit === 'function') {
+    const emit = runtime.telemetry.emit;
+    telemetry = (event) => emit(MOTIF_TELEMETRY_EVENT, event);
+  }
+  return { consult, telemetry };
+};
+
+const emitMotifTelemetryEvent = (hooks: MotifMinerHooks, event: MotifTelemetryEvent) => {
+  const emitter = hooks.telemetry ?? fallbackMotifTelemetryEmitter;
+  try {
+    emitter(event);
+  } catch {
+    fallbackMotifTelemetryEmitter(event);
+  }
+};
+
+interface MotifAutonomyCacheEntry {
+  sourceRevision: number;
+  showAiNotes: boolean;
+  board: BoardState;
+}
+
+let motifAutonomyCache: MotifAutonomyCacheEntry | null = null;
+
+const evaluateMotifAutonomyDecision = (board: BoardState, showAiNotes: boolean): BoardState => {
+  const hooks = getMotifMinerHooks();
+  const start = nowMs();
+  const aiElementCount = countAiAuthoredElements(board);
+  const totalElementCount = Object.keys(board.elements).length;
+  const buildEvent = (overrides: Partial<MotifTelemetryEvent>): MotifTelemetryEvent => ({
+    motifId: overrides.motifId ?? 'unknown',
+    confidence: overrides.confidence ?? null,
+    boardRevision: board.revision,
+    decision: overrides.decision ?? 'fallback',
+    durationMs: Math.max(0, nowMs() - start),
+    reason: overrides.reason,
+    showAiNotes,
+    aiElementCount,
+    totalElementCount,
+    metadata: overrides.metadata,
+  });
+
+  if (!hooks.consult) {
+    emitMotifTelemetryEvent(hooks, buildEvent({ decision: 'skipped', reason: 'motif_miner_unavailable' }));
+    return board;
+  }
+
+  let decision: MotifMinerDecision | null = null;
+  try {
+    const outcome = hooks.consult({
+      board,
+      showAiNotes,
+      totalElementCount,
+      aiElementCount,
+    });
+    if (isPromiseLike(outcome)) {
+      emitMotifTelemetryEvent(hooks, buildEvent({ decision: 'fallback', reason: 'async_consult_not_supported' }));
+      return board;
+    }
+    decision = outcome ?? null;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'motif_miner_error';
+    emitMotifTelemetryEvent(hooks, buildEvent({ decision: 'error', reason }));
+    return board;
+  }
+
+  if (!decision) {
+    emitMotifTelemetryEvent(hooks, buildEvent({ decision: 'skipped', reason: 'no_decision' }));
+    return board;
+  }
+
+  const motifId = decision.motifId ?? 'unknown';
+  const confidence =
+    typeof decision.confidence === 'number' && Number.isFinite(decision.confidence) ? decision.confidence : null;
+  if (decision.allowAutonomy === false) {
+    emitMotifTelemetryEvent(
+      hooks,
+      buildEvent({
+        decision: 'fallback',
+        motifId,
+        confidence,
+        reason: decision.reason ?? 'autonomy_blocked',
+        metadata: decision.metadata,
+      }),
+    );
+    return board;
+  }
+
+  if (confidence === null || confidence < MOTIF_CONFIDENCE_THRESHOLD) {
+    emitMotifTelemetryEvent(
+      hooks,
+      buildEvent({
+        decision: 'fallback',
+        motifId,
+        confidence,
+        reason: decision.reason ?? 'low_confidence',
+        metadata: decision.metadata,
+      }),
+    );
+    return board;
+  }
+
+  if (decision.overrideBoard) {
+    if (!isBoardStateLike(decision.overrideBoard)) {
+      emitMotifTelemetryEvent(
+        hooks,
+        buildEvent({
+          decision: 'fallback',
+          motifId,
+          confidence,
+          reason: 'invalid_override',
+          metadata: decision.metadata,
+        }),
+      );
+      return board;
+    }
+
+    emitMotifTelemetryEvent(
+      hooks,
+      buildEvent({
+        decision: 'applied',
+        motifId,
+        confidence,
+        metadata: decision.metadata,
+      }),
+    );
+    return decision.overrideBoard;
+  }
+
+  emitMotifTelemetryEvent(
+    hooks,
+    buildEvent({
+      decision: 'approved',
+      motifId,
+      confidence,
+      metadata: decision.metadata,
+    }),
+  );
+  return board;
+};
+
+// Gate autonomy-loop canvas actions behind motif_miner once per board revision.
+const getAutonomyLoopBoard = (board: BoardState, showAiNotes: boolean): BoardState => {
+  if (
+    motifAutonomyCache &&
+    motifAutonomyCache.sourceRevision === board.revision &&
+    motifAutonomyCache.showAiNotes === showAiNotes
+  ) {
+    return motifAutonomyCache.board;
+  }
+
+  const nextBoard = evaluateMotifAutonomyDecision(board, showAiNotes);
+  motifAutonomyCache = {
+    sourceRevision: board.revision,
+    showAiNotes,
+    board: nextBoard,
+  };
+  return nextBoard;
+};
+
 const SIZE_TO_APPROX_FONT_PX: Record<TldrawSizeStyle, number> = {
   s: 14,
   m: 18,
@@ -666,14 +964,7 @@ const toDraftShape = (
   return null;
 };
 
-export const boardToTldrawDraftShapes = (
-  board: BoardState | null | undefined,
-  showAiNotes: boolean,
-): TldrawDraftShape[] => {
-  if (!board) {
-    return [];
-  }
-
+const convertBoardToDraftShapes = (board: BoardState, showAiNotes: boolean): TldrawDraftShape[] => {
   const ordered = getOrderedElements(board);
   const textContainers = ordered
     .map((element) => toContainerBounds(element))
@@ -685,4 +976,17 @@ export const boardToTldrawDraftShapes = (
 
   drafts.sort((left, right) => left.zIndex - right.zIndex);
   return drafts;
+};
+
+export const boardToTldrawDraftShapes = (
+  board: BoardState | null | undefined,
+  showAiNotes: boolean,
+): TldrawDraftShape[] => {
+  if (!board) {
+    motifAutonomyCache = null;
+    return [];
+  }
+
+  const autonomyLoopBoard = getAutonomyLoopBoard(board, showAiNotes);
+  return convertBoardToDraftShapes(autonomyLoopBoard, showAiNotes);
 };
