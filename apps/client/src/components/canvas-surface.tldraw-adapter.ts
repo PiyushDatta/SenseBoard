@@ -1,4 +1,12 @@
 import type { BoardElement, BoardPoint, BoardState } from '../../../shared/types';
+import { clampNumber } from './board-ops-guard/numeric';
+export { guardBoardOpsEnvelope, resetDefaultBurstTracker, createIsolatedBurstTracker } from './board-ops-guard';
+export type {
+  BoardOpsGuardOptions,
+  BoardOpsGuardResult,
+  BoardOpsGuardTelemetry,
+  TranscriptBurstTracker,
+} from './board-ops-guard';
 
 export type TldrawColorName =
   | 'black'
@@ -362,14 +370,6 @@ const maxLinesForHeight = (height: number, size: TldrawSizeStyle): number => {
   const contentHeight = Math.max(24, height - 18);
   return Math.max(1, Math.floor(contentHeight / lineHeight));
 };
-
-const clampNumber = (value: number, min: number, max: number): number => {
-  if (min > max) {
-    return min;
-  }
-  return Math.min(max, Math.max(min, value));
-};
-
 const isContainerElement = (
   element: BoardElement,
 ): element is Extract<BoardElement, { kind: 'rect' | 'ellipse' | 'diamond' | 'triangle' | 'sticky' | 'frame' }> => {
