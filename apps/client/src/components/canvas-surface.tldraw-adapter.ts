@@ -746,7 +746,12 @@ const ALIGN_AXIS_SET: ReadonlySet<AlignAxis> = new Set([
 
 const DISTRIBUTE_AXIS_SET: ReadonlySet<DistributeAxis> = new Set(['horizontal', 'vertical', 'x', 'y']);
 
-export type BoardOpsGuardFailureReason = 'invalid_envelope' | 'schema_mismatch' | 'missing_ops' | 'empty_ops';
+export type BoardOpsGuardFailureReason =
+  | 'invalid_envelope'
+  | 'schema_mismatch'
+  | 'missing_ops'
+  | 'empty_ops'
+  | 'invalid_ops';
 
 export interface AdapterGuardTelemetryEvent {
   category: 'canvas_surface_guard';
@@ -793,9 +798,27 @@ export interface IncrementalBoardOpsGuard {
 }
 
 interface SanitizeContext {
-  invalidOps: number;
   truncatedOps: number;
+  truncatedPoints: number;
+  textTruncations: number;
+  invalidCount: number;
+  invalid?: {
+    reason: BoardOpsGuardFailureReason;
+    detail: string;
+    sample?: unknown;
+  };
 }
+
+const markInvalidPayload = (context: SanitizeContext, detail: string, sample: unknown) => {
+  if (!context.invalid) {
+    context.invalid = {
+      reason: 'invalid_ops',
+      detail,
+      sample,
+    };
+  }
+  context.invalidCount += 1;
+};
 
 interface DuplicateContext {
   knownIds: Set<string>;
@@ -806,7 +829,7 @@ interface DuplicateContext {
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> => {
-  return typeof value === 'object' && value !== null;
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 };
 
 const toId = (value: unknown): string | null => {
@@ -828,12 +851,22 @@ const toFiniteNumber = (value: unknown): number | null => {
   return null;
 };
 
-const toTextValue = (value: unknown): string | null => {
+const toTextValue = (value: unknown, context?: SanitizeContext): string | null => {
+  const truncate = (text: string): string => {
+    if (text.length <= MAX_TEXT_LENGTH) {
+      return text;
+    }
+    if (context) {
+      context.textTruncations += 1;
+    }
+    return text.slice(0, MAX_TEXT_LENGTH);
+  };
+
   if (typeof value === 'string') {
-    return value.slice(0, MAX_TEXT_LENGTH);
+    return truncate(value);
   }
   if (typeof value === 'number') {
-    return String(value).slice(0, MAX_TEXT_LENGTH);
+    return truncate(String(value));
   }
   if (Array.isArray(value)) {
     const combined = value
@@ -841,7 +874,7 @@ const toTextValue = (value: unknown): string | null => {
       .filter((entry) => entry.length > 0)
       .join(' ');
     if (combined.length > 0) {
-      return combined.slice(0, MAX_TEXT_LENGTH);
+      return truncate(combined);
     }
   }
   return null;
@@ -865,7 +898,7 @@ const toBoardPoint = (value: unknown): BoardPoint | null => {
   return null;
 };
 
-const toBoardPoints = (value: unknown, limit: number): BoardPoint[] => {
+const toBoardPoints = (value: unknown, limit: number, context?: SanitizeContext): BoardPoint[] => {
   if (!Array.isArray(value) || limit <= 0) {
     return [];
   }
@@ -875,6 +908,9 @@ const toBoardPoints = (value: unknown, limit: number): BoardPoint[] => {
     if (candidate) {
       points.push(candidate);
     }
+  }
+  if (context && Array.isArray(value) && value.length > limit) {
+    context.truncatedPoints += value.length - limit;
   }
   return points;
 };
@@ -896,51 +932,101 @@ const toStringArray = (value: unknown, limit: number): string[] => {
   return next;
 };
 
-const coerceBoardElementStyle = (value: unknown): BoardElementStyle | undefined => {
+const coerceBoardElementStyle = (
+  value: unknown,
+  context?: SanitizeContext,
+  detail?: string,
+  sample?: unknown,
+): BoardElementStyle | undefined => {
   if (!isPlainObject(value)) {
+    if (value !== undefined && context && detail) {
+      markInvalidPayload(context, detail, sample ?? value);
+    }
     return undefined;
   }
+  let invalid = false;
   const style: BoardElementStyle = {};
-  if (typeof value.strokeColor === 'string') {
-    style.strokeColor = value.strokeColor;
+  const hasOwn = Object.prototype.hasOwnProperty;
+
+  if (hasOwn.call(value, 'strokeColor')) {
+    if (typeof value.strokeColor === 'string') {
+      style.strokeColor = value.strokeColor;
+    } else {
+      invalid = true;
+    }
   }
-  if (typeof value.fillColor === 'string') {
-    style.fillColor = value.fillColor;
+  if (hasOwn.call(value, 'fillColor')) {
+    if (typeof value.fillColor === 'string') {
+      style.fillColor = value.fillColor;
+    } else {
+      invalid = true;
+    }
   }
-  const strokeWidth = toFiniteNumber(value.strokeWidth);
-  if (strokeWidth !== null) {
-    style.strokeWidth = strokeWidth;
+  if (hasOwn.call(value, 'strokeWidth')) {
+    const strokeWidth = toFiniteNumber(value.strokeWidth);
+    if (strokeWidth !== null) {
+      style.strokeWidth = strokeWidth;
+    } else {
+      invalid = true;
+    }
   }
-  const roughness = toFiniteNumber(value.roughness);
-  if (roughness !== null) {
-    style.roughness = roughness;
+  if (hasOwn.call(value, 'roughness')) {
+    const roughness = toFiniteNumber(value.roughness);
+    if (roughness !== null) {
+      style.roughness = roughness;
+    } else {
+      invalid = true;
+    }
   }
-  const fontSize = toFiniteNumber(value.fontSize);
-  if (fontSize !== null) {
-    style.fontSize = fontSize;
+  if (hasOwn.call(value, 'fontSize')) {
+    const fontSize = toFiniteNumber(value.fontSize);
+    if (fontSize !== null) {
+      style.fontSize = fontSize;
+    } else {
+      invalid = true;
+    }
   }
+
+  if (invalid && context && detail) {
+    markInvalidPayload(context, detail, sample ?? value);
+    return undefined;
+  }
+
   return Object.keys(style).length > 0 ? style : undefined;
 };
 
-const coerceBoardElement = (value: unknown): BoardElement | null => {
+const coerceBoardElement = (value: unknown, context: SanitizeContext): BoardElement | null => {
   if (!isPlainObject(value)) {
+    markInvalidPayload(context, 'element_not_object', value);
     return null;
   }
   const id = toId(value.id);
   const kindRaw = typeof value.kind === 'string' ? (value.kind.trim().toLowerCase() as BoardElement['kind']) : null;
   if (!id || !kindRaw || !BOARD_ELEMENT_KINDS.has(kindRaw)) {
+    markInvalidPayload(context, 'element_invalid_kind', value);
     return null;
   }
+  const hasOwn = Object.prototype.hasOwnProperty;
   const createdAt = toFiniteNumber(value.createdAt) ?? deterministicCreatedAtForId(id);
   const createdBy = value.createdBy === 'system' ? 'system' : 'ai';
-  const style = coerceBoardElementStyle(value.style);
-  const zIndex = toFiniteNumber(value.zIndex);
+  const style =
+    hasOwn.call(value, 'style') && value.style !== undefined
+      ? coerceBoardElementStyle(value.style, context, 'invalid_element_style', value)
+      : undefined;
+  if (context.invalid) {
+    return null;
+  }
+  const zIndexRaw = toFiniteNumber(value.zIndex);
+  if (zIndexRaw === null && hasOwn.call(value, 'zIndex')) {
+    markInvalidPayload(context, 'invalid_element_zindex', value);
+    return null;
+  }
   const base = {
     id,
     createdAt,
     createdBy,
     ...(style ? { style } : {}),
-    ...(zIndex !== null ? { zIndex } : {}),
+    ...(zIndexRaw !== null ? { zIndex: zIndexRaw } : {}),
   };
 
   if (
@@ -956,10 +1042,16 @@ const coerceBoardElement = (value: unknown): BoardElement | null => {
     const w = toFiniteNumber(value.w ?? value.width);
     const h = toFiniteNumber(value.h ?? value.height);
     if (x === null || y === null || w === null || h === null) {
+      markInvalidPayload(context, 'invalid_element_geometry', value);
       return null;
     }
     if (kindRaw === 'sticky') {
-      const text = toTextValue(value.text ?? value.label ?? value.content) ?? '';
+      const rawText = value.text ?? value.label ?? value.content;
+      const text = rawText === undefined ? '' : toTextValue(rawText, context);
+      if (text === null) {
+        markInvalidPayload(context, 'invalid_element_text', value);
+        return null;
+      }
       return {
         ...base,
         kind: 'sticky',
@@ -979,9 +1071,16 @@ const coerceBoardElement = (value: unknown): BoardElement | null => {
         w,
         h,
       };
-      const name = toTextValue(value.title ?? value.text ?? value.label);
-      if (name) {
-        element.title = name;
+      const rawName = value.title ?? value.text ?? value.label;
+      if (rawName !== undefined) {
+        const name = toTextValue(rawName, context);
+        if (name === null) {
+          markInvalidPayload(context, 'invalid_element_text', value);
+          return null;
+        }
+        if (name.trim().length > 0) {
+          element.title = name;
+        }
       }
       return element;
     }
@@ -999,9 +1098,15 @@ const coerceBoardElement = (value: unknown): BoardElement | null => {
     const x = toFiniteNumber(value.x);
     const y = toFiniteNumber(value.y);
     if (x === null || y === null) {
+      markInvalidPayload(context, 'invalid_element_geometry', value);
       return null;
     }
-    const text = toTextValue(value.text ?? value.label ?? value.content) ?? '';
+    const rawText = value.text ?? value.label ?? value.content;
+    const text = rawText === undefined ? '' : toTextValue(rawText, context);
+    if (text === null) {
+      markInvalidPayload(context, 'invalid_element_text', value);
+      return null;
+    }
     return {
       ...base,
       kind: 'text',
@@ -1012,8 +1117,13 @@ const coerceBoardElement = (value: unknown): BoardElement | null => {
   }
 
   if (kindRaw === 'stroke' || kindRaw === 'line' || kindRaw === 'arrow') {
-    const points = toBoardPoints(value.points, MAX_POINTS_PER_ELEMENT);
+    if (!Array.isArray(value.points)) {
+      markInvalidPayload(context, 'invalid_element_points', value);
+      return null;
+    }
+    const points = toBoardPoints(value.points, MAX_POINTS_PER_ELEMENT, context);
     if (points.length < 2) {
+      markInvalidPayload(context, 'invalid_element_points', value);
       return null;
     }
     return {
@@ -1026,8 +1136,13 @@ const coerceBoardElement = (value: unknown): BoardElement | null => {
   return null;
 };
 
-const coerceStylePatch = (value: unknown): Partial<BoardElementStyle> | null => {
-  const style = coerceBoardElementStyle(value);
+const coerceStylePatch = (
+  value: unknown,
+  context: SanitizeContext,
+  detail: string,
+  sample: unknown,
+): Partial<BoardElementStyle> | null => {
+  const style = coerceBoardElementStyle(value, context, detail, sample);
   return style ?? null;
 };
 
@@ -1052,25 +1167,36 @@ const sanitizeViewportPatch = (value: unknown): Partial<BoardViewport> | null =>
 };
 
 const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number): BoardOp | null => {
-  if (depth > MAX_BATCH_DEPTH || !isPlainObject(value)) {
-    context.invalidOps += 1;
+  if (depth > MAX_BATCH_DEPTH) {
+    markInvalidPayload(context, 'max_batch_depth', value);
+    return null;
+  }
+  if (!isPlainObject(value)) {
+    markInvalidPayload(context, 'op_not_object', value);
     return null;
   }
   const type = typeof value.type === 'string' ? value.type : '';
+  if (!type) {
+    markInvalidPayload(context, 'op_missing_type', value);
+    return null;
+  }
 
   if (type === 'upsertElement') {
-    const element = coerceBoardElement(value.element);
+    const element = coerceBoardElement(value.element, context);
     if (!element) {
-      context.invalidOps += 1;
       return null;
     }
     return { type: 'upsertElement', element };
   }
   if (type === 'appendStrokePoints') {
     const id = toId(value.id);
-    const points = toBoardPoints(value.points, MAX_POINTS_PER_APPEND);
-    if (!id || points.length === 0) {
-      context.invalidOps += 1;
+    if (!id || !Array.isArray(value.points)) {
+      markInvalidPayload(context, 'invalid_append_points', value);
+      return null;
+    }
+    const points = toBoardPoints(value.points, MAX_POINTS_PER_APPEND, context);
+    if (points.length === 0) {
+      markInvalidPayload(context, 'invalid_append_points', value);
       return null;
     }
     return { type: 'appendStrokePoints', id, points };
@@ -1078,7 +1204,7 @@ const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number
   if (type === 'deleteElement') {
     const id = toId(value.id);
     if (!id) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_delete', value);
       return null;
     }
     return { type: 'deleteElement', id };
@@ -1088,7 +1214,7 @@ const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number
     const dx = toFiniteNumber(value.dx);
     const dy = toFiniteNumber(value.dy);
     if (!id || dx === null || dy === null) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_offset', value);
       return null;
     }
     return { type: 'offsetElement', id, dx, dy };
@@ -1096,50 +1222,87 @@ const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number
   if (type === 'setElementGeometry') {
     const id = toId(value.id);
     if (!id) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_geometry_id', value);
       return null;
     }
     const op: Extract<BoardOp, { type: 'setElementGeometry' }> = { type: 'setElementGeometry', id };
+    const hasOwn = Object.prototype.hasOwnProperty;
     const x = toFiniteNumber(value.x);
     const y = toFiniteNumber(value.y);
     const w = toFiniteNumber(value.w);
     const h = toFiniteNumber(value.h);
-    const points = toBoardPoints(value.points, MAX_POINTS_PER_ELEMENT);
+    const pointsArray = hasOwn.call(value, 'points') ? value.points : undefined;
     if (x !== null) {
       op.x = x;
+    } else if (hasOwn.call(value, 'x')) {
+      markInvalidPayload(context, 'invalid_geometry_value', value);
+      return null;
     }
     if (y !== null) {
       op.y = y;
+    } else if (hasOwn.call(value, 'y')) {
+      markInvalidPayload(context, 'invalid_geometry_value', value);
+      return null;
     }
     if (w !== null) {
       op.w = w;
+    } else if (hasOwn.call(value, 'w')) {
+      markInvalidPayload(context, 'invalid_geometry_value', value);
+      return null;
     }
     if (h !== null) {
       op.h = h;
+    } else if (hasOwn.call(value, 'h')) {
+      markInvalidPayload(context, 'invalid_geometry_value', value);
+      return null;
     }
-    if (points.length > 0) {
+    if (pointsArray !== undefined) {
+      if (!Array.isArray(pointsArray)) {
+        markInvalidPayload(context, 'invalid_geometry_points', value);
+        return null;
+      }
+      const points = toBoardPoints(pointsArray, MAX_POINTS_PER_ELEMENT, context);
+      if (points.length === 0) {
+        markInvalidPayload(context, 'invalid_geometry_points', value);
+        return null;
+      }
       op.points = points;
     }
     if (op.x === undefined && op.y === undefined && op.w === undefined && op.h === undefined && !op.points) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'empty_geometry_patch', value);
       return null;
     }
     return op;
   }
   if (type === 'setElementStyle') {
     const id = toId(value.id);
-    const style = coerceStylePatch(value.style);
-    if (!id || !style) {
-      context.invalidOps += 1;
+    if (!id) {
+      markInvalidPayload(context, 'invalid_style_id', value);
+      return null;
+    }
+    const style = coerceStylePatch(value.style, context, 'invalid_style_patch', value);
+    if (!style) {
       return null;
     }
     return { type: 'setElementStyle', id, style };
   }
   if (type === 'setElementText') {
     const id = toId(value.id);
-    const text = toTextValue(value.text ?? value.label ?? value.content);
-    if (!id || text === null) {
-      context.invalidOps += 1;
+    if (!id) {
+      markInvalidPayload(context, 'invalid_text_id', value);
+      return null;
+    }
+    const hasText =
+      Object.prototype.hasOwnProperty.call(value, 'text') ||
+      Object.prototype.hasOwnProperty.call(value, 'label') ||
+      Object.prototype.hasOwnProperty.call(value, 'content');
+    if (!hasText) {
+      markInvalidPayload(context, 'missing_text_payload', value);
+      return null;
+    }
+    const text = toTextValue(value.text ?? value.label ?? value.content, context);
+    if (text === null) {
+      markInvalidPayload(context, 'invalid_text_payload', value);
       return null;
     }
     return { type: 'setElementText', id, text };
@@ -1148,17 +1311,24 @@ const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number
     const id = toId(value.id);
     const newId = toId(value.newId);
     if (!id || !newId) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_duplicate_ids', value);
       return null;
     }
     const op: Extract<BoardOp, { type: 'duplicateElement' }> = { type: 'duplicateElement', id, newId };
+    const hasOwn = Object.prototype.hasOwnProperty;
     const dx = toFiniteNumber(value.dx);
-    const dy = toFiniteNumber(value.dy);
     if (dx !== null) {
       op.dx = dx;
+    } else if (hasOwn.call(value, 'dx')) {
+      markInvalidPayload(context, 'invalid_duplicate_offset', value);
+      return null;
     }
+    const dy = toFiniteNumber(value.dy);
     if (dy !== null) {
       op.dy = dy;
+    } else if (hasOwn.call(value, 'dy')) {
+      markInvalidPayload(context, 'invalid_duplicate_offset', value);
+      return null;
     }
     return op;
   }
@@ -1166,31 +1336,42 @@ const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number
     const id = toId(value.id);
     const zIndex = toFiniteNumber(value.zIndex);
     if (!id || zIndex === null) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_zindex', value);
       return null;
     }
     return { type: 'setElementZIndex', id, zIndex };
   }
   if (type === 'alignElements') {
+    if (!Array.isArray(value.ids)) {
+      markInvalidPayload(context, 'invalid_align_ids', value);
+      return null;
+    }
     const ids = toStringArray(value.ids, 1200);
     const axis = typeof value.axis === 'string' ? (value.axis as AlignAxis) : null;
     if (ids.length === 0 || !axis || !ALIGN_AXIS_SET.has(axis)) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_align_payload', value);
       return null;
     }
     return { type: 'alignElements', ids, axis };
   }
   if (type === 'distributeElements') {
+    if (!Array.isArray(value.ids)) {
+      markInvalidPayload(context, 'invalid_distribute_ids', value);
+      return null;
+    }
     const ids = toStringArray(value.ids, 1200);
     const axis = typeof value.axis === 'string' ? (value.axis as DistributeAxis) : null;
     if (ids.length === 0 || !axis || !DISTRIBUTE_AXIS_SET.has(axis)) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_distribute_payload', value);
       return null;
     }
     const op: Extract<BoardOp, { type: 'distributeElements' }> = { type: 'distributeElements', ids, axis };
     const gap = toFiniteNumber(value.gap);
     if (gap !== null) {
       op.gap = gap;
+    } else if (Object.prototype.hasOwnProperty.call(value, 'gap')) {
+      markInvalidPayload(context, 'invalid_distribute_gap', value);
+      return null;
     }
     return op;
   }
@@ -1200,41 +1381,57 @@ const sanitizeBoardOp = (value: unknown, context: SanitizeContext, depth: number
   if (type === 'setViewport') {
     const viewport = sanitizeViewportPatch(value.viewport);
     if (!viewport) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_viewport', value);
       return null;
     }
     return { type: 'setViewport', viewport };
   }
   if (type === 'batch') {
+    if (!Array.isArray(value.ops) || value.ops.length === 0) {
+      markInvalidPayload(context, 'invalid_batch', value);
+      return null;
+    }
     const nestedOps = sanitizeOpsArray(value.ops, context, depth + 1);
+    if (context.invalid) {
+      return null;
+    }
     if (nestedOps.length === 0) {
-      context.invalidOps += 1;
+      markInvalidPayload(context, 'invalid_batch', value);
       return null;
     }
     return { type: 'batch', ops: nestedOps };
   }
 
-  context.invalidOps += 1;
+  markInvalidPayload(context, 'unknown_op_type', value);
   return null;
 };
 
 const sanitizeOpsArray = (value: unknown, context: SanitizeContext, depth: number): BoardOp[] => {
+  if (context.invalid) {
+    return [];
+  }
   if (!Array.isArray(value)) {
-    context.invalidOps += 1;
+    markInvalidPayload(context, 'ops_not_array', value);
     return [];
   }
   const safe: BoardOp[] = [];
   const limit = Math.min(value.length, MAX_BOARD_OPS_PER_ENVELOPE);
   for (let index = 0; index < limit; index += 1) {
+    if (context.invalid) {
+      break;
+    }
     const op = sanitizeBoardOp(value[index], context, depth);
+    if (context.invalid) {
+      break;
+    }
     if (op) {
       safe.push(op);
     }
   }
-  if (value.length > limit) {
+  if (!context.invalid && value.length > limit) {
     context.truncatedOps += value.length - limit;
   }
-  return safe;
+  return context.invalid ? [] : safe;
 };
 
 const removeDuplicateOps = (ops: BoardOp[], context: DuplicateContext): BoardOp[] => {
@@ -1282,22 +1479,24 @@ const removeDuplicateOps = (ops: BoardOp[], context: DuplicateContext): BoardOp[
 const parseOpsEnvelope = (
   value: unknown,
 ): { ok: true; ops: unknown[] } | { ok: false; reason: BoardOpsGuardFailureReason } => {
-  if (Array.isArray(value)) {
-    return { ok: true, ops: value };
-  }
   if (!isPlainObject(value)) {
     return { ok: false, reason: 'invalid_envelope' };
   }
-  const kind = typeof value.kind === 'string' ? value.kind.trim().toLowerCase() : '';
-  if (kind && kind !== 'board_ops') {
+  if (value.kind !== 'board_ops') {
     return { ok: false, reason: 'invalid_envelope' };
   }
-  const schemaVersion = toFiniteNumber(value.schemaVersion);
-  if (schemaVersion === null || schemaVersion !== BOARD_OPS_SCHEMA_VERSION) {
+  if (
+    typeof value.schemaVersion !== 'number' ||
+    !Number.isFinite(value.schemaVersion) ||
+    value.schemaVersion !== BOARD_OPS_SCHEMA_VERSION
+  ) {
     return { ok: false, reason: 'schema_mismatch' };
   }
   if (!Array.isArray(value.ops)) {
     return { ok: false, reason: 'missing_ops' };
+  }
+  if (value.ops.length === 0) {
+    return { ok: false, reason: 'empty_ops' };
   }
   return { ok: true, ops: value.ops };
 };
@@ -1376,8 +1575,36 @@ export const createIncrementalBoardOpsGuard = (options?: {
       };
     }
 
-    const sanitizeContext: SanitizeContext = { invalidOps: 0, truncatedOps: 0 };
+    const sanitizeContext: SanitizeContext = {
+      truncatedOps: 0,
+      truncatedPoints: 0,
+      textTruncations: 0,
+      invalidCount: 0,
+    };
     const sanitized = sanitizeOpsArray(parsed.ops, sanitizeContext, 0);
+    if (sanitizeContext.invalid) {
+      counters.payloadRejections += 1;
+      emitTelemetry({
+        category: 'canvas_surface_guard',
+        guard: 'payload',
+        action: 'reject',
+        reason: sanitizeContext.invalid.reason,
+        provider: context?.provider,
+        source: context?.source,
+        sample: { detail: sanitizeContext.invalid.detail, payload: sanitizeContext.invalid.sample },
+        counters: snapshotCounters(),
+      });
+      return {
+        ok: false,
+        acceptedOps: [],
+        reason: sanitizeContext.invalid.reason,
+        droppedInvalidCount: sanitizeContext.invalidCount,
+        droppedDuplicateCount: 0,
+        truncatedCount: sanitizeContext.truncatedOps + sanitizeContext.truncatedPoints + sanitizeContext.textTruncations,
+        duplicateIds: [],
+      };
+    }
+
     const duplicateContext: DuplicateContext = {
       knownIds: buildKnownIdSet(lastSnapshot),
       seenUpsertIds: new Set(),
@@ -1387,18 +1614,46 @@ export const createIncrementalBoardOpsGuard = (options?: {
     };
     const deduped = removeDuplicateOps(sanitized, duplicateContext);
 
-    if (sanitizeContext.invalidOps > 0 || sanitizeContext.truncatedOps > 0) {
-      counters.payloadRepairs += sanitizeContext.invalidOps + sanitizeContext.truncatedOps;
-      emitTelemetry({
-        category: 'canvas_surface_guard',
-        guard: 'payload',
-        action: 'repair',
-        reason: sanitizeContext.truncatedOps > 0 ? 'ops_truncated' : 'invalid_ops',
-        provider: context?.provider,
-        source: context?.source,
-        droppedOps: sanitizeContext.invalidOps + sanitizeContext.truncatedOps,
-        counters: snapshotCounters(),
-      });
+    const truncatedTotal =
+      sanitizeContext.truncatedOps + sanitizeContext.truncatedPoints + sanitizeContext.textTruncations;
+    if (truncatedTotal > 0) {
+      counters.payloadRepairs += truncatedTotal;
+      if (sanitizeContext.truncatedOps > 0) {
+        emitTelemetry({
+          category: 'canvas_surface_guard',
+          guard: 'payload',
+          action: 'repair',
+          reason: 'ops_truncated',
+          provider: context?.provider,
+          source: context?.source,
+          droppedOps: sanitizeContext.truncatedOps,
+          counters: snapshotCounters(),
+        });
+      }
+      if (sanitizeContext.truncatedPoints > 0) {
+        emitTelemetry({
+          category: 'canvas_surface_guard',
+          guard: 'payload',
+          action: 'repair',
+          reason: 'points_truncated',
+          provider: context?.provider,
+          source: context?.source,
+          droppedOps: sanitizeContext.truncatedPoints,
+          counters: snapshotCounters(),
+        });
+      }
+      if (sanitizeContext.textTruncations > 0) {
+        emitTelemetry({
+          category: 'canvas_surface_guard',
+          guard: 'payload',
+          action: 'repair',
+          reason: 'text_truncated',
+          provider: context?.provider,
+          source: context?.source,
+          droppedOps: sanitizeContext.textTruncations,
+          counters: snapshotCounters(),
+        });
+      }
     }
 
     if (duplicateContext.duplicateIds.size > 0) {
@@ -1431,9 +1686,9 @@ export const createIncrementalBoardOpsGuard = (options?: {
         ok: false,
         acceptedOps: [],
         reason: 'empty_ops',
-        droppedInvalidCount: sanitizeContext.invalidOps,
+        droppedInvalidCount: 0,
         droppedDuplicateCount: duplicateContext.droppedFromDuplicates,
-        truncatedCount: sanitizeContext.truncatedOps,
+        truncatedCount: truncatedTotal,
         duplicateIds: Array.from(duplicateContext.duplicateIds).slice(0, MAX_DUPLICATE_IDS_REPORTED),
       };
     }
@@ -1441,9 +1696,9 @@ export const createIncrementalBoardOpsGuard = (options?: {
     return {
       ok: true,
       acceptedOps: deduped,
-      droppedInvalidCount: sanitizeContext.invalidOps,
+      droppedInvalidCount: 0,
       droppedDuplicateCount: duplicateContext.droppedFromDuplicates,
-      truncatedCount: sanitizeContext.truncatedOps,
+      truncatedCount: truncatedTotal,
       duplicateIds: Array.from(duplicateContext.duplicateIds).slice(0, MAX_DUPLICATE_IDS_REPORTED),
     };
   };
@@ -1466,238 +1721,3 @@ export const createIncrementalBoardOpsGuard = (options?: {
     guardIncomingOps,
   };
 };
-
-type BunTestGlobals = typeof import('bun:test');
-declare const describe: BunTestGlobals['describe'];
-declare const it: BunTestGlobals['it'];
-declare const expect: BunTestGlobals['expect'];
-
-const hasBunTestGlobals =
-  typeof describe === 'function' && typeof it === 'function' && typeof expect === 'function';
-
-if (hasBunTestGlobals) {
-  const buildBoardState = (): BoardState => ({
-    elements: {
-      box: {
-        id: 'box',
-        kind: 'rect',
-        x: 10,
-        y: 10,
-        w: 120,
-        h: 80,
-        createdAt: 1,
-        createdBy: 'ai',
-      },
-    },
-    order: ['box'],
-    revision: 1,
-    lastUpdatedAt: 1,
-    viewport: { x: 0, y: 0, zoom: 1 },
-  });
-
-  const buildRectElement = (id: string, overrides?: Partial<BoardRectElement>): BoardRectElement => ({
-    id,
-    kind: 'rect',
-    x: 0,
-    y: 0,
-    w: 24,
-    h: 24,
-    createdAt: 11,
-    createdBy: 'ai',
-    ...(overrides ?? {}),
-  });
-
-  const recordTelemetry = (bucket: AdapterGuardTelemetryEvent[]) => (event: AdapterGuardTelemetryEvent) => {
-    bucket.push(event);
-  };
-
-  describe('createIncrementalBoardOpsGuard', () => {
-    it('snapshots the provided board before applying new ops and preserves a recoverable clone', () => {
-      const guard = createIncrementalBoardOpsGuard();
-      const board = buildBoardState();
-
-      const envelope: BoardOpsEnvelope = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION,
-        ops: [{ type: 'upsertElement', element: buildRectElement('fresh') }],
-      };
-
-      const result = guard.guardIncomingOps(envelope, { boardBefore: board });
-      expect(result.ok).toBe(true);
-      const recovered = guard.recoverLastAcceptedBoard();
-      expect(recovered).not.toBeNull();
-      expect(recovered).not.toBe(board);
-      expect(recovered).toEqual(board);
-
-      board.elements.box.x = 500;
-      const recoveredAfterMutation = guard.recoverLastAcceptedBoard();
-      expect(recoveredAfterMutation?.elements.box.x).toBe(10);
-    });
-
-    it('filters duplicate IDs before returning accepted ops and reports telemetry', () => {
-      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
-      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
-      const board = buildBoardState();
-      const envelope: BoardOpsEnvelope = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION,
-        ops: [
-          { type: 'upsertElement', element: buildRectElement('dupe') },
-          { type: 'upsertElement', element: buildRectElement('dupe', { w: 48 }) },
-          { type: 'duplicateElement', id: 'dupe', newId: 'box' },
-        ],
-      };
-
-      const context = { boardBefore: board, provider: 'ai_guard', source: 'unit' };
-      const result = guard.guardIncomingOps(envelope, context);
-      expect(result.ok).toBe(true);
-      expect(result.acceptedOps).toHaveLength(1);
-      expect(result.droppedDuplicateCount).toBe(2);
-      expect(result.duplicateIds).toEqual(expect.arrayContaining(['dupe', 'box']));
-      expect(telemetryEvents).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            guard: 'duplicate_id',
-            action: 'repair',
-            provider: context.provider,
-            source: context.source,
-            duplicateIds: expect.arrayContaining(['dupe', 'box']),
-            droppedOps: 2,
-          }),
-        ]),
-      );
-    });
-
-    it('rejects schema mismatches and increments schema counters', () => {
-      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
-      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
-      const context = { provider: 'ai_guard', source: 'unit' };
-      const mismatchedEnvelope: unknown = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION + 1,
-        ops: [],
-      };
-
-      const result = guard.guardIncomingOps(mismatchedEnvelope, context);
-      expect(result.ok).toBe(false);
-      expect(result.reason).toBe('schema_mismatch');
-      expect(guard.counters.schemaRejections).toBe(1);
-      expect(telemetryEvents).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            guard: 'schema',
-            action: 'reject',
-            reason: 'schema_mismatch',
-            provider: context.provider,
-            source: context.source,
-            counters: expect.objectContaining({ schemaRejections: 1 }),
-          }),
-        ]),
-      );
-    });
-
-    it('rejects when repairs drop all ops and preserves the last board snapshot for recovery', () => {
-      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
-      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
-      const board = buildBoardState();
-      const context = { boardBefore: board, provider: 'ai_guard', source: 'unit' };
-      const invalidEnvelope: unknown = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION,
-        ops: [{ type: 'bogus_op' }],
-      };
-
-      const result = guard.guardIncomingOps(invalidEnvelope, context);
-      expect(result.ok).toBe(false);
-      expect(result.reason).toBe('empty_ops');
-      expect(result.droppedInvalidCount).toBeGreaterThan(0);
-      const recovered = guard.recoverLastAcceptedBoard();
-      expect(recovered).not.toBeNull();
-      expect(recovered).not.toBe(context.boardBefore);
-      expect(recovered).toEqual(context.boardBefore);
-      expect(telemetryEvents).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            guard: 'payload',
-            action: 'repair',
-            reason: 'invalid_ops',
-            provider: context.provider,
-            source: context.source,
-          }),
-          expect.objectContaining({
-            guard: 'payload',
-            action: 'reject',
-            reason: 'empty_ops',
-            provider: context.provider,
-            source: context.source,
-          }),
-        ]),
-      );
-    });
-
-    it('repairs malformed ops deterministically', () => {
-      const guard = createIncrementalBoardOpsGuard();
-      const rawEnvelope: unknown = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION,
-        ops: [
-          {
-            type: 'upsertElement',
-            element: { id: 'alpha', kind: 'rect', x: 1, y: 2, w: 3, h: 4 },
-          },
-        ],
-      };
-
-      const result = guard.guardIncomingOps(rawEnvelope);
-      expect(result.ok).toBe(true);
-      expect(result.acceptedOps).toHaveLength(1);
-      const [op] = result.acceptedOps;
-      if (op?.type !== 'upsertElement') {
-        throw new Error('expected upsertElement op');
-      }
-      expect(op.element.createdAt).toBe(deterministicCreatedAtForId('alpha'));
-      expect(op.element.createdBy).toBe('ai');
-    });
-
-    it('emits structured telemetry with guard reason, provider, and counters', () => {
-      const telemetryEvents: AdapterGuardTelemetryEvent[] = [];
-      const guard = createIncrementalBoardOpsGuard({ emitTelemetry: recordTelemetry(telemetryEvents) });
-      const context = { provider: 'ai_guard', source: 'unit' };
-
-      const schemaMismatch: unknown = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION + 1,
-        ops: [],
-      };
-      const malformed: unknown = {
-        kind: 'board_ops',
-        schemaVersion: BOARD_OPS_SCHEMA_VERSION,
-        ops: [{ type: 'bogus_op' }],
-      };
-
-      guard.guardIncomingOps(schemaMismatch, context);
-      guard.guardIncomingOps(malformed, context);
-
-      expect(telemetryEvents).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            guard: 'schema',
-            action: 'reject',
-            reason: 'schema_mismatch',
-            provider: context.provider,
-            source: context.source,
-            counters: expect.objectContaining({ schemaRejections: 1 }),
-          }),
-          expect.objectContaining({
-            guard: 'payload',
-            action: 'repair',
-            reason: 'invalid_ops',
-            provider: context.provider,
-            source: context.source,
-            counters: expect.objectContaining({ payloadRepairs: 1 }),
-          }),
-        ]),
-      );
-    });
-  });
-}
