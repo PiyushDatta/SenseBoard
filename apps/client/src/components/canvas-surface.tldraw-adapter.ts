@@ -171,6 +171,17 @@ const zeroOpStrikesByWindow = new Map<string, number>();
 let boardDeltaTelemetryListener: BoardDeltaTelemetryListener | null = null;
 const boardDeltaTelemetryHistory: BoardDeltaTelemetryEvent[] = [];
 
+const getPreviousSummaryForWindow = (windowId: string): BoardSummary | null => {
+  const exact = boardSummaryByWindowId.get(windowId);
+  if (exact) {
+    return exact;
+  }
+  if (lastWindowContextId && lastWindowContextId !== windowId) {
+    return boardSummaryByWindowId.get(lastWindowContextId) ?? null;
+  }
+  return null;
+};
+
 const createDraftConversionDiagnostics = (): DraftConversionDiagnostics => ({
   hiddenElementIds: new Set<string>(),
   invalidElementIds: new Set<string>(),
@@ -291,7 +302,10 @@ const updateZeroOpStrikeCount = (windowId: string, zeroDelta: boolean): number =
     zeroOpStrikesByWindow.set(windowId, 0);
     return 0;
   }
-  const next = (zeroOpStrikesByWindow.get(windowId) ?? 0) + 1;
+  const baseStrikes =
+    zeroOpStrikesByWindow.get(windowId) ??
+    (lastWindowContextId && lastWindowContextId !== windowId ? zeroOpStrikesByWindow.get(lastWindowContextId) ?? 0 : 0);
+  const next = baseStrikes + 1;
   zeroOpStrikesByWindow.set(windowId, next);
   return next;
 };
@@ -951,6 +965,7 @@ export const boardToTldrawDraftShapes = (
   if (!board) {
     boardSummaryByWindowId.delete(windowId);
     zeroOpStrikesByWindow.delete(windowId);
+    lastWindowContextId = null;
     return [];
   }
 
@@ -967,7 +982,7 @@ export const boardToTldrawDraftShapes = (
   drafts.sort((left, right) => left.zIndex - right.zIndex);
 
   const summary = summarizeBoardState(board);
-  const previousSummary = boardSummaryByWindowId.get(windowId) ?? null;
+  const previousSummary = getPreviousSummaryForWindow(windowId);
   const delta = diffBoardSummaries(summary, previousSummary);
   const orderChanged = Boolean(previousSummary) && summary.orderSignature !== previousSummary.orderSignature;
   const structureUnchanged = delta.added.length === 0 && delta.removed.length === 0 && delta.changed.length === 0 && !orderChanged;
@@ -1019,7 +1034,7 @@ export const boardToTldrawDraftShapes = (
   });
 
   boardSummaryByWindowId.set(windowId, summary);
-  lastWindowContextId = hasTranscriptContext ? windowId : null;
+  lastWindowContextId = hasTranscriptContext ? windowId : lastWindowContextId;
 
   return resolvedDrafts;
 };
