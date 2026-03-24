@@ -1,4 +1,20 @@
-import type { BoardElement, BoardPoint, BoardState } from '../../../shared/types';
+import type { BoardElement, BoardOp, BoardPoint, BoardState } from '../../../shared/types';
+export {
+  guardBoardOpsForTldraw,
+  resetBoardOpGuardScope,
+  setBoardOpGuardHostNoticeHandler,
+  setBoardOpGuardTelemetryHandler,
+  createGuardFallbackSequenceStore,
+  setGuardFallbackSequenceStore,
+} from './board-op-guard';
+export type {
+  BoardOpGuardHostNotice,
+  BoardOpGuardOptions,
+  BoardOpGuardResult,
+  BoardOpGuardTelemetryEvent,
+  GuardFallbackSequenceStore,
+  GuardReasonRecord,
+} from './board-op-guard';
 
 export type TldrawColorName =
   | 'black'
