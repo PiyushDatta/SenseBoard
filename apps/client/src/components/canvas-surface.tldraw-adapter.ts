@@ -1498,3 +1498,10 @@ export const boardToTldrawDraftShapes = (
   drafts.sort((left, right) => left.zIndex - right.zIndex);
   return drafts;
 };
+
+export const __testInternals = {
+  clampSingleBoardOp,
+  resetTranscriptBurstHistory: (): void => {
+    transcriptBurstHistory.clear();
+  },
+} as const;
