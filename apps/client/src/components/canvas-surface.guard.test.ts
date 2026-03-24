@@ -17,7 +17,12 @@ import {
 } from '../../../shared/board-dimensions';
 import type { BoardOp, BoardOpsEnvelope } from '../../../shared/types';
 
-const { clampSingleBoardOp, resetTranscriptBurstHistory } = __testInternals;
+const {
+  clampSingleBoardOp,
+  resetTranscriptBurstHistory,
+  getTranscriptBurstHistorySize,
+  burstHistoryLimit,
+} = __testInternals;
 
 const baseEnvelope = (ops: BoardOp[]): BoardOpsEnvelope => ({
   kind: 'board_ops',
@@ -36,7 +41,7 @@ const runGuard = (envelope: BoardOpsEnvelope, overrides: Parameters<typeof guard
 };
 
 describe('clampSingleBoardOp', () => {
-  it('trims setElementText payloads and rejects whitespace-only input', () => {
+  it('preserves setElementText whitespace while rejecting blank input', () => {
     const trimmed = clampSingleBoardOp(
       { type: 'setElementText', id: 'label-1', text: '  Keep me  ' },
       new Set(),
@@ -44,7 +49,7 @@ describe('clampSingleBoardOp', () => {
     );
     expect(trimmed?.op.type).toBe('setElementText');
     if (trimmed?.op.type === 'setElementText') {
-      expect(trimmed.op.text).toBe('Keep me');
+      expect(trimmed.op.text).toBe('  Keep me  ');
     }
 
     const skipReasons = new Map<string, number>();
@@ -184,6 +189,33 @@ describe('clampSingleBoardOp', () => {
     expect(invalidResult).toBeNull();
     expect(invalidSkipReasons.get('op:invalid')).toBe(1);
   });
+
+  it('counts style clamp mutations for telemetry', () => {
+    const clampReasons = new Set<string>();
+    const result = clampSingleBoardOp(
+      {
+        type: 'setElementStyle',
+        id: 'shape-style',
+        style: {
+          strokeColor: 'a'.repeat(128),
+          fillColor: 'b'.repeat(128),
+          strokeWidth: 128,
+          roughness: 10,
+          fontSize: 400,
+        },
+      },
+      clampReasons,
+      new Map(),
+    );
+
+    expect(result?.op.type).toBe('setElementStyle');
+    expect(result?.clamped).toBeGreaterThanOrEqual(5);
+    expect(clampReasons.has('style:strokeColor')).toBe(true);
+    expect(clampReasons.has('style:fillColor')).toBe(true);
+    expect(clampReasons.has('style:strokeWidth')).toBe(true);
+    expect(clampReasons.has('style:roughness')).toBe(true);
+    expect(clampReasons.has('style:fontSize')).toBe(true);
+  });
 });
 
 describe('guardBoardOpsEnvelope', () => {
@@ -248,7 +280,7 @@ describe('guardBoardOpsEnvelope', () => {
 
     expect(textOp.type).toBe('setElementText');
     if (textOp.type === 'setElementText') {
-      expect(textOp.text).toBe('ok');
+      expect(textOp.text).toBe('  ok ');
     }
 
     expect(result.telemetry.clampedOps).toBeGreaterThan(0);
@@ -280,5 +312,35 @@ describe('guardBoardOpsEnvelope', () => {
     expect(recovery.fallbackApplied).toBe(false);
     expect(recovery.telemetry.burstCount).toBe(0);
     expect(recovery.ops[0]?.type).toBe('setElementText');
+  });
+
+  it('reports style clamp telemetry when sanitizing style ops', () => {
+    const envelope = baseEnvelope([
+      {
+        type: 'setElementStyle',
+        id: 'shape-clamp',
+        style: {
+          strokeWidth: 256,
+          fontSize: 999,
+        },
+      } as BoardOp,
+    ]);
+
+    const result = runGuard(envelope);
+    expect(result.fallbackApplied).toBe(false);
+    expect(result.telemetry.clampedOps).toBeGreaterThanOrEqual(2);
+    expect(result.telemetry.clampReasons).toContain('style:strokeWidth');
+    expect(result.telemetry.clampReasons).toContain('style:fontSize');
+  });
+
+  it('bounds transcript burst history and prunes stale keys', () => {
+    const emptyEnvelope = baseEnvelope([]);
+    for (let index = 0; index < burstHistoryLimit + 10; index += 1) {
+      runGuard(emptyEnvelope, { burstKey: `burst-${index}`, now: 1000 });
+    }
+    expect(getTranscriptBurstHistorySize()).toBeLessThanOrEqual(burstHistoryLimit);
+
+    runGuard(emptyEnvelope, { burstKey: 'burst-fresh', now: 1_000_000 });
+    expect(getTranscriptBurstHistorySize()).toBe(1);
   });
 });

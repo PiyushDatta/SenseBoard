@@ -472,6 +472,31 @@ interface BurstTrackerState {
 }
 
 const transcriptBurstHistory = new Map<string, BurstTrackerState>();
+const MAX_BURST_HISTORY_ENTRIES = 64;
+const BURST_RETENTION_MULTIPLIER = 4;
+const MIN_BURST_RETENTION_MS = 10_000;
+
+const pruneTranscriptBurstHistory = (now: number, retentionMs: number) => {
+  if (transcriptBurstHistory.size === 0) {
+    return;
+  }
+  const expiration = now - retentionMs;
+  for (const [key, state] of transcriptBurstHistory) {
+    if (state.lastTimestamp < expiration) {
+      transcriptBurstHistory.delete(key);
+    }
+  }
+  if (transcriptBurstHistory.size <= MAX_BURST_HISTORY_ENTRIES) {
+    return;
+  }
+  const entries = Array.from(transcriptBurstHistory.entries()).sort(
+    (left, right) => left[1].lastTimestamp - right[1].lastTimestamp,
+  );
+  for (let index = 0; index < entries.length - MAX_BURST_HISTORY_ENTRIES; index += 1) {
+    const [key] = entries[index]!;
+    transcriptBurstHistory.delete(key);
+  }
+};
 
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
@@ -479,8 +504,8 @@ const sanitizeBoardText = (value: unknown): string | null => {
   if (typeof value !== 'string') {
     return null;
   }
-  const normalized = value.replace(/\r\n/g, '\n').trim();
-  if (!normalized) {
+  const normalized = value.replace(/\r\n/g, '\n');
+  if (normalized.trim().length === 0) {
     return null;
   }
   return normalized.slice(0, MAX_TEXT_LENGTH);
@@ -664,25 +689,67 @@ const clampBoardElementForOps = (
   return null;
 };
 
-const clampStylePatch = (style: unknown): Partial<BoardElementStyle> => {
+const clampStylePatch = (
+  style: unknown,
+  clampReasons: Set<string>,
+  counter: ClampCounter,
+): Partial<BoardElementStyle> => {
   if (!style || typeof style !== 'object') {
     return {};
   }
   const next: Partial<BoardElementStyle> = {};
+  const recordClamp = (reason: string) => {
+    clampReasons.add(reason);
+    counter.count += 1;
+  };
   if (typeof (style as BoardElementStyle).strokeColor === 'string') {
-    next.strokeColor = (style as BoardElementStyle).strokeColor.slice(0, 64);
+    const original = (style as BoardElementStyle).strokeColor;
+    const sanitized = original.slice(0, 64);
+    if (sanitized !== original) {
+      recordClamp('style:strokeColor');
+    }
+    next.strokeColor = sanitized;
   }
   if (typeof (style as BoardElementStyle).fillColor === 'string') {
-    next.fillColor = (style as BoardElementStyle).fillColor.slice(0, 64);
+    const original = (style as BoardElementStyle).fillColor;
+    const sanitized = original.slice(0, 64);
+    if (sanitized !== original) {
+      recordClamp('style:fillColor');
+    }
+    next.fillColor = sanitized;
   }
   if (isFiniteNumber((style as BoardElementStyle).strokeWidth)) {
-    next.strokeWidth = clampNumber((style as BoardElementStyle).strokeWidth ?? 1, 0.2, 32);
+    next.strokeWidth = clampNumericValue(
+      (style as BoardElementStyle).strokeWidth ?? 1,
+      0.2,
+      32,
+      'style:strokeWidth',
+      clampReasons,
+      counter,
+      1,
+    );
   }
   if (isFiniteNumber((style as BoardElementStyle).roughness)) {
-    next.roughness = clampNumber((style as BoardElementStyle).roughness ?? 0, 0, 2);
+    next.roughness = clampNumericValue(
+      (style as BoardElementStyle).roughness ?? 0,
+      0,
+      2,
+      'style:roughness',
+      clampReasons,
+      counter,
+      0,
+    );
   }
   if (isFiniteNumber((style as BoardElementStyle).fontSize)) {
-    next.fontSize = clampNumber((style as BoardElementStyle).fontSize ?? 16, 8, 120);
+    next.fontSize = clampNumericValue(
+      (style as BoardElementStyle).fontSize ?? 16,
+      8,
+      120,
+      'style:fontSize',
+      clampReasons,
+      counter,
+      16,
+    );
   }
   return next;
 };
@@ -821,14 +888,15 @@ const clampSingleBoardOp = (
       registerSkipReason(skipReasons, 'style:id');
       return null;
     }
-    const style = clampStylePatch(op.style);
+    const counter: ClampCounter = { count: 0 };
+    const style = clampStylePatch(op.style, clampReasons, counter);
     if (Object.keys(style).length === 0) {
       registerSkipReason(skipReasons, 'style:empty');
       return null;
     }
     return {
       op: { type: 'setElementStyle', id: op.id, style },
-      clamped: 0,
+      clamped: counter.count,
       skippedChildren: 0,
     };
   }
@@ -994,14 +1062,18 @@ const trackTranscriptBurst = (
   threshold: number,
   windowMs: number,
 ): { burstCount: number; triggered: boolean } => {
+  const retentionWindow = Math.max(windowMs * BURST_RETENTION_MULTIPLIER, MIN_BURST_RETENTION_MS);
+  pruneTranscriptBurstHistory(now, retentionWindow);
   if (!invalidPayload) {
     transcriptBurstHistory.set(key, { count: 0, lastTimestamp: now });
+    pruneTranscriptBurstHistory(now, retentionWindow);
     return { burstCount: 0, triggered: false };
   }
   const previous = transcriptBurstHistory.get(key);
   const withinWindow = previous && now - previous.lastTimestamp <= windowMs;
   const nextCount = withinWindow ? (previous?.count ?? 0) + 1 : 1;
   transcriptBurstHistory.set(key, { count: nextCount, lastTimestamp: now });
+  pruneTranscriptBurstHistory(now, retentionWindow);
   return { burstCount: nextCount, triggered: nextCount >= threshold };
 };
 
@@ -1504,4 +1576,6 @@ export const __testInternals = {
   resetTranscriptBurstHistory: (): void => {
     transcriptBurstHistory.clear();
   },
+  getTranscriptBurstHistorySize: (): number => transcriptBurstHistory.size,
+  burstHistoryLimit: MAX_BURST_HISTORY_ENTRIES,
 } as const;
