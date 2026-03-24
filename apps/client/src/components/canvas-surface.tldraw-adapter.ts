@@ -1,4 +1,4 @@
-import type { BoardElement, BoardPoint, BoardState } from '../../../shared/types';
+import type { BoardElement, BoardOp, BoardPoint, BoardState } from '../../../shared/types';
 
 export type TldrawColorName =
   | 'black'
@@ -685,4 +685,899 @@ export const boardToTldrawDraftShapes = (
 
   drafts.sort((left, right) => left.zIndex - right.zIndex);
   return drafts;
+};
+
+const BOARD_OP_GUARD_MAX_DELTA = 4096;
+const BOARD_OP_GUARD_MAX_COORD = 200000;
+const BOARD_OP_GUARD_MIN_ZOOM = 0.05;
+const BOARD_OP_GUARD_MAX_ZOOM = 5;
+const BOARD_OP_GUARD_PROVIDER_UNKNOWN = 'unknown';
+
+type GuardElementAuthor = BoardElement['createdBy'] | 'user';
+
+const BOARD_OP_GUARD_ALLOWED_AUTHORS = new Set<GuardElementAuthor>(['ai', 'system', 'user']);
+
+const VALID_ELEMENT_KINDS: Array<BoardElement['kind']> = [
+  'stroke',
+  'rect',
+  'ellipse',
+  'diamond',
+  'triangle',
+  'sticky',
+  'frame',
+  'arrow',
+  'line',
+  'text',
+];
+
+const guardFallbackSequenceByScope = new Map<string, number>();
+const BOARD_OP_GUARD_DEFAULT_SCOPE = 'default';
+
+const sanitizeGuardElementId = (value: unknown): string | null => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const sanitizeGuardAuthor = (value: unknown): GuardElementAuthor | null => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return BOARD_OP_GUARD_ALLOWED_AUTHORS.has(normalized as GuardElementAuthor)
+    ? (normalized as GuardElementAuthor)
+    : null;
+};
+
+const sanitizeGuardScopeSegment = (value: string | undefined): string => {
+  if (!value) {
+    return 'default';
+  }
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized.length > 0 ? normalized : 'default';
+};
+
+const makeGuardFallbackScopeKey = (providerTag: string, fallbackSeed?: string): string => {
+  const providerSegment = sanitizeGuardScopeSegment(providerTag || BOARD_OP_GUARD_PROVIDER_UNKNOWN);
+  const seedSegment = sanitizeGuardScopeSegment(fallbackSeed);
+  return `${providerSegment}:${seedSegment}`;
+};
+
+const getNextGuardFallbackSequence = (scopeKey: string): number => {
+  const next = (guardFallbackSequenceByScope.get(scopeKey) ?? 0) + 1;
+  guardFallbackSequenceByScope.set(scopeKey, next);
+  return next;
+};
+
+const toGuardScopeKey = (scope?: string): string => {
+  return sanitizeGuardScopeSegment(scope ?? BOARD_OP_GUARD_DEFAULT_SCOPE);
+};
+
+const isFiniteNumber = (value: unknown): value is number => {
+  return typeof value === 'number' && Number.isFinite(value);
+};
+
+type GuardStylePatch = NonNullable<BoardElement['style']>;
+type GuardReasonRecord = Record<string, number>;
+
+interface BoardOpGuardContext {
+  maxDelta: number;
+  clampReasons: GuardReasonRecord;
+  dropReasons: GuardReasonRecord;
+  droppedOps: number;
+  clampedOps: number;
+}
+
+const recordGuardDrop = (ctx: BoardOpGuardContext, reason: string) => {
+  ctx.droppedOps += 1;
+  ctx.dropReasons[reason] = (ctx.dropReasons[reason] ?? 0) + 1;
+};
+
+const recordGuardClamp = (ctx: BoardOpGuardContext, reason: string) => {
+  ctx.clampReasons[reason] = (ctx.clampReasons[reason] ?? 0) + 1;
+};
+
+const clampGuardDelta = (value: number, reason: string, ctx: BoardOpGuardContext): { value: number; clamped: boolean } => {
+  const next = clampNumber(value, -ctx.maxDelta, ctx.maxDelta);
+  if (next !== value) {
+    recordGuardClamp(ctx, reason);
+    return { value: next, clamped: true };
+  }
+  return { value, clamped: false };
+};
+
+const clampGuardCoordinateValue = (
+  value: number,
+  reason: string,
+  ctx: BoardOpGuardContext,
+): { value: number; clamped: boolean } => {
+  const next = clampNumber(value, -BOARD_OP_GUARD_MAX_COORD, BOARD_OP_GUARD_MAX_COORD);
+  if (next !== value) {
+    recordGuardClamp(ctx, reason);
+    return { value: next, clamped: true };
+  }
+  return { value, clamped: false };
+};
+
+const sanitizeGuardPoint = (
+  point: BoardPoint | null | undefined,
+  ctx: BoardOpGuardContext,
+  reason: string,
+): { point: BoardPoint; clamped: boolean } | null => {
+  if (!point) {
+    return null;
+  }
+  const [xRaw, yRaw] = point;
+  if (!Number.isFinite(xRaw) || !Number.isFinite(yRaw)) {
+    return null;
+  }
+  const clampX = clampGuardCoordinateValue(xRaw, `${reason}_x`, ctx);
+  const clampY = clampGuardCoordinateValue(yRaw, `${reason}_y`, ctx);
+  return { point: [clampX.value, clampY.value], clamped: clampX.clamped || clampY.clamped };
+};
+
+const sanitizeGuardPoints = (
+  points: BoardPoint[] | undefined,
+  ctx: BoardOpGuardContext,
+  reason: string,
+): { points: BoardPoint[]; clamped: boolean } => {
+  if (!Array.isArray(points)) {
+    return { points: [], clamped: false };
+  }
+  let clampedAny = false;
+  const sanitized: BoardPoint[] = [];
+  for (let index = 0; index < points.length; index += 1) {
+    const result = sanitizeGuardPoint(points[index], ctx, reason);
+    if (result) {
+      sanitized.push(result.point);
+      clampedAny ||= result.clamped;
+    }
+  }
+  return { points: sanitized, clamped: clampedAny };
+};
+
+const sanitizeGuardStylePatch = (style: Partial<GuardStylePatch> | undefined): Partial<GuardStylePatch> | null => {
+  if (!style || typeof style !== 'object') {
+    return null;
+  }
+
+  const sanitized: Partial<GuardStylePatch> = {};
+  if (typeof style.strokeColor === 'string' && style.strokeColor.trim().length > 0) {
+    sanitized.strokeColor = style.strokeColor.trim();
+  }
+  if (typeof style.fillColor === 'string' && style.fillColor.trim().length > 0) {
+    sanitized.fillColor = style.fillColor.trim();
+  }
+  if (typeof style.strokeWidth === 'number' && Number.isFinite(style.strokeWidth)) {
+    sanitized.strokeWidth = style.strokeWidth;
+  }
+  if (typeof style.roughness === 'number' && Number.isFinite(style.roughness)) {
+    sanitized.roughness = style.roughness;
+  }
+  if (typeof style.fontSize === 'number' && Number.isFinite(style.fontSize)) {
+    sanitized.fontSize = style.fontSize;
+  }
+
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+};
+
+const sanitizeUpsertElement = (op: Extract<BoardOp, { type: 'upsertElement' }>, ctx: BoardOpGuardContext): BoardOp | null => {
+  const element = op.element;
+  if (!element) {
+    recordGuardDrop(ctx, 'missing_element');
+    return null;
+  }
+
+  const id = sanitizeGuardElementId((element as { id?: unknown }).id);
+  if (!id) {
+    recordGuardDrop(ctx, 'invalid_element_id');
+    return null;
+  }
+  if (!VALID_ELEMENT_KINDS.includes(element.kind)) {
+    recordGuardDrop(ctx, 'invalid_element_kind');
+    return null;
+  }
+  if (!isFiniteNumber((element as { createdAt?: unknown }).createdAt)) {
+    recordGuardDrop(ctx, 'invalid_element_timestamp');
+    return null;
+  }
+  if (!sanitizeGuardAuthor((element as { createdBy?: unknown }).createdBy)) {
+    recordGuardDrop(ctx, 'invalid_element_author');
+    return null;
+  }
+
+  let sanitizedElement: BoardElement = element;
+  let elementClamped = false;
+
+  const cloneElementIfNeeded = () => {
+    if (sanitizedElement === element) {
+      sanitizedElement = { ...element };
+    }
+  };
+
+  if (id !== element.id) {
+    cloneElementIfNeeded();
+    sanitizedElement.id = id;
+  }
+
+  const clampCoord = (value: number, reason: string): number => {
+    const result = clampGuardCoordinateValue(value, reason, ctx);
+    elementClamped ||= result.clamped;
+    return result.value;
+  };
+
+  const clampSize = (value: number, reason: string): number => {
+    const normalized = clampNumber(Math.max(1, value), 1, BOARD_OP_GUARD_MAX_COORD);
+    if (normalized !== value) {
+      recordGuardClamp(ctx, reason);
+      elementClamped = true;
+    }
+    return normalized;
+  };
+
+  const sanitizePointsForElement = (points: BoardPoint[] | undefined, reason: string, minLength: number): BoardPoint[] | null => {
+    const result = sanitizeGuardPoints(points, ctx, reason);
+    if (result.points.length < minLength) {
+      recordGuardDrop(ctx, 'invalid_element_points');
+      return null;
+    }
+    elementClamped ||= result.clamped;
+    return result.points;
+  };
+
+  const rejectGeometry = () => {
+    recordGuardDrop(ctx, 'invalid_element_geometry');
+    return null;
+  };
+
+  switch (sanitizedElement.kind) {
+    case 'rect':
+    case 'ellipse':
+    case 'diamond':
+    case 'triangle':
+    case 'frame':
+    case 'sticky': {
+      if (
+        !isFiniteNumber(sanitizedElement.x) ||
+        !isFiniteNumber(sanitizedElement.y) ||
+        !isFiniteNumber(sanitizedElement.w) ||
+        !isFiniteNumber(sanitizedElement.h)
+      ) {
+        return rejectGeometry();
+      }
+      cloneElementIfNeeded();
+      sanitizedElement.x = clampCoord(sanitizedElement.x, `${sanitizedElement.kind}_x`);
+      sanitizedElement.y = clampCoord(sanitizedElement.y, `${sanitizedElement.kind}_y`);
+      sanitizedElement.w = clampSize(sanitizedElement.w, `${sanitizedElement.kind}_w`);
+      sanitizedElement.h = clampSize(sanitizedElement.h, `${sanitizedElement.kind}_h`);
+      if (sanitizedElement.kind === 'sticky' && typeof sanitizedElement.text !== 'string') {
+        recordGuardDrop(ctx, 'invalid_element_text');
+        return null;
+      }
+      break;
+    }
+    case 'text': {
+      if (
+        !isFiniteNumber(sanitizedElement.x) ||
+        !isFiniteNumber(sanitizedElement.y) ||
+        typeof sanitizedElement.text !== 'string'
+      ) {
+        recordGuardDrop(ctx, 'invalid_element_text');
+        return null;
+      }
+      cloneElementIfNeeded();
+      sanitizedElement.x = clampCoord(sanitizedElement.x, 'text_x');
+      sanitizedElement.y = clampCoord(sanitizedElement.y, 'text_y');
+      break;
+    }
+    case 'stroke': {
+      const points = sanitizePointsForElement(sanitizedElement.points, 'stroke_points', 1);
+      if (!points) {
+        return null;
+      }
+      cloneElementIfNeeded();
+      sanitizedElement.points = points;
+      break;
+    }
+    case 'line': {
+      const points = sanitizePointsForElement(sanitizedElement.points, 'line_points', 2);
+      if (!points) {
+        return null;
+      }
+      cloneElementIfNeeded();
+      sanitizedElement.points = points;
+      break;
+    }
+    case 'arrow': {
+      const points = sanitizePointsForElement(sanitizedElement.points, 'arrow_points', 2);
+      if (!points) {
+        return null;
+      }
+      cloneElementIfNeeded();
+      sanitizedElement.points = points;
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (elementClamped) {
+    ctx.clampedOps += 1;
+  }
+  return sanitizedElement === element ? op : { type: 'upsertElement', element: sanitizedElement };
+};
+
+const sanitizeBoardOp = (op: BoardOp | null | undefined, ctx: BoardOpGuardContext): BoardOp | null => {
+  if (!op) {
+    recordGuardDrop(ctx, 'null_op');
+    return null;
+  }
+
+  switch (op.type) {
+    case 'batch': {
+      const nested = sanitizeBoardOps(op.ops, ctx);
+      if (nested.length === 0) {
+        recordGuardDrop(ctx, 'empty_batch');
+        return null;
+      }
+      return { type: 'batch', ops: nested };
+    }
+    case 'appendStrokePoints': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_append_id');
+        return null;
+      }
+      const { points, clamped } = sanitizeGuardPoints(op.points, ctx, 'append_points');
+      if (points.length === 0) {
+        recordGuardDrop(ctx, 'empty_points');
+        return null;
+      }
+      if (clamped) {
+        ctx.clampedOps += 1;
+      }
+      return { ...op, id, points };
+    }
+    case 'offsetElement': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_offset_id');
+        return null;
+      }
+      if (!Number.isFinite(op.dx) || !Number.isFinite(op.dy)) {
+        recordGuardDrop(ctx, 'invalid_offset_delta');
+        return null;
+      }
+      const clampDx = clampGuardDelta(op.dx, 'offset_dx', ctx);
+      const clampDy = clampGuardDelta(op.dy, 'offset_dy', ctx);
+      if (clampDx.clamped || clampDy.clamped) {
+        ctx.clampedOps += 1;
+      }
+      return { ...op, id, dx: clampDx.value, dy: clampDy.value };
+    }
+    case 'duplicateElement': {
+      const id = sanitizeGuardElementId(op.id);
+      const newId = sanitizeGuardElementId(op.newId);
+      if (!id || !newId) {
+        recordGuardDrop(ctx, 'invalid_duplicate_id');
+        return null;
+      }
+      let clamped = false;
+      let dx = op.dx;
+      if (dx !== undefined) {
+        if (!Number.isFinite(dx)) {
+          recordGuardDrop(ctx, 'invalid_duplicate_delta');
+          return null;
+        }
+        const result = clampGuardDelta(dx, 'duplicate_dx', ctx);
+        dx = result.value;
+        clamped ||= result.clamped;
+      }
+      let dy = op.dy;
+      if (dy !== undefined) {
+        if (!Number.isFinite(dy)) {
+          recordGuardDrop(ctx, 'invalid_duplicate_delta');
+          return null;
+        }
+        const result = clampGuardDelta(dy, 'duplicate_dy', ctx);
+        dy = result.value;
+        clamped ||= result.clamped;
+      }
+      if (clamped) {
+        ctx.clampedOps += 1;
+      }
+      return { ...op, id, newId, dx, dy };
+    }
+    case 'setElementGeometry': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_geometry_id');
+        return null;
+      }
+      const next: Extract<BoardOp, { type: 'setElementGeometry' }> = { type: 'setElementGeometry', id };
+      let hasUpdate = false;
+      let clamped = false;
+
+      if (isFiniteNumber(op.x)) {
+        const result = clampGuardCoordinateValue(op.x, 'geometry_x', ctx);
+        next.x = result.value;
+        hasUpdate = true;
+        clamped ||= result.clamped;
+      }
+      if (isFiniteNumber(op.y)) {
+        const result = clampGuardCoordinateValue(op.y, 'geometry_y', ctx);
+        next.y = result.value;
+        hasUpdate = true;
+        clamped ||= result.clamped;
+      }
+      if (isFiniteNumber(op.w)) {
+        const normalized = clampNumber(Math.max(1, op.w), 1, BOARD_OP_GUARD_MAX_COORD);
+        if (normalized !== op.w) {
+          recordGuardClamp(ctx, 'geometry_w');
+          clamped = true;
+        }
+        next.w = normalized;
+        hasUpdate = true;
+      }
+      if (isFiniteNumber(op.h)) {
+        const normalized = clampNumber(Math.max(1, op.h), 1, BOARD_OP_GUARD_MAX_COORD);
+        if (normalized !== op.h) {
+          recordGuardClamp(ctx, 'geometry_h');
+          clamped = true;
+        }
+        next.h = normalized;
+        hasUpdate = true;
+      }
+      if (op.points) {
+        const points = sanitizeGuardPoints(op.points, ctx, 'geometry_points');
+        if (points.points.length > 0) {
+          next.points = points.points;
+          hasUpdate = true;
+          clamped ||= points.clamped;
+        }
+      }
+      if (!hasUpdate) {
+        recordGuardDrop(ctx, 'empty_geometry');
+        return null;
+      }
+      if (clamped) {
+        ctx.clampedOps += 1;
+      }
+      return next;
+    }
+    case 'setElementStyle': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_style_id');
+        return null;
+      }
+      const style = sanitizeGuardStylePatch(op.style);
+      if (!style) {
+        recordGuardDrop(ctx, 'empty_style');
+        return null;
+      }
+      return { ...op, id, style };
+    }
+    case 'setElementText': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_text_id');
+        return null;
+      }
+      if (typeof op.text !== 'string') {
+        recordGuardDrop(ctx, 'invalid_text');
+        return null;
+      }
+      return { ...op, id, text: op.text };
+    }
+    case 'setElementZIndex': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_z_index_id');
+        return null;
+      }
+      if (!Number.isFinite(op.zIndex)) {
+        recordGuardDrop(ctx, 'invalid_z_index');
+        return null;
+      }
+      return { ...op, id };
+    }
+    case 'alignElements': {
+      const ids = Array.from(
+        new Set((op.ids ?? []).filter((idValue): idValue is string => typeof idValue === 'string' && idValue.trim().length > 0)),
+      );
+      if (ids.length === 0) {
+        recordGuardDrop(ctx, 'empty_align_ids');
+        return null;
+      }
+      return { ...op, ids };
+    }
+    case 'distributeElements': {
+      const ids = Array.from(
+        new Set((op.ids ?? []).filter((idValue): idValue is string => typeof idValue === 'string' && idValue.trim().length > 0)),
+      );
+      if (ids.length === 0) {
+        recordGuardDrop(ctx, 'empty_distribute_ids');
+        return null;
+      }
+      let gap = op.gap;
+      let clamped = false;
+      if (gap !== undefined) {
+        if (!Number.isFinite(gap)) {
+          recordGuardDrop(ctx, 'invalid_distribute_gap');
+          return null;
+        }
+        const clampResult = clampGuardDelta(gap, 'distribute_gap', ctx);
+        gap = clampResult.value;
+        clamped = clampResult.clamped;
+      }
+      if (clamped) {
+        ctx.clampedOps += 1;
+      }
+      return gap !== undefined ? { ...op, ids, gap } : { ...op, ids };
+    }
+    case 'setViewport': {
+      const viewport = op.viewport ?? {};
+      const normalized: typeof op.viewport = {};
+      let clamped = false;
+      if (typeof viewport.x === 'number' && Number.isFinite(viewport.x)) {
+        const result = clampGuardCoordinateValue(viewport.x, 'viewport_x', ctx);
+        normalized.x = result.value;
+        clamped ||= result.clamped;
+      }
+      if (typeof viewport.y === 'number' && Number.isFinite(viewport.y)) {
+        const result = clampGuardCoordinateValue(viewport.y, 'viewport_y', ctx);
+        normalized.y = result.value;
+        clamped ||= result.clamped;
+      }
+      if (typeof viewport.zoom === 'number' && Number.isFinite(viewport.zoom)) {
+        const nextZoom = clampNumber(viewport.zoom, BOARD_OP_GUARD_MIN_ZOOM, BOARD_OP_GUARD_MAX_ZOOM);
+        if (nextZoom !== viewport.zoom) {
+          recordGuardClamp(ctx, 'viewport_zoom');
+          clamped = true;
+        }
+        normalized.zoom = nextZoom;
+      }
+      if (Object.keys(normalized).length === 0) {
+        recordGuardDrop(ctx, 'empty_viewport');
+        return null;
+      }
+      if (clamped) {
+        ctx.clampedOps += 1;
+      }
+      return { type: 'setViewport', viewport: normalized };
+    }
+    case 'deleteElement': {
+      const id = sanitizeGuardElementId(op.id);
+      if (!id) {
+        recordGuardDrop(ctx, 'invalid_delete_id');
+        return null;
+      }
+      return { ...op, id };
+    }
+    case 'clearBoard':
+      return op;
+    case 'upsertElement':
+      return sanitizeUpsertElement(op, ctx);
+    default:
+      recordGuardDrop(ctx, 'unknown_op');
+      return null;
+  }
+};
+
+const sanitizeBoardOps = (ops: BoardOp[] | undefined, ctx: BoardOpGuardContext): BoardOp[] => {
+  if (!Array.isArray(ops)) {
+    return [];
+  }
+  const sanitized: BoardOp[] = [];
+  for (let index = 0; index < ops.length; index += 1) {
+    const next = sanitizeBoardOp(ops[index], ctx);
+    if (next) {
+      sanitized.push(next);
+    }
+  }
+  return sanitized;
+};
+
+export interface BoardOpGuardTelemetryEvent {
+  kind: 'board_op_guard';
+  scopeKey: string;
+  providerTag: string;
+  totalOps: number;
+  sanitizedOps: number;
+  droppedOps: number;
+  clampedOps: number;
+  fallbackOps: number;
+  clampReasons: GuardReasonRecord;
+  dropReasons: GuardReasonRecord;
+  timestamp: number;
+}
+
+type BoardOpGuardTelemetryHandler = (event: BoardOpGuardTelemetryEvent) => void;
+
+const boardOpGuardTelemetryHandlers = new Map<string, BoardOpGuardTelemetryHandler>();
+
+export const setBoardOpGuardTelemetryHandler = (handler: BoardOpGuardTelemetryHandler | null, scope?: string) => {
+  const scopeKey = toGuardScopeKey(scope);
+  if (handler) {
+    boardOpGuardTelemetryHandlers.set(scopeKey, handler);
+    return;
+  }
+  boardOpGuardTelemetryHandlers.delete(scopeKey);
+};
+
+const emitBoardOpGuardTelemetry = (scopeKey: string, event: BoardOpGuardTelemetryEvent) => {
+  const handler = boardOpGuardTelemetryHandlers.get(scopeKey);
+  if (handler) {
+    try {
+      handler(event);
+      return;
+    } catch {
+      // Swallow handler errors to keep guard execution safe.
+    }
+  }
+  if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+    console.warn(`[board-op-guard:${scopeKey}]`, event);
+  }
+};
+
+export interface BoardOpGuardHostNotice {
+  kind: 'board_op_guard';
+  scopeKey: string;
+  severity: 'info' | 'warning';
+  providerTag: string;
+  message: string;
+  droppedOps: number;
+  clampedOps: number;
+  fallbackOps: number;
+}
+
+type BoardOpGuardHostNoticeHandler = (notice: BoardOpGuardHostNotice) => void;
+
+const boardOpGuardHostNoticeHandlers = new Map<string, BoardOpGuardHostNoticeHandler>();
+
+export const setBoardOpGuardHostNoticeHandler = (handler: BoardOpGuardHostNoticeHandler | null, scope?: string) => {
+  const scopeKey = toGuardScopeKey(scope);
+  if (handler) {
+    boardOpGuardHostNoticeHandlers.set(scopeKey, handler);
+    return;
+  }
+  boardOpGuardHostNoticeHandlers.delete(scopeKey);
+};
+
+const notifyBoardOpGuardHost = (scopeKey: string, notice: BoardOpGuardHostNotice) => {
+  const handler = boardOpGuardHostNoticeHandlers.get(scopeKey);
+  if (handler) {
+    try {
+      handler(notice);
+      return;
+    } catch {
+      // Ignore host notice handler errors.
+    }
+  }
+  if (typeof console !== 'undefined' && typeof console.info === 'function') {
+    console.info(`[board-op-guard:notice:${scopeKey}]`, notice);
+  }
+};
+
+export const resetBoardOpGuardScope = (scope?: string, providerTag?: string, fallbackSeed?: string) => {
+  if (!scope) {
+    boardOpGuardTelemetryHandlers.clear();
+    boardOpGuardHostNoticeHandlers.clear();
+    guardFallbackSequenceByScope.clear();
+    return;
+  }
+  const scopeKey = toGuardScopeKey(scope);
+  boardOpGuardTelemetryHandlers.delete(scopeKey);
+  boardOpGuardHostNoticeHandlers.delete(scopeKey);
+
+  const fallbackKey = makeGuardFallbackScopeKey(
+    providerTag || BOARD_OP_GUARD_PROVIDER_UNKNOWN,
+    fallbackSeed ?? scopeKey,
+  );
+  guardFallbackSequenceByScope.delete(fallbackKey);
+};
+
+const deterministicGuardHash = (value: string): number => {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash >>> 0;
+};
+
+interface GuardFallbackInput {
+  providerTag: string;
+  droppedOps: number;
+  clampedOps: number;
+  sanitizedCount: number;
+  scopeKey: string;
+  sequence: number;
+  seed?: string;
+}
+
+const buildGuardFallbackOps = (input: GuardFallbackInput): BoardOp[] => {
+  const seedSource =
+    input.seed ??
+    `${input.scopeKey}:${input.sequence}:${input.providerTag}:${input.droppedOps}:${input.clampedOps}:${input.sanitizedCount}`;
+  const hash = deterministicGuardHash(seedSource);
+  const suffix = `${input.scopeKey}:${input.sequence.toString(36)}:${hash.toString(36)}`;
+  const baseX = 200 + (hash % 220);
+  const baseY = 160 + ((hash >> 5) % 160);
+  const createdAt = 1700000000000 + (hash % 5000);
+  const textColor = '#1f2937';
+  const connectorColor = '#475569';
+
+  const summary: BoardElement = {
+    id: `guard:fallback:text:${suffix}:summary`,
+    kind: 'text',
+    x: baseX,
+    y: baseY,
+    text: `Board guard repaired ${input.droppedOps} drop(s)${input.clampedOps > 0 ? ` + ${input.clampedOps} clamp(s)` : ''}.`,
+    createdAt,
+    createdBy: 'system',
+    style: {
+      fontSize: 26,
+      strokeColor: textColor,
+    },
+  };
+
+  const provider: BoardElement = {
+    id: `guard:fallback:text:${suffix}:provider`,
+    kind: 'text',
+    x: baseX,
+    y: baseY + 90,
+    text: `Provider: ${input.providerTag || BOARD_OP_GUARD_PROVIDER_UNKNOWN}`,
+    createdAt,
+    createdBy: 'system',
+    style: {
+      fontSize: 22,
+      strokeColor: textColor,
+    },
+  };
+
+  const connectorOne: BoardElement = {
+    id: `guard:fallback:arrow:${suffix}:0`,
+    kind: 'arrow',
+    points: [
+      [baseX - 140, baseY - 40],
+      [baseX - 12, baseY + 18],
+      [baseX + 60, baseY + 120],
+    ],
+    createdAt,
+    createdBy: 'system',
+    style: {
+      strokeColor: connectorColor,
+      strokeWidth: 2,
+      roughness: 1.3,
+    },
+  };
+
+  const connectorTwo: BoardElement = {
+    id: `guard:fallback:arrow:${suffix}:1`,
+    kind: 'arrow',
+    points: [
+      [baseX + 220, baseY + 10],
+      [baseX + 80, baseY + 60],
+      [baseX + 12, baseY + 150],
+    ],
+    createdAt,
+    createdBy: 'system',
+    style: {
+      strokeColor: connectorColor,
+      strokeWidth: 2,
+      roughness: 1.3,
+    },
+  };
+
+  return [summary, provider, connectorOne, connectorTwo].map((element): BoardOp => {
+    return {
+      type: 'upsertElement',
+      element,
+    };
+  });
+};
+
+export interface BoardOpGuardOptions {
+  providerTag?: string;
+  maxDeltaMagnitude?: number;
+  fallbackSeed?: string;
+  runtimeScope?: string;
+}
+
+export interface BoardOpGuardResult {
+  ops: BoardOp[];
+  sanitizedOps: BoardOp[];
+  fallbackOps: BoardOp[];
+  totalOps: number;
+  droppedOps: number;
+  clampedOps: number;
+  clampReasons: GuardReasonRecord;
+  dropReasons: GuardReasonRecord;
+  providerTag: string;
+  scopeKey: string;
+  intervened: boolean;
+}
+
+export const guardBoardOpsForTldraw = (
+  ops: BoardOp[] | null | undefined,
+  options?: BoardOpGuardOptions,
+): BoardOpGuardResult => {
+  const providerTag = options?.providerTag?.trim() || BOARD_OP_GUARD_PROVIDER_UNKNOWN;
+  const maxDelta = Math.max(1, options?.maxDeltaMagnitude ?? BOARD_OP_GUARD_MAX_DELTA);
+  const runtimeScopeKey = toGuardScopeKey(options?.runtimeScope);
+  const ctx: BoardOpGuardContext = {
+    maxDelta,
+    clampReasons: {},
+    dropReasons: {},
+    droppedOps: 0,
+    clampedOps: 0,
+  };
+
+  const sourceOps = Array.isArray(ops) ? ops : [];
+  const sanitizedOps = sanitizeBoardOps(sourceOps, ctx);
+  const intervened = ctx.droppedOps > 0 || ctx.clampedOps > 0;
+  const fallbackScopeKey = makeGuardFallbackScopeKey(providerTag, options?.fallbackSeed ?? runtimeScopeKey);
+  const fallbackSequence = intervened ? getNextGuardFallbackSequence(fallbackScopeKey) : 0;
+  const fallbackOps =
+    intervened && fallbackSequence > 0
+      ? buildGuardFallbackOps({
+          providerTag,
+          droppedOps: ctx.droppedOps,
+          clampedOps: ctx.clampedOps,
+          sanitizedCount: sanitizedOps.length,
+          scopeKey: fallbackScopeKey,
+          sequence: fallbackSequence,
+          seed: options?.fallbackSeed,
+        })
+      : [];
+  const guardedOps = fallbackOps.length > 0 ? [...sanitizedOps, ...fallbackOps] : sanitizedOps;
+
+  if (intervened) {
+    emitBoardOpGuardTelemetry(runtimeScopeKey, {
+      kind: 'board_op_guard',
+      scopeKey: runtimeScopeKey,
+      providerTag,
+      totalOps: sourceOps.length,
+      sanitizedOps: sanitizedOps.length,
+      droppedOps: ctx.droppedOps,
+      clampedOps: ctx.clampedOps,
+      clampReasons: ctx.clampReasons,
+      dropReasons: ctx.dropReasons,
+      fallbackOps: fallbackOps.length,
+      timestamp: Date.now(),
+    });
+
+    notifyBoardOpGuardHost(runtimeScopeKey, {
+      kind: 'board_op_guard',
+      scopeKey: runtimeScopeKey,
+      severity: 'warning',
+      providerTag,
+      message: `Guard repaired ${ctx.droppedOps} dropped and ${ctx.clampedOps} clamped board ops.`,
+      droppedOps: ctx.droppedOps,
+      clampedOps: ctx.clampedOps,
+      fallbackOps: fallbackOps.length,
+    });
+  }
+
+  return {
+    ops: guardedOps,
+    sanitizedOps,
+    fallbackOps,
+    totalOps: sourceOps.length,
+    droppedOps: ctx.droppedOps,
+    clampedOps: ctx.clampedOps,
+    clampReasons: ctx.clampReasons,
+    dropReasons: ctx.dropReasons,
+    providerTag,
+    scopeKey: runtimeScopeKey,
+    intervened,
+  };
 };
