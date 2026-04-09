@@ -1,10 +1,16 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from 'bun:test';
+import { beforeEach, describe, expect, it } from 'bun:test';
 
 import { createEmptyBoardState } from '../../../shared/board-state';
 import type { BoardElement, BoardState } from '../../../shared/types';
-import { boardToTldrawDraftShapes } from './canvas-surface.tldraw-adapter';
+import {
+  boardToTldrawDraftShapes,
+  getBoardDeltaTelemetryHistory,
+  getBoardDeltaZeroOpStrikes,
+  resetBoardDeltaTelemetry,
+  setTranscriptWindowContext,
+} from './canvas-surface.tldraw-adapter';
 
 const withBoard = (elements: BoardElement[], order?: string[]): BoardState => {
   const board = createEmptyBoardState();
@@ -340,5 +346,77 @@ describe('canvas-surface tldraw adapter', () => {
       const lines = text.props.text.split('\n');
       expect(lines.length).toBeLessThanOrEqual(5);
     }
+  });
+
+  describe('board delta telemetry + fallback', () => {
+    beforeEach(() => {
+      resetBoardDeltaTelemetry();
+      setTranscriptWindowContext(null);
+    });
+
+    it('generates deterministic fallback after repeated zero-delta windows', () => {
+      const board = createEmptyBoardState();
+      const now = Date.now();
+
+      setTranscriptWindowContext({
+        id: 'window-1',
+        summary: 'Initial window',
+        lines: ['Host: kickoff'],
+      });
+      expect(boardToTldrawDraftShapes(board, true)).toHaveLength(0);
+
+      setTranscriptWindowContext({
+        id: 'window-2',
+        summary: 'Second window',
+        lines: ['Host: still waiting'],
+      });
+      expect(boardToTldrawDraftShapes(board, true)).toHaveLength(0);
+      expect(getBoardDeltaZeroOpStrikes('window-2')).toBe(1);
+
+      setTranscriptWindowContext({
+        id: `window-3-${now}`,
+        summary: 'Third window',
+        lines: ['Host: send fallback please'],
+      });
+      const fallbackDrafts = boardToTldrawDraftShapes(board, true);
+      expect(fallbackDrafts.length).toBeGreaterThanOrEqual(2);
+      expect(fallbackDrafts.some((shape) => shape.kind === 'geo')).toBe(true);
+      expect(fallbackDrafts.some((shape) => shape.kind === 'text')).toBe(true);
+
+      const telemetry = getBoardDeltaTelemetryHistory();
+      const lastEvent = telemetry[telemetry.length - 1];
+      expect(lastEvent?.fallbackTriggered).toBe(true);
+      expect(lastEvent?.fallbackReason).toBe('zero_delta');
+      expect(lastEvent?.windowId).toBe(`window-3-${now}`);
+      expect(lastEvent?.invalidElementIds).toEqual([]);
+      expect(getBoardDeltaZeroOpStrikes(`window-3-${now}`)).toBe(0);
+    });
+
+    it('reports diagnostics when invalid ops force fallback', () => {
+      const board = createEmptyBoardState();
+      const arrowId = 'invalid-arrow';
+      board.elements[arrowId] = {
+        id: arrowId,
+        kind: 'arrow',
+        points: [],
+        createdAt: Date.now(),
+        createdBy: 'ai',
+      };
+      board.order.push(arrowId);
+
+      setTranscriptWindowContext({
+        id: 'invalid-window',
+        summary: 'Invalid ops',
+        lines: ['Host: describing diagram'],
+      });
+      const fallbackDrafts = boardToTldrawDraftShapes(board, true);
+      expect(fallbackDrafts.length).toBeGreaterThan(0);
+
+      const telemetry = getBoardDeltaTelemetryHistory();
+      const lastEvent = telemetry[telemetry.length - 1];
+      expect(lastEvent?.fallbackTriggered).toBe(true);
+      expect(lastEvent?.fallbackReason).toBe('invalid_ops');
+      expect(lastEvent?.invalidElementIds).toContain(arrowId);
+    });
   });
 });

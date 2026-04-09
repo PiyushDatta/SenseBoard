@@ -12,10 +12,15 @@ import {
 import 'tldraw/tldraw.css';
 
 import { SENSEBOARD_AI_CONTENT_MAX_X, SENSEBOARD_AI_CONTENT_MIN_X } from '../../../shared/board-dimensions';
-import type { RoomState } from '../../../shared/types';
+import type { RoomState, TranscriptChunk } from '../../../shared/types';
 import type { SenseTheme } from '../lib/theme';
 import { createCanvasViewportStyle } from '../styles/canvas-surface-web.styles';
-import { boardToTldrawDraftShapes, type TldrawDraftShape } from './canvas-surface.tldraw-adapter';
+import {
+  boardToTldrawDraftShapes,
+  setTranscriptWindowContext,
+  type TldrawDraftShape,
+  type TranscriptWindowContext,
+} from './canvas-surface.tldraw-adapter';
 
 export interface CanvasSurfaceProps {
   room: RoomState | null;
@@ -25,6 +30,45 @@ export interface CanvasSurfaceProps {
   showAiNotes: boolean;
   theme: SenseTheme;
 }
+
+const MAX_TRANSCRIPT_CONTEXT_LINES = 6;
+
+const normalizeTranscriptLine = (chunk: TranscriptChunk): string | null => {
+  const speaker = chunk.speaker?.trim() ?? '';
+  const text = chunk.text?.trim() ?? '';
+  if (!speaker && !text) {
+    return null;
+  }
+  if (!text) {
+    return speaker || null;
+  }
+  const label = speaker || 'Speaker';
+  return `${label}: ${text}`;
+};
+
+const buildTranscriptWindowContext = (room: RoomState | null): TranscriptWindowContext | null => {
+  if (!room?.transcriptChunks?.length) {
+    return null;
+  }
+
+  const latestChunks = room.transcriptChunks.slice(-MAX_TRANSCRIPT_CONTEXT_LINES);
+  const lines = latestChunks
+    .map((chunk) => normalizeTranscriptLine(chunk))
+    .filter((line): line is string => Boolean(line));
+
+  if (lines.length === 0) {
+    return null;
+  }
+
+  const chunkIdSeed = latestChunks.map((chunk) => chunk.id).join('|');
+  const summary = room.visualHint?.trim() || lines[lines.length - 1]!;
+
+  return {
+    id: `${room.id}:${chunkIdSeed}`,
+    summary,
+    lines,
+  };
+};
 
 const toLinePointsRecord = (points: Array<{ id: string; index: string; x: number; y: number }>): Record<string, TLLineShapePoint> => {
   return points.reduce<Record<string, TLLineShapePoint>>((acc, point) => {
@@ -178,8 +222,23 @@ const centerCameraOnAiLane = (editor: Editor) => {
 export const CanvasSurface = ({ room, showAiNotes, theme }: CanvasSurfaceProps) => {
   const editorRef = useRef<Editor | null>(null);
   const centeredRef = useRef(false);
+  const transcriptChunkKey =
+    room?.transcriptChunks?.map((chunk) => `${chunk.id}:${chunk.text ?? ''}`).join('|') ?? '';
+  const transcriptContext = useMemo(
+    () => buildTranscriptWindowContext(room),
+    [room?.id, room?.visualHint, transcriptChunkKey],
+  );
 
-  const drafts = useMemo(() => boardToTldrawDraftShapes(room?.board, showAiNotes), [room?.board, showAiNotes]);
+  const drafts = useMemo(() => {
+    setTranscriptWindowContext(transcriptContext);
+    return boardToTldrawDraftShapes(room?.board, showAiNotes);
+  }, [room?.board, showAiNotes, transcriptContext]);
+
+  useEffect(() => {
+    return () => {
+      setTranscriptWindowContext(null);
+    };
+  }, []);
 
   const handleMount = useCallback(
     (editor: Editor) => {

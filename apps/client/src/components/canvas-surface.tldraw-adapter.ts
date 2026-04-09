@@ -111,6 +111,290 @@ export type TldrawDraftShape =
   | TldrawDraftLineShape
   | TldrawDraftArrowShape;
 
+interface DraftConversionDiagnostics {
+  hiddenElementIds: Set<string>;
+  invalidElementIds: Set<string>;
+}
+
+export interface TranscriptWindowContext {
+  id: string;
+  summary?: string;
+  lines?: string[];
+}
+
+export type BoardDeltaFallbackReason = 'zero_delta' | 'invalid_ops' | null;
+
+export interface BoardDeltaTelemetryEvent {
+  timestamp: number;
+  revision: number;
+  lastUpdatedAt: number;
+  windowId: string;
+  boardElementCount: number;
+  draftCount: number;
+  zeroDelta: boolean;
+  zeroOpStrikes: number;
+  orderChanged: boolean;
+  fallbackTriggered: boolean;
+  fallbackReason: BoardDeltaFallbackReason;
+  addedIds: string[];
+  removedIds: string[];
+  changedIds: string[];
+  hiddenElementIds: string[];
+  invalidElementIds: string[];
+  transcriptSummary?: string;
+}
+
+export type BoardDeltaTelemetryListener = (event: BoardDeltaTelemetryEvent) => void;
+
+interface BoardSummary {
+  fingerprint: string;
+  revision: number;
+  lastUpdatedAt: number;
+  elementHashes: Record<string, string>;
+  elementCount: number;
+  orderSignature: string;
+}
+
+interface BoardDeltaSummary {
+  added: string[];
+  removed: string[];
+  changed: string[];
+}
+
+const ZERO_OP_STRIKE_LIMIT = 2;
+const TELEMETRY_HISTORY_LIMIT = 12;
+
+let transcriptWindowContext: TranscriptWindowContext | null = null;
+const boardSummaryByWindowId = new Map<string, BoardSummary>();
+let lastWindowContextId: string | null = null;
+const zeroOpStrikesByWindow = new Map<string, number>();
+let boardDeltaTelemetryListener: BoardDeltaTelemetryListener | null = null;
+const boardDeltaTelemetryHistory: BoardDeltaTelemetryEvent[] = [];
+
+const getPreviousSummaryForWindow = (windowId: string): BoardSummary | null => {
+  const exact = boardSummaryByWindowId.get(windowId);
+  if (exact) {
+    return exact;
+  }
+  if (lastWindowContextId && lastWindowContextId !== windowId) {
+    return boardSummaryByWindowId.get(lastWindowContextId) ?? null;
+  }
+  return null;
+};
+
+const createDraftConversionDiagnostics = (): DraftConversionDiagnostics => ({
+  hiddenElementIds: new Set<string>(),
+  invalidElementIds: new Set<string>(),
+});
+
+const hashString = (value: string): string => {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = (hash + (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)) >>> 0;
+  }
+  return hash.toString(36);
+};
+
+const serializeStyle = (style: BoardElement['style'] | undefined): string => {
+  if (!style) {
+    return '';
+  }
+  return Object.entries(style)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, value]) => `${key}:${String(value ?? '')}`)
+    .join(',');
+};
+
+const hashBoardElement = (element: BoardElement): string => {
+  const parts: string[] = [
+    element.id,
+    element.kind,
+    String(element.zIndex ?? 0),
+    element.createdBy,
+    serializeStyle(element.style),
+  ];
+
+  if ('x' in element) {
+    parts.push(`x:${(element as { x: number }).x}`, `y:${(element as { y: number }).y}`);
+  }
+  if ('w' in element) {
+    parts.push(`w:${(element as { w: number }).w}`, `h:${(element as { h: number }).h}`);
+  }
+  if ('text' in element && typeof (element as { text?: string }).text === 'string') {
+    parts.push(`text:${(element as { text: string }).text}`);
+  }
+  if ('title' in element && typeof (element as { title?: string }).title === 'string') {
+    parts.push(`title:${(element as { title: string }).title}`);
+  }
+  if ('points' in element) {
+    const points = (element as { points: BoardPoint[] }).points
+      .map((point) => `${point[0]}:${point[1]}`)
+      .join('|');
+    parts.push(`points:${points}`);
+  }
+
+  return hashString(parts.join('|'));
+};
+
+const summarizeBoardState = (board: BoardState): BoardSummary => {
+  const ids = Object.keys(board.elements).sort();
+  const elementHashes: Record<string, string> = {};
+  const fingerprintSeed: string[] = [board.order.join('|')];
+  ids.forEach((id) => {
+    const element = board.elements[id];
+    if (!element) {
+      return;
+    }
+    const hash = hashBoardElement(element);
+    elementHashes[id] = hash;
+    fingerprintSeed.push(`${id}:${hash}`);
+  });
+
+  const orderSignature = hashString(board.order.join('|'));
+  return {
+    fingerprint: hashString(fingerprintSeed.join(';')),
+    revision: board.revision,
+    lastUpdatedAt: board.lastUpdatedAt,
+    elementHashes,
+    elementCount: ids.length,
+    orderSignature,
+  };
+};
+
+const diffBoardSummaries = (current: BoardSummary, previous: BoardSummary | null): BoardDeltaSummary => {
+  if (!previous) {
+    return {
+      added: Object.keys(current.elementHashes),
+      removed: [],
+      changed: [],
+    };
+  }
+
+  const added: string[] = [];
+  const removed: string[] = [];
+  const changed: string[] = [];
+
+  Object.keys(current.elementHashes).forEach((id) => {
+    if (!previous.elementHashes[id]) {
+      added.push(id);
+    } else if (current.elementHashes[id] !== previous.elementHashes[id]) {
+      changed.push(id);
+    }
+  });
+
+  Object.keys(previous.elementHashes).forEach((id) => {
+    if (!current.elementHashes[id]) {
+      removed.push(id);
+    }
+  });
+
+  return { added, removed, changed };
+};
+
+const getWindowId = (): string => {
+  const id = transcriptWindowContext?.id?.trim();
+  return id && id.length > 0 ? id : 'global';
+};
+
+const updateZeroOpStrikeCount = (windowId: string, zeroDelta: boolean): number => {
+  if (!zeroDelta) {
+    zeroOpStrikesByWindow.set(windowId, 0);
+    return 0;
+  }
+  const baseStrikes =
+    zeroOpStrikesByWindow.get(windowId) ??
+    (lastWindowContextId && lastWindowContextId !== windowId ? zeroOpStrikesByWindow.get(lastWindowContextId) ?? 0 : 0);
+  const next = baseStrikes + 1;
+  zeroOpStrikesByWindow.set(windowId, next);
+  return next;
+};
+
+const recordBoardDeltaTelemetry = (event: BoardDeltaTelemetryEvent) => {
+  boardDeltaTelemetryHistory.push(event);
+  while (boardDeltaTelemetryHistory.length > TELEMETRY_HISTORY_LIMIT) {
+    boardDeltaTelemetryHistory.shift();
+  }
+  if (boardDeltaTelemetryListener) {
+    boardDeltaTelemetryListener(event);
+  }
+};
+
+const truncateFallbackLine = (value: string, maxLength = 120): string => {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const buildDeterministicSketchFallback = (
+  board: BoardState,
+  diagnostics: DraftConversionDiagnostics,
+  reason: BoardDeltaFallbackReason,
+  zeroOpStrikes: number,
+): TldrawDraftShape[] => {
+  const windowId = getWindowId();
+  const transcriptLines = (transcriptWindowContext?.lines ?? [])
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(-4)
+    .map((line) => `• ${truncateFallbackLine(line, 150)}`);
+  const summaryLine = transcriptWindowContext?.summary?.trim() || 'Live transcript sketch fallback';
+  const invalidIds = Array.from(diagnostics.invalidElementIds).slice(0, 3);
+  const reasonLine =
+    reason === 'invalid_ops'
+      ? `Reason: invalid ops${invalidIds.length > 0 ? ` (${invalidIds.join(', ')})` : ''}`
+      : 'Reason: repeated empty board deltas';
+  const strikesLine = `Revision ${board.revision} • strikes ${zeroOpStrikes}`;
+  const lines = [summaryLine, reasonLine, strikesLine, ...transcriptLines].map((line) => truncateFallbackLine(line, 160));
+  const text = lines.join('\n');
+
+  const seed = hashString(`${windowId}:${board.revision}:${board.lastUpdatedAt}`);
+  const seedValue = Number.parseInt(seed, 36) || 0;
+  const width = 760;
+  const height = 260 + Math.max(0, transcriptLines.length - 2) * 24;
+  const x = 140 + (seedValue % 120);
+  const y = 180 + (Math.floor(seedValue / 7) % 90);
+  const zIndex = 100000 + (seedValue % 1000);
+
+  return [
+    {
+      kind: 'geo',
+      id: toSafeShapeKey(`fallback:frame:${windowId}:${seed}`),
+      x,
+      y,
+      zIndex,
+      props: {
+        geo: 'rectangle',
+        w: width,
+        h: height,
+        color: 'light-violet',
+        labelColor: 'light-violet',
+        fill: 'semi',
+        size: 'm',
+        dash: 'draw',
+        text: '',
+        align: 'middle',
+        verticalAlign: 'middle',
+      },
+    },
+    {
+      kind: 'text',
+      id: toSafeShapeKey(`fallback:text:${windowId}:${seed}`),
+      x: x + 24,
+      y: y + 24,
+      zIndex: zIndex + 1,
+      props: {
+        text,
+        color: 'black',
+        size: 'm',
+        w: width - 48,
+        autoSize: false,
+      },
+    },
+  ];
+};
+
 interface TextContainerBounds {
   x: number;
   y: number;
@@ -495,6 +779,7 @@ const toDraftShape = (
   orderIndex: number,
   showAiNotes: boolean,
   textContainers: TextContainerBounds[],
+  diagnostics?: DraftConversionDiagnostics,
 ): TldrawDraftShape | null => {
   const strokeColor = element.style?.strokeColor;
   const fillColor = element.style?.fillColor;
@@ -503,9 +788,12 @@ const toDraftShape = (
   const fontSize = element.style?.fontSize;
   const zIndex = element.zIndex ?? orderIndex;
   const safeId = toSafeShapeKey(element.id);
+  const markHidden = () => diagnostics?.hiddenElementIds.add(element.id);
+  const markInvalid = () => diagnostics?.invalidElementIds.add(element.id);
 
   if (element.kind === 'text') {
     if (shouldHideAiText(element.id, showAiNotes)) {
+      markHidden();
       return null;
     }
     const textSize = toSizeFromFont(fontSize);
@@ -616,6 +904,7 @@ const toDraftShape = (
   if (element.kind === 'line' || element.kind === 'stroke') {
     const line = toRelativeLinePoints(element.points);
     if (!line) {
+      markInvalid();
       return null;
     }
     return {
@@ -638,6 +927,7 @@ const toDraftShape = (
     const first = element.points[0];
     const last = element.points[element.points.length - 1];
     if (!first || !last) {
+      markInvalid();
       return null;
     }
     return {
@@ -663,6 +953,7 @@ const toDraftShape = (
     };
   }
 
+  markInvalid();
   return null;
 };
 
@@ -670,21 +961,113 @@ export const boardToTldrawDraftShapes = (
   board: BoardState | null | undefined,
   showAiNotes: boolean,
 ): TldrawDraftShape[] => {
+  const windowId = getWindowId();
   if (!board) {
+    boardSummaryByWindowId.delete(windowId);
+    zeroOpStrikesByWindow.delete(windowId);
+    lastWindowContextId = null;
     return [];
   }
 
+  const diagnostics = createDraftConversionDiagnostics();
   const ordered = getOrderedElements(board);
   const textContainers = ordered
     .map((element) => toContainerBounds(element))
     .filter((value): value is TextContainerBounds => value !== null)
     .sort((left, right) => left.w * left.h - right.w * right.h);
   const drafts = ordered
-    .map((element, orderIndex) => toDraftShape(element, orderIndex, showAiNotes, textContainers))
+    .map((element, orderIndex) => toDraftShape(element, orderIndex, showAiNotes, textContainers, diagnostics))
     .filter((shape): shape is TldrawDraftShape => Boolean(shape));
 
   drafts.sort((left, right) => left.zIndex - right.zIndex);
-  return drafts;
+
+  const summary = summarizeBoardState(board);
+  const previousSummary = getPreviousSummaryForWindow(windowId);
+  const delta = diffBoardSummaries(summary, previousSummary);
+  const orderChanged = Boolean(previousSummary) && summary.orderSignature !== previousSummary.orderSignature;
+  const structureUnchanged = delta.added.length === 0 && delta.removed.length === 0 && delta.changed.length === 0 && !orderChanged;
+  const lastUpdateChangedAt = previousSummary?.lastUpdatedAt ?? 0;
+  const hasTranscriptContext = Boolean(transcriptWindowContext);
+  const transcriptWindowChanged = hasTranscriptContext && lastWindowContextId !== null && windowId !== lastWindowContextId;
+  const zeroDelta =
+    hasTranscriptContext &&
+    Boolean(previousSummary) &&
+    structureUnchanged &&
+    (summary.lastUpdatedAt !== lastUpdateChangedAt || transcriptWindowChanged);
+  const zeroOpStrikes = updateZeroOpStrikeCount(windowId, zeroDelta);
+  const invalidOpsDetected = diagnostics.invalidElementIds.size > 0;
+
+  let fallbackReason: BoardDeltaFallbackReason = null;
+  if (drafts.length === 0 && invalidOpsDetected) {
+    fallbackReason = 'invalid_ops';
+  } else if (drafts.length === 0 && zeroDelta && zeroOpStrikes >= ZERO_OP_STRIKE_LIMIT) {
+    fallbackReason = 'zero_delta';
+  }
+
+  let resolvedDrafts = drafts;
+  if (fallbackReason) {
+    resolvedDrafts = buildDeterministicSketchFallback(board, diagnostics, fallbackReason, zeroOpStrikes);
+    zeroOpStrikesByWindow.set(windowId, 0);
+  }
+
+  resolvedDrafts.sort((left, right) => left.zIndex - right.zIndex);
+
+  // Emit structured telemetry so incremental board behavior can be asserted in tests.
+  recordBoardDeltaTelemetry({
+    timestamp: Date.now(),
+    revision: board.revision,
+    lastUpdatedAt: board.lastUpdatedAt,
+    windowId,
+    boardElementCount: summary.elementCount,
+    draftCount: resolvedDrafts.length,
+    zeroDelta,
+    zeroOpStrikes,
+    orderChanged,
+    fallbackTriggered: Boolean(fallbackReason),
+    fallbackReason,
+    addedIds: delta.added,
+    removedIds: delta.removed,
+    changedIds: delta.changed,
+    hiddenElementIds: Array.from(diagnostics.hiddenElementIds),
+    invalidElementIds: Array.from(diagnostics.invalidElementIds),
+    transcriptSummary: transcriptWindowContext?.summary,
+  });
+
+  boardSummaryByWindowId.set(windowId, summary);
+  lastWindowContextId = hasTranscriptContext ? windowId : lastWindowContextId;
+
+  return resolvedDrafts;
+};
+
+export const setTranscriptWindowContext = (context: TranscriptWindowContext | null): void => {
+  transcriptWindowContext = context;
+};
+
+export const registerBoardDeltaTelemetryListener = (listener: BoardDeltaTelemetryListener | null): void => {
+  boardDeltaTelemetryListener = listener;
+};
+
+export const getBoardDeltaTelemetryHistory = (): BoardDeltaTelemetryEvent[] => {
+  return [...boardDeltaTelemetryHistory];
+};
+
+/**
+ * Clears all board delta tracking state. Tests should call this to ensure isolated sessions.
+ */
+export const resetBoardDeltaTelemetry = (): void => {
+  boardDeltaTelemetryHistory.length = 0;
+  zeroOpStrikesByWindow.clear();
+  boardSummaryByWindowId.clear();
+  transcriptWindowContext = null;
+  lastWindowContextId = null;
+  boardDeltaTelemetryListener = null;
+};
+
+export const getBoardDeltaZeroOpStrikes = (windowId?: string): number => {
+  if (windowId) {
+    return zeroOpStrikesByWindow.get(windowId) ?? 0;
+  }
+  return zeroOpStrikesByWindow.get(getWindowId()) ?? 0;
 };
 
 const SHAPE_TEXT_MAX_LENGTH = 4000;
